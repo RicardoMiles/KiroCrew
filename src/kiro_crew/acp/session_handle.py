@@ -30,6 +30,7 @@ from kiro_crew import acp_tool_gate, model_registry, permission_floor
 from kiro_crew.acp import kas_wire
 from kiro_crew.acp._dispatch import (
     DRAIN_YIELD_AFTER_S,
+    MAX_ACTIVE_TOOL_CALLS,
     TOOL_CALL_CACHE_MAX_ENTRIES,
     TOOL_CALL_CACHE_MAX_PAYLOAD_CHARS,
     build_permission_event,
@@ -39,6 +40,7 @@ from kiro_crew.acp._dispatch import (
     is_mcp_tool_approval,
     is_unattributed_error_candidate,
     kas_crew_agent_id,
+    liveness_key,
     parse_codex_compaction_update,
     parse_metadata,
     parse_prompt_token_usage,
@@ -123,6 +125,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
+    ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION,
     ACP_BACKENDS_HOOKS_LIST,
     ACP_BACKENDS_INLINE_COMPACTION,
     ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS,
@@ -882,6 +885,24 @@ class AcpModeNotFound(AcpRuntimeError):
         self.mode_id = mode_id
 
 
+class AcpAgentUnavailable(AcpRuntimeError):
+    """The session's agent has no definition at all, so the session is not created.
+
+    Raised at session start when no spec declares the agent -- typically because
+    the app that registered it is disabled -- with a message that names the cause
+    and the fix. ``transient = False``: a retry finds the same missing definition.
+    ``agent_unavailable`` is the structural tag the chat reads to show the reason
+    as a refusal with no Resume, so the verdict never depends on the prose.
+    """
+
+    transient = False
+    agent_unavailable = True
+
+    def __init__(self, message: str, *, agent: str) -> None:
+        super().__init__(message)
+        self.agent = agent
+
+
 class AcpRequestTimeout(AcpRuntimeError):
     """Raised when a request's response does not arrive within its budget.
 
@@ -1055,6 +1076,7 @@ class AcpRuntimeProtocol(Protocol):
         result: dict[str, Any],
         *,
         before_write: Callable[[], None] | None = None,
+        withdrawal_check: Callable[[], None] | None = None,
     ) -> None: ...
 
     async def send_error(self, request_id: str | int, code: int, message: str) -> None: ...
@@ -1099,6 +1121,14 @@ class AcpRuntimeProtocol(Protocol):
         ...
 
     def death_summary(self) -> str | None: ...
+
+    def _member_projection_needs_confirmation(self, mirror_used: bool) -> bool:
+        """Whether this start must confirm the array a mirror built. Synchronous."""
+        ...
+
+    async def _confirm_member_projection(self, handle: AcpSessionHandle) -> None:
+        """Refuse a member session whose consumed projection is not the saved intent."""
+        ...
 
 
 class AcpSessionHandle:
@@ -1224,7 +1254,13 @@ class AcpSessionHandle:
         # tracker's aux payload (``None`` for a non-shell tool). ``ToolCallState``
         # does not carry the id, and the ``waiting_input`` status must name the
         # call, so the tracker keeps it too (``_inflight_tool_call_id`` below).
-        self._tool_tracker = InFlightToolTracker()
+        # Bounded by ``MAX_ACTIVE_TOOL_CALLS``: a backend that emits distinct
+        # tool_call frames whose results never report a terminal status would
+        # otherwise grow the tracker for the length of the turn. At the cap the
+        # OLDEST attribution is evicted and the call just dispatched is always
+        # kept, so the oracle keeps reporting the tool actually in flight rather
+        # than failing permissive on stall detection.
+        self._tool_tracker = InFlightToolTracker(max_calls=MAX_ACTIVE_TOOL_CALLS)
         # toolCallIds that streamed output (a non-final tool_call_update with
         # content) this turn. A command that already produced output may have
         # already acted, so a non-interactive retry of it is never ``safe_retry``.
@@ -1469,6 +1505,18 @@ class AcpSessionHandle:
         # ``_deny_spec_disabled_tool`` a single falsy read on those sessions.
         # Mirrors ``AcpClient._spec_denied_tools``.
         self.spec_denied_tools: frozenset[tuple[str, str]] = frozenset()
+        # The parsed agent spec this session's mirrored array was built from, set by
+        # the runtime from the same projection. None on a host with no mirror. A
+        # member session's loaded-check reads this, never a re-read of the file.
+        self.consumed_agent_spec: dict[str, Any] | None = None
+        self.mirror_used: bool = False
+        # A member session's confirmation result, recorded by the runtime from the
+        # mirrored arm: the saved template whose consumed projection matched, plus
+        # the projection gaps that keep the Capabilities view "unverified". Both
+        # stay at their defaults for a host with no mirror and for a session whose
+        # consumed spec matched no saved intent.
+        self.confirmed_projection_template: str = ""
+        self.capability_projection_gaps: tuple[str, ...] = ()
         # The capabilities the agent batch this session registered auto-approves
         # (see ``kas_agents.projected_auto_approved``); None when no batch was sent.
         self.kas_auto_approved: frozenset[str] | None = None
@@ -1502,6 +1550,10 @@ class AcpSessionHandle:
         # (mirrors AcpClient._resolved_model_id; avoids the profile-id
         # pinning trap where a resolved profile id poisons slot.model).
         self._resolved_model_id: str = ""
+        # True after set_mode switched a live session's agent, until the model
+        # kiro-cli reported for that activation has been judged against the
+        # served list (see _served_default_after_set_mode).
+        self._mode_model_unjudged: bool = False
         # The model a non-strict config-option push was refused on, or the
         # startup pin the provider factory withheld because the account does not
         # serve it, or ``""`` (mirrors AcpClient.model_pin_refused). Either way
@@ -1687,7 +1739,8 @@ class AcpSessionHandle:
             prompt_blocks = await asyncio.to_thread(
                 build_prompt_blocks,
                 message,
-                allow_image=allow_image and self._runtime.supports_image_prompt,
+                allow_image=allow_image,
+                agent_accepts_image=self._runtime.supports_image_prompt,
             )
             # Content-free outbound STRUCTURE diagnostics: one
             # line per turn build recording block counts, per-type counts, and
@@ -1836,6 +1889,10 @@ class AcpSessionHandle:
             await self._settle_abandoned_steering()
         if self._abandoned_prompt_id is not None:
             await self._close_abandoned_turn()
+        if getattr(self, "_mode_model_unjudged", False):
+            # Before the turn is marked active: a set_model the judgement sends
+            # awaits its own answer on this queue.
+            await self._served_default_after_set_mode()
 
         self._cancelled = False
         self._cancel_ts = 0.0
@@ -1860,6 +1917,7 @@ class AcpSessionHandle:
         # A new turn starts with no infrastructure verdict carried over.
         self.last_infra_error = None
         self._tool_dispatched = False
+        self._report_evicted_attributions()
         self._tool_tracker.clear()
         self._tool_output_seen.clear()
         self._status_rejected.clear()
@@ -2468,6 +2526,7 @@ class AcpSessionHandle:
         option_id: str | None = None,
         *,
         deadline: GrantDeadline | None = None,
+        withdraw_if: Callable[[], bool] | None = None,
     ) -> bool:
         """Approve a pending permission request.
 
@@ -2489,6 +2548,13 @@ class AcpSessionHandle:
         has passed, nothing is written, the request stays pending as it was, and
         :class:`~kiro_crew.trust_patterns.GrantEnded` tells the caller to ask
         the person instead. Without it the approval is sent as before.
+
+        *withdraw_if* is read after the floor's thread hop and under the write
+        lock right before the answer is written; once it holds, nothing is
+        written, the request's records are put back, and
+        :class:`~kiro_crew.permission_floor.ApprovalWithdrawn` is raised. Under
+        the lock it is read ahead of the runtime's liveness check, which
+        ``deadline`` follows.
         """
         gate_event = self._permission_gate_events.pop(request_id, None)
         # No recorded event means no request this transport built, so there is
@@ -2508,6 +2574,11 @@ class AcpSessionHandle:
             )
             await self.reject_tool(request_id)
             return False
+        if withdraw_if is not None and withdraw_if():
+            # The floor's thread hop is an await: read again before anything else
+            # is taken from the request's records.
+            self._restore_withdrawn(request_id, gate_event, None)
+            raise permission_floor.ApprovalWithdrawn
         resolved_id = option_id
         recorded = self._permission_options.pop(request_id, None)
         if deadline is None:
@@ -2524,17 +2595,20 @@ class AcpSessionHandle:
                 resolved_id = recorded.get("once") or resolved_id
         if resolved_id is None:
             resolved_id = OPTION_ALLOW_ONCE
-        if deadline is None:
-            await self._runtime.send_response(
-                request_id,
-                {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": resolved_id}},
-            )
-            return True
+        # The wait for the write lock is the last await before the answer goes
+        # out, so the runtime reads the withdrawal again under that lock, ahead
+        # of its own liveness check, and the grant's deadline after it: a runtime
+        # that died during the wait reports the death, not an ended grant.
+        recheck: dict[str, Callable[[], None]] = {}
+        if withdraw_if is not None:
+            recheck["withdrawal_check"] = lambda: permission_floor.raise_if_withdrawn(withdraw_if)
+        if deadline is not None:
+            recheck["before_write"] = grant_deadline_guard(deadline, request_id)
         try:
             await self._runtime.send_response(
                 request_id,
                 {"outcome": {"outcome": OUTCOME_SELECTED, "optionId": resolved_id}},
-                before_write=grant_deadline_guard(deadline, request_id),
+                **recheck,
             )
         except GrantEnded:
             # Nothing was written: put the request back exactly as it was.
@@ -2543,9 +2617,25 @@ class AcpSessionHandle:
             if recorded is not None:
                 self._permission_options[request_id] = recorded
             raise
-        # Answered only now: until the write the request was still pending.
-        self._end_human_wait()
+        except permission_floor.ApprovalWithdrawn:
+            self._restore_withdrawn(request_id, gate_event, recorded)
+            raise
+        if deadline is not None:
+            # Answered only now: until the write the request was still pending.
+            self._end_human_wait()
         return True
+
+    def _restore_withdrawn(
+        self,
+        request_id: str | int,
+        gate_event: AcpEvent | None,
+        recorded: dict[str, str] | None,
+    ) -> None:
+        """Put back what a withdrawn approval took, so the request is pending as before."""
+        if gate_event is not None:
+            self._permission_gate_events[request_id] = gate_event
+        if recorded is not None:
+            self._permission_options[request_id] = recorded
 
     async def reject_tool(self, request_id: str | int) -> None:
         """Reject a pending permission request.
@@ -2630,6 +2720,43 @@ class AcpSessionHandle:
         )
         await self.reject_tool(event.request_id)
         return True
+
+    def _report_evicted_attributions(self) -> None:
+        """Say the previous turn's liveness-map overflow once, by count.
+
+        Run at the turn reset, before the map is cleared: the one warning for
+        an overflowed turn, naming the bound and how far past it the turn went
+        (a map that dropped rows at its cap must not read like one that was
+        never that full). A turn that evicted nothing says nothing.
+        """
+        count = self._tool_tracker.evicted_count
+        if not count:
+            return
+        logger.warning(
+            "tool-call liveness map evicted %d attribution(s) at its bound of %d last turn; "
+            "once its retained calls settled, that turn was judged as an opaque tool in "
+            "flight (the build-scale tool-stall window, never the stale probe) [session=%s]",
+            count,
+            MAX_ACTIVE_TOOL_CALLS,
+            self._session_id,
+        )
+
+    def _no_tool_in_flight(self) -> bool:
+        """Whether the turn provably has no tool call running.
+
+        An empty attribution map proves it only while the map has never
+        evicted this turn: once the tracker's ``evicted`` is set, a call
+        whose row was evicted at the cap may still be running, and reading the
+        emptied map as "nothing in flight" would arm the stale clock against
+        it -- the cancel-probe would then stop a live call as a wedge that did
+        not exist. After an eviction the turn is treated as having a tool in
+        flight until its ``clear()``: with no state to read, the oracle answers
+        UNKNOWN and the tool branch keeps its full build-scale forbearance
+        (``tool_stall_suspect_secs`` under the hard cap) before the non-lethal
+        tool-stall recovery, the same window any opaque in-flight tool gets.
+        The stale clock gives up nothing it could prove.
+        """
+        return not self._tool_tracker.any_active and not self._tool_tracker.evicted
 
     def _release_settled_tool_call(self, update: object, scope: str) -> None:
         """Drop a settled call's provenance rows once its result frame reports a
@@ -2933,10 +3060,37 @@ class AcpSessionHandle:
             raise AcpRuntimeError(str(exc)) from exc
         # send_request only queues the request; it does not await a mode ACK.
         self.active_agent = ""
+        take = getattr(self._runtime, "take_switched_model", None)
+        if take is not None:
+            # Only the agent/switched frame THIS activation sends may be judged.
+            take(self._session_id)
         await self._runtime.send_request(
             METHOD_SET_MODE,
             set_mode_params(self._session_id, agent_name),
         )
+        if take is not None:
+            self._mode_model_unjudged = True
+
+    async def _served_default_after_set_mode(self) -> None:
+        """Judge the model a mid-session :meth:`set_mode` put the session on.
+
+        kiro-cli moves the session to the model the switched-to agent's spec
+        pins and reports it only in ``_kiro.dev/agent/switched``, which the
+        runtime's reader records for this session as it arrives. Runs before
+        each turn while a switch is unjudged: a recorded model goes through
+        :meth:`ensure_served_default` the way the start paths' activation does,
+        so an unserved one is moved to a served model before the prompt and a
+        served one is adopted with no extra write. Until the frame has arrived
+        nothing is judged and the next turn looks again; a frame without a
+        model records nothing, so it changes nothing. The frame is kiro-cli's
+        own, so a host that never sends it never has a model to judge.
+        """
+        take = getattr(self._runtime, "take_switched_model", None)
+        activated = take(self._session_id) if take is not None else ""
+        if not activated:
+            return
+        self._mode_model_unjudged = False
+        await self.ensure_served_default(activated_model=activated)
 
     async def set_model(self, model_id: str) -> None:
         """Switch model via session/set_model.
@@ -3038,6 +3192,13 @@ class AcpSessionHandle:
                 return
         self._model = resolved
         self.model_pin_refused = ""
+        if getattr(self, "_mode_model_unjudged", False):
+            # The session runs this model now, not the one an earlier set_mode
+            # activation put it on, so that activation's frame is not judged.
+            self._mode_model_unjudged = False
+            take = getattr(self._runtime, "take_switched_model", None)
+            if take is not None:
+                take(self._session_id)
         # Parity with AcpClient.set_model: keep _resolved_model_id in sync so
         # _backfill_context_window looks up the NEW model's window after a switch
         # (otherwise the context meter converts pct against the stale session/new
@@ -3761,6 +3922,10 @@ class AcpSessionHandle:
         backend = self._runtime.acp_backend
         if acp_tool_gate.routing_for(backend) is not acp_tool_gate.Routing.SESSION_CONFIG:
             return
+        if self.mirror_used and self._runtime._member_projection_needs_confirmation(
+            self.mirror_used
+        ):
+            await self._runtime._confirm_member_projection(self)
         option_id, value = acp_tool_gate.permission_config_for(backend)
         issue = acp_tool_gate.session_config_issue(backend, self._config_options)
         if issue:
@@ -4637,14 +4802,24 @@ class AcpSessionHandle:
     def _sync_effort_levels(self) -> None:
         """Push ACP-reported effort levels to the global validation set (parity
         with AcpClient._sync_effort_levels). Without this, the unified kiro path
-        never refreshes the reasoning-effort allow-list. Function-level import
-        avoids the chat_persistence -> dashboard -> session -> acp import cycle."""
+        never refreshes the reasoning-effort allow-list. A backend in
+        ``ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION`` advertises a per-session
+        list: it joins the validation set but never replaces the global fallback
+        order other slots are served. Function-level import avoids the
+        chat_persistence -> dashboard -> session -> acp import cycle."""
         levels = self.get_valid_effort_levels()
-        if levels:
+        if not levels:
+            return
+        if self._runtime.acp_backend in ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION:
             # circular import: chat_persistence -> dashboard -> session -> acp
-            from kiro_crew.dashboard.chat_persistence import update_reasoning_effort_values
+            from kiro_crew.dashboard.chat_persistence import register_reasoning_effort_values
 
-            update_reasoning_effort_values(levels)
+            register_reasoning_effort_values(levels)
+            return
+        # circular import: chat_persistence -> dashboard -> session -> acp
+        from kiro_crew.dashboard.chat_persistence import update_reasoning_effort_values
+
+        update_reasoning_effort_values(levels)
 
     # NOTE: resume is done via AcpRuntime.load_session() (issues session/load
     # DIRECTLY under the transcript's own sid). The old per-handle load() is
@@ -7563,7 +7738,7 @@ class AcpSessionHandle:
             filtered_events.append(ev)
             if ev.kind == EVENT_TEXT_CHUNK:
                 self.last_prompt_stats.text_chunks += 1
-                self._stale_eligible = not self._tool_tracker.any_active
+                self._stale_eligible = self._no_tool_in_flight()
                 self._prompt_or_tool_seen = True
             elif ev.kind == EVENT_TOOL_CALL:
                 self._stale_eligible = False
@@ -7624,22 +7799,39 @@ class AcpSessionHandle:
                 # judged one (the interactive classification rides as the aux
                 # payload, read back via ``_inflight_interactive``). A dispatch
                 # always changes the judged call, so retire the oracle.
-                self._tool_tracker.dispatch(ev.tool_call_id or "", inflight_tool, interactive)
+                # At the cap the oldest attribution is evicted and counted; the
+                # turn's overflow is said once, by count, at the next reset
+                # (``_report_evicted_attributions``).
+                self._tool_tracker.dispatch(
+                    liveness_key(ev.tool_call_id or ""), inflight_tool, interactive
+                )
                 self._retire_liveness_state()
             elif ev.kind == EVENT_TOOL_RESULT:
                 if not ev.tool_final and ev.tool_call_id:
                     # Streamed partial output: the command has acted, so any
                     # later non-interactive retry of it is not a safe replay.
-                    self._tool_output_seen.add(ev.tool_call_id)
+                    # Bounded like the map, and by it: the key is the liveness
+                    # key, only a call the map still holds is admitted (an id
+                    # matters here only while its call is in flight, and an
+                    # evicted or unknown id must not grow a sibling store past
+                    # the shared cap), and at the cap the set is pruned to the
+                    # calls still in flight.
+                    _seen_key = liveness_key(ev.tool_call_id)
+                    if _seen_key and _seen_key in self._active_tool_calls:
+                        if len(self._tool_output_seen) >= MAX_ACTIVE_TOOL_CALLS:
+                            self._tool_output_seen &= set(self._active_tool_calls)
+                        self._tool_output_seen.add(_seen_key)
                 if ev.tool_status in TERMINAL_TOOL_STATUSES:
                     # The shared hand-off rule drops the finished call and, when
                     # it was the judged one, re-points to the newest remaining
                     # dispatch (or clears). It returns whether the judged call
                     # changed — only then is the oracle retired and the input
                     # wait reset.
-                    judged_changed = self._tool_tracker.result(ev.tool_call_id or "", terminal=True)
-                    self._tool_dispatched = self._tool_tracker.any_active
-                    self._stale_eligible = not self._tool_tracker.any_active
+                    judged_changed = self._tool_tracker.result(
+                        liveness_key(ev.tool_call_id or ""), terminal=True
+                    )
+                    self._tool_dispatched = not self._no_tool_in_flight()
+                    self._stale_eligible = self._no_tool_in_flight()
                     if judged_changed:
                         self._input_wait_emitted = False
                         self._retire_liveness_state()

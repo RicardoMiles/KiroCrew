@@ -713,6 +713,9 @@ describe('ArtifactPanel', () => {
       expect(message).toContain(`${NAME} (${SLUG})`)
       expect(message).toContain('tighten this heading')
       expect(message).not.toContain('agent note')
+      // The count (second arg) is the number of human comments in the batch,
+      // so the "N comments sent" info banner can show the right number.
+      expect(onSubmitComments.mock.calls[0][1]).toBe(1)
 
       // The batch is marked sent, so the bar clears instead of re-offering the
       // same comments on the next Submit.

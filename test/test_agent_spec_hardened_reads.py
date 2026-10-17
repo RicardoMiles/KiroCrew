@@ -472,7 +472,7 @@ class TestLoadSteeringResources:
     every platform: Windows ``expanduser`` reads ``USERPROFILE``, so setting
     ``HOME`` alone left the real profile dir in play, the marker could never
     load, and the refusal assertion passed vacuously while the valid-spec one
-    failed (same ``setattr(Path, "home", ...)`` shape as test_acp_client.py).
+    failed (same ``setattr(Path, "home", ...)`` shape as test_acp_client_binary_resolution.py).
     """
 
     @staticmethod
@@ -1076,7 +1076,7 @@ _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
         ("connections_warm_mint", "dashboard"),
         ("connections_warm_mint", "dashboard"),
     ],
-    "kiro_crew/context.py": [
+    "kiro_crew/context_assembly/agent_spec.py": [
         ("agent_prompt", "context"),
         ("steering_resources", "unknown"),
     ],
@@ -1134,6 +1134,9 @@ _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
         ("side_readonly_spec", "dashboard"),
     ],
     "kiro_crew/mcp_discovery.py": [("mcp_discovery_agent_config", "unknown")],
+    # The installed spec as an OAuth discovery trust anchor; any chat interface
+    # can raise the banner that triggers it.
+    "kiro_crew/mcp_oauth_discovery.py": [("mcp_oauth_discovery", "unknown")],
     "kiro_crew/member_essential_context.py": [
         ("member_essentials", "context"),
         ("member_essentials", "context"),
@@ -1145,8 +1148,27 @@ _EXPECTED_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
     # The spawn gate walks every spec for the PARENT agent's
     # ``toolsSettings.subagent.availableAgents`` allowlist, and keeps a file the
     # reader refuses as unreadable (refuse) rather than as "no spec"; a denial
-    # there belongs to the sub-agent surface that asked to spawn.
-    "kiro_crew/subagent.py": [("spawn_available_agents", "subagent")],
+    # there belongs to the sub-agent surface that asked to spawn. The second
+    # label is the same walk over the parent session's ``<project>/.kiro/agents``.
+    "kiro_crew/subagent_parts/agent_policy.py": [
+        ("spawn_available_agents", "subagent"),
+        ("spawn_available_agents_project", "subagent"),
+    ],
+    # `list_apps` confirms a contributed command's agent was actually registered by
+    # reading the app's materialized `<app>--<agent>.json` -- a user-writable dir, so
+    # it goes through the hardened reader; a denial belongs to the app listing.
+    # A turn refused for an app-owned agent labels the refusal with the app's
+    # `displayName`, read from the app-writable `app.json` the same way.
+    # A session whose agent has no spec left names the app that declares it,
+    # from that app's own source specs in its app-writable root.
+    "kiro_crew/apps/manager.py": [
+        ("app_agent_owner", "unknown"),
+        ("app_command_agent_label", "unknown"),
+        ("list_apps_command_agent", "unknown"),
+    ],
+    # A manifest's `commands[].agent` is checked against the names its own source
+    # specs declare; those live in the app root, which the app can rewrite.
+    "kiro_crew/apps/manifest.py": [("app_manifest_agent_names", "unknown")],
 }
 
 
@@ -1177,6 +1199,9 @@ _EXPECTED_PROJECT_FILES_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
         ("agent_project_shadow", "unknown"),
         ("markdown_spec_lookup", "unknown"),
     ],
+    # No ``kiro_crew/apps/manager.py`` entry: the app-command guard scans the
+    # checkout through ``acp.managed_agent_shadow.project_claims_agent_name``,
+    # the screened recursive walk, not through these roster helpers.
     # No ``kiro_crew/agent_discovery.py`` entry on purpose. The two in-module
     # readers (``list_agents``, ``project_agent_names``) decide this scope's
     # sensitivity THEMSELVES -- pinned in
@@ -1204,11 +1229,11 @@ _EXPECTED_PROJECT_FILES_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
 # highest-traffic route to the scan (a chat turn's ``slot.project`` reaches it
 # every turn), so it is exactly where attribution matters most.
 _EXPECTED_WARM_CALL_SITE_LABELS: dict[str, list[tuple[str, str]]] = {
-    "kiro_crew/dashboard/chat_handlers.py": [
-        ("api_chat", "dashboard"),
+    "kiro_crew/dashboard/chat_api/agent_switch.py": [
         ("api_chat_slot_agent", "dashboard"),
         ("api_chat_slot_agent", "dashboard"),
     ],
+    "kiro_crew/dashboard/chat_api/chat_send.py": [("api_chat", "dashboard")],
     "kiro_crew/dashboard/chat_runner.py": [("chat_turn", "unknown")],
     "kiro_crew/dashboard/chat_threads.py": [("thread_reply", "dashboard")],
     "kiro_crew/dashboard/handlers/side.py": [("side_panel", "dashboard")],

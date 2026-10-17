@@ -101,9 +101,7 @@ For the full hook list see [getting-started.md](getting-started.md#app-sdk-hooks
 ## Embedded Chat
 
 `ChatEmbed` mounts Kiro Crew's native transcript and compact composer for an
-existing session. The required `slotKey` selects the session. Existing props such
-as `agent`, `placeholder`, `frameless`, `startAtBottom`, `onSend`, and
-`aboveComposer` keep their current contracts.
+existing session. The required `slotKey` selects the session.
 
 ```tsx
 import { ChatEmbed } from '@kirocrew/app-sdk'
@@ -111,21 +109,225 @@ import { ChatEmbed } from '@kirocrew/app-sdk'
 <ChatEmbed slotKey="coder-abc123" />
 ```
 
+Unless `frameless` is set, a header strip shows the session's title. Without a
+title it shows a label in the user's language: "Loading session…" until the
+first read arrives, "New session" for a session with no history, and "Untitled
+session" for one that has messages. The slot key is never
+shown as text, only as the header's hover tooltip.
+
+| Prop | Type | Default | What it does |
+|---|---|---|---|
+| `slotKey` | `string` | required | The chat slot (session) the embed reads and sends to. |
+| `agent` | `string` | unset (sent as `''`) | Agent name sent with each `POST /api/chat`, and shown in the title strip when set. Ignored by `onSend`. |
+| `placeholder` | `string` | localized "Message..." (`appSdk.chatEmbed.message`) | Composer placeholder while the session is idle. While a turn runs the composer shows its own "agent is working" text instead. |
+| `frameless` | `boolean` | `false` | Drops the outer border, rounding, background and title strip, and makes the input row transparent, so a host card can hold the chat flush. |
+| `startAtBottom` | `boolean` | `false` | Opens scrolled to the newest row and stays pinned there as rows arrive, until the user scrolls up; shows a jump-to-bottom button while unpinned. Without it the embed opens at the top and smooth-scrolls to each new message. |
+| `onSend` | `(message: string, meta?: ChatEmbedSendMeta) => Promise<unknown> \| void` | none | Replaces `POST /api/chat` as the send path. Use it when the app owns its slots: the generic endpoint creates a missing slot with no app ownership and no project. A send with non-image attachments passes `meta` (`{ files?: string[] }`); forward it as `meta` on your own chat POST (see [Attachments](#attachments)). |
+| `aboveComposer` | `ReactNode` | none | Content placed in normal flow directly above the composer, such as a docked quote bar. |
+| `composerMaxHeight` | `number` (px) | `240` | Cap for the composer's auto-grow (see below). |
+| `onFileOpen` | `(path: string, opts?: { line?: number; endLine?: number }) => void` | none | Opens a file the transcript names; without it the tool-row file chip is hidden and path links stay plain (see below). |
+| `onArtifactOpen` | `(slug: string) => void` | none | Opens a saved artifact from a link in a reply; without it artifact links follow their href. |
+
+### Required permissions and limitations
+
+The embed calls the Gateway through the host's scoped `useAppApi()` client, so
+the app must grant `/api/chat` in its `permissions.api` (a builtin host passes it
+in `AppApiProvider`'s `allowedApiPaths`). This entry satisfies the scoped client's
+API-path check for each of these calls:
+
+- `GET /api/chat/slots/{slot}?limit=N` — the transcript poll.
+- `POST /api/chat` — sending, unless `onSend` is supplied.
+- `POST /api/chat/slots/{slot}/approve` — Approve, Reject and Trust on a tool approval.
+
+File attachments upload to `POST /api/upload/file`, which `/api/chat` does not
+cover: it is a separate, optional grant (see [Attachments](#attachments)).
+
+Without the API-path grant the scoped client throws before any request is sent:
+the transcript shows its load error, and sending and approving fail. Supplying
+`onSend` removes only the send call; the poll and approvals still need the grant.
+
+For app-token callers, approvals also require `permissions.sessionApproval`.
+Without that permission, the Gateway returns 403 `session_approval_not_granted`,
+even for the app's own slots. The API-path grant alone does not authorize an
+approval; the session ownership rules still apply. See **Ownership for app
+callers** under [Approvals](#approvals).
+
+What the embed does not do today, one line each:
+
+- No live stream. It polls the slot every 1 s while a turn runs and every 5 s
+  when idle, reading the newest 200 rows; "load earlier" widens that by 200 rows
+  a press, up to 500. Replies are displayed from the transcript poll, not from
+  the send response. After 10 s of failed polls it backs off, up to 30 s
+  between attempts.
+- No Stop control. A running turn cannot be cancelled from the embed.
+- No reasoning display. Model thinking is sent only as the `chat_thinking`
+  WebSocket event, which the poll never sees.
+- Trust is a lasting grant, not a one-shot approval. Choosing Trust on an
+  approval card approves the call and sets the session's approval policy to
+  auto-approve, so later tool calls in that session run without asking until
+  the policy is changed.
+
+### Composer
+
 The composer accepts multiple lines. `Enter` sends the draft, `Shift+Enter`
 inserts a line break, and an Enter used to commit an input method editor (IME)
 candidate does not send. The box grows with the draft up to 240 pixels, then
-keeps its height and scrolls vertically.
+keeps its height and scrolls vertically. The embed's composer has no voice input:
+dictation reads its settings outside the app's granted API paths.
+
+A sent message appears at once, where the server's copy will appear. On an idle
+slot that is a row at the end of the transcript. On a busy slot it is a queued
+card in the queue strip above the composer, and a `queued` receipt moves it
+there too. The embed keeps it until a poll returns this send: its own `user`
+row by `sendId`, or its queue entry by the receipt's `queue_id` (the server
+entry then takes over the same card). Once seen, it does not come back. Each
+send is held on its own, so a second send made before the poll shows the first
+leaves the first's copy in place. A send
+whose text goes back to the composer (refused, or delivery not confirmed) drops
+the row. An `onSend` handler posts on its own endpoint, so no `sendId` comes
+back; there the server copy is a new `user` row with the same text, one that
+was not in the transcript at send time.
 
 A host that boxes the embed at a fixed height passes `composerMaxHeight` (in
 pixels) to lower that cap, so a long draft cannot take most of the box from the
 transcript. The resting (empty) size of the composer is unchanged; only the cap
 moves. Omitted, the 240-pixel default applies.
 
+While the agent is working and the draft is empty, a Stop button takes the send
+button's place. It is the dashboard composer's own Stop control. The first press
+asks the agent to stop, and the header then reads "Stopping…". A
+second press made while that stop is still pending forces the stop: it ends the
+turn at once and drops any queued messages, and a hint above the composer says
+so before the press. If the forced stop itself stalls, the button comes back
+after 15 seconds and the hint says to press it again. The hint shows only while
+the Stop button does: typing a draft brings Send back, and Send queues the
+draft. A failed stop shows an error above the composer. While the session is
+compacting its context, a first press stops nothing: the header does not change
+to "Stopping…", and for the next 60 seconds the hint warns that Stop will
+restart the session: the chat history stays, but work in progress and queued
+messages are dropped. A stop belongs to the turn it was pressed in: when the
+next queued turn starts, the embed shows an unpressed Stop again. The embed's Stop is not
+the dashboard guide's `composer.stop` target, which stays on the chat page. Stop calls
+`POST /api/chat/slots/{slot}/stop` (`?force=true` for the second press), which
+the `/api/chat` entry the embed already needs in `allowedApiPaths` covers. The
+embed reads the stop phase from the `stop_state` field of
+`GET /api/chat/slots/{slot}` (`idle`, `soft_pending` or `killing`), and from
+its `stop_declined` field whether the next press restarts the session, so an
+embed opened during that window warns before the first press. Its `turn` and
+`turn_gen` fields tell it when a new turn has started.
+
 ```tsx
 <div style={{ height: 420 }}>
   <ChatEmbed slotKey="coder-abc123" composerMaxHeight={160} />
 </div>
 ```
+
+A message sent while the session is busy waits in the session's queue. While a
+turn runs, typing a message turns the Send button into a **Queue** button, so
+the button says the message will wait for the current work to finish. The embed
+shows each waiting message as a card above the composer, the same card the
+dashboard's chat shows, and the card leaves when the message is delivered. This
+covers sends from the embed itself and from any other surface (another tab, a
+scheduled job). The cards are read-only in the embed: to cancel or edit a queued
+message, open the session in the dashboard. Finished sub-agent results waiting
+for the same turn show as one progress line instead of cards.
+
+The embed polls the session about once a second while the agent works and
+every five seconds otherwise. A failed poll is retried at the same pace and
+stays silent. Once polls have kept failing for 10 seconds, counted from the
+first failure (the gateway restarted, the session was deleted, or access was
+lost), the transcript stays on its last update, the header stops showing the
+session as running and its dot turns muted, a half-written reply loses its live
+caret, and a notice with a Reconnect button appears above the composer. The poll
+then backs off, waiting as long as the outage has lasted, up to 30 seconds
+between reads. Reconnect reads the session at once: the button is disabled and
+marked busy while that read is in flight, and a read that fails announces the
+notice again. The first successful read clears the notice. Sending stays
+available during the outage, since the gateway may be back before the next
+read; a send that is refused or unconfirmed hands its text back to the composer
+as usual.
+
+A file the agent sends with `file_send` appears in the transcript as the same
+card the main chat shows: a download card, or an inline player or image for
+audio, video and pictures. The card links to `/api/outbox/<filename>` as an
+ordinary same-origin URL, so the browser fetches it with the viewer's dashboard
+sign-in and the gateway's own download checks apply. It does not go through
+`useAppApi`, so the app needs no `allowedApiPaths` entry for it. A `file` row
+draws a card only when its content is a file record: JSON with a non-empty
+string `filename`, plus optional string `content_type` and `description` and
+a number `size`. Any other row draws nothing in the embed; the main chat runs
+the same check and shows such a row's text as a message instead.
+
+A host that can open files or artifacts itself passes `onFileOpen` and
+`onArtifactOpen`. The embed hands both straight to the transcript, as in the
+main chat: `onFileOpen(path, { line, endLine })` turns on a tool row's file chip
+and opens path links in replies, and `onArtifactOpen(slug)` opens an
+`/artifacts/<slug>` link instead of following it. Omitted, the file chip stays
+hidden and both kinds of link behave as before.
+
+Keep both handlers the same function between renders while their behaviour
+does not change. The transcript re-renders its messages whenever either one
+changes identity, so an inline arrow re-renders it on every render of the host.
+Wrap each in `useCallback`, listing what it reads as dependencies, or pass a
+function defined outside the component.
+
+```tsx
+import { useCallback } from 'react'
+import { ChatEmbed } from '@kirocrew/app-sdk'
+
+// Defined outside the component, so it is the same function on every render.
+function openArtifactTab(slug: string) {
+  myTabs.open({ kind: 'artifact', slug })
+}
+
+function CoderChat({ viewer }: { viewer: MyViewer }) {
+  // Changes only when `viewer` does.
+  const handleFileOpen = useCallback(
+    (path: string, opts?: { line?: number; endLine?: number }) =>
+      viewer.open(path, opts),
+    [viewer],
+  )
+  return (
+    <ChatEmbed
+      slotKey="coder-abc123"
+      onFileOpen={handleFileOpen}
+      onArtifactOpen={openArtifactTab}
+    />
+  )
+}
+```
+
+### Attachments
+
+The composer attaches files the way the main chat does: paste a file or
+screenshot, drop one on the box, or press the paperclip to pick files. Each file
+uploads to `POST /api/upload/file` through the app's scoped client. While it
+uploads, the file's name shows above the composer with an "Uploading files…"
+status, and the paperclip and Send wait for it; once the upload returns, the
+file shows as a chip, and a chip's remove button unstages it. An attachment
+alone is a sendable turn, and queues like any other send while a turn runs. On
+send, images become inline image lines and other files become
+`[attached_file N]` markers whose paths ride `meta.files`, exactly as the main
+chat sends them. A folder token such as `@src/utils/` stays in the text as
+typed: the embed does not attach folders.
+
+The upload writes to the gateway's disk, so it is an explicit grant. Declare it
+in the manifest to turn attachments on; nothing grants it by default:
+
+```json
+"permissions": { "api": ["/api/chat", "/api/chat/slots", "/api/upload/file"] }
+```
+
+Without the grant the paperclip is not rendered, and a pasted or dropped file
+shows "This app doesn't accept files. Attach them in Sessions instead." above the composer instead of uploading.
+The page is named by its sidebar label (`nav.sessions`), in the user's language.
+A server refusal (unsupported type, over the size cap) shows the same way with
+the server's reason.
+
+A host that passes `onSend` receives the meta as a second argument on a send
+with non-image attachments, `onSend(message, { files })`, and forwards it as
+`meta` on its own chat POST. A send without attachments still calls
+`onSend(message)` alone.
 
 ## Native Chat Panel
 
@@ -264,7 +466,7 @@ That renders the built-in rows. To change one, pass `renderers`.
 ### Adding a row the transcript does not draw
 
 Four roles are deliberately undrawn — `thinking`, `system`, `done` and `queued` — because the
-dashboard shows them through other affordances. `file` is undrawn too. Claim one and it is yours:
+dashboard shows them through other affordances. Claim one and it is yours:
 
 ```jsx
 const renderers = [{
@@ -312,9 +514,16 @@ Import `defaultMessageRenderers` if you need to read what the built-ins do, and 
 | `onFileOpen` | open a path, when the host supports it |
 | `autoDeniedIds` | tool calls a policy or hook blocked |
 | `renderTool` | the host's tool row, if it passed one |
+| `handOff` | whether a row's error notice may offer "Ask the agent"; absent means yes |
 
-Two rules the registry relies on:
+Three rules the registry relies on:
 
+- **Look ahead at roles, not at streaming text.** A renderer may read any neighbour off `messages`,
+  but not the text of a `streaming` row other than its own. When the list owns its scroller (the
+  `transcript` mount `ChatEmbed` uses), a row is drawn again when its own messages, the host's props
+  or any other row change, except one change: a streaming row's text growing, which redraws that row
+  alone. Every built-in rule that looks ahead (the reply footer, the steer chip, a retry notice's
+  tense) reads a streaming row by its role.
 - **Shape beats role.** Resolution is first-match, and your entries sit between the two built-ins
   recognised by message *shape* — a stop event and a sub-agent completion, which claim `'*'` and gate
   on a `match` predicate — and the role-keyed ones. This matters because a stop event reaches the
@@ -326,6 +535,15 @@ Two rules the registry relies on:
   says "no row by design"; no entry at all says "nothing handles this". Both look identical on
   screen, so `website/src/test/messageRenderers.test.ts` pins which is which.
 
+### Error hand-off inside the list
+
+A failed approval decision, a refused tool-output copy and a failed MCP sign-in banner render an
+`ErrorNotice` with the "Ask the agent" hand-off, which navigates to the main chat. A host holding unsaved local state that the
+navigation would drop passes `handOff={false}` to `ChatMessageList`: those notices then render
+without the button, and renderers see `ctx.handOff === false`. `ChatEmbed` does this because its
+composer draft lives only in the embed; `ChatPane` does too, for its staged message quote. `ToolCallPill` takes the same switch as `askAgent`.
+Default is `true`, so a host with nothing to lose keeps the hand-off.
+
 ### Exports
 
 | Export | Kind | Purpose |
@@ -334,7 +552,7 @@ Two rules the registry relies on:
 | `defaultMessageRenderers` | value | the built-in registry, in resolution order |
 | `mergeRenderers(extra)` | function | shape-matched defaults, then host entries, then the rest |
 | `resolveRenderer(message, renderers)` | function | first entry that claims the message |
-| `ToolCallPill` | component | the store-free tool row the default registry uses |
+| `ToolCallPill` | component | the store-free tool row the default registry uses; expanded, it shows the persisted `meta.input` / `meta.output` in the main chat's Input/Output panel, and falls back to the row's `content` only when both are empty |
 | `GROUPED_ROLES` | value | frozen array of the roles grouped before per-row resolution (see the limitation above) |
 | `MessageRenderer` | type | `{ id, roles, match?, render }` |
 | `MessageRenderContext` | type | what `render` is handed |
@@ -979,6 +1197,30 @@ does so before each reconnect.
 | `injectContext(slot, content, opts?)` | `inject_context(slot, content, *, source?, ephemeral?, max_age?)` |
 | `flushPendingContext(slot)` | `flush_pending_context(slot)` |
 | `setDefaultSlot(slot)` | `set_default_slot(slot)` |
+
+When `send_message` targets the default slot it flushes buffered context first.
+An entry the Gateway refuses for good (`context_not_queued` or
+`context_secret_shaped`) is dropped so it cannot block the send, and the send
+still goes through. Read the `last_flush_dropped` property after the call to see
+how many entries that send dropped: `send_message` resets it to 0 before it
+sends, and a direct `flush_pending_context` call sets it too, including when the
+flush raises on a transient failure.
+
+```python
+await mc.send_message("slot-1", "hello")
+if mc.last_flush_dropped:
+    print(f"{mc.last_flush_dropped} context entries were dropped; the turn ran without them")
+```
+
+`last_flush_dropped` belongs to the client, not to one call, so it describes a
+send only while sends on that client do not overlap; a later overlapping send or
+flush overwrites it. When you send concurrently, flush first and read the count
+that call returns, which is that call's alone:
+
+```python
+dropped = await mc.flush_pending_context("slot-1")
+await mc.send_message("slot-1", "hello")
+```
 
 The standalone package exports `KiroCrewClient`, `KiroCrewError`, `ErrorCode`,
 `WsClient`, `WsEvent` and `GATEWAY_CONFIG_KEYS`. It does not export

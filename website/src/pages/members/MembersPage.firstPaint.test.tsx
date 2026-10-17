@@ -35,6 +35,8 @@ vi.mock('../../api/client', () => ({
     webhooks: vi.fn(() => Promise.resolve({ tokens: [] })),
     defaultAgent: vi.fn(() => Promise.resolve({ default_agent: '' })),
     autonudgeList: vi.fn(() => Promise.resolve({ enabled: true, loops: [] })),
+    autonudgeForSlot: vi.fn(() => Promise.resolve({ enabled: true, loop: null })),
+    monitorForSlot: vi.fn(() => Promise.resolve({ enabled: true, monitor: null })),
   },
 }))
 
@@ -98,7 +100,7 @@ function renderPage(seed: { members: unknown[]; teams?: unknown[]; defaultAgent?
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 30_000 } } })
   queryClient.setQueryData(MEMBERS_ROSTER_QUERY_KEY, seed.members)
   if (seed.teams) queryClient.setQueryData(TEAMS_QUERY_KEY, seed.teams)
-  if (seed.defaultAgent !== undefined) queryClient.setQueryData(defaultAgentQuery.queryKey, seed.defaultAgent)
+  if (seed.defaultAgent !== undefined) queryClient.setQueryData(defaultAgentQuery.queryKey, { default_agent: '', default_template: seed.defaultAgent, overridden: false })
   ;(api.members as ReturnType<typeof vi.fn>).mockResolvedValue({ members: seed.members })
   const frames: Frame[] = []
   render(

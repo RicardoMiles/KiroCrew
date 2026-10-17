@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from body_stream_helpers import attach_json_body
 from chat_test_helpers import _make_ready_kiro_prerequisite
 
 from kiro_crew import artifacts as art_mod
@@ -336,7 +337,7 @@ def _request(
     req.match_info = match or {}
     req.query = {}
     encoded = json.dumps(body).encode() if body is not None else b""
-    req.read = AsyncMock(return_value=encoded)
+    attach_json_body(req, encoded)
     state = state if state is not None else MagicMock()
     # The dashboard owner: the artifact write routes refuse any other subject.
     state.owner_id = _OWNER

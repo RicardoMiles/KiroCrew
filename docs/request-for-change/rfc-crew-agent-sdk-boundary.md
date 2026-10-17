@@ -225,13 +225,13 @@ consolidates this one into `agent_sdk` and closes those two gaps.
 **Three of the four concerns v3 listed have since moved**, and `session.py` only
 forwards to them. The state is no longer where this subsection said it was:
 
-- `_warm_pool` is a forwarding property at `session.py` onto
+- `_warm_pool` is a forwarding property at `session_parts/state_views.py` onto
   `session_pool.py`, which owns the pre-spawned process pool.
-- `_bg_runtime` and `_bg_runtime_lock` forward from `session.py`
+- `_bg_runtime` and `_bg_runtime_lock` forward from `session_parts/state_views.py`
   onto `session_background.py`.
-- `_subagent_runtimes` forwards from `session.py` onto
+- `_subagent_runtimes` forwards from `session_parts/state_views.py` onto
   `session_allocation.py`.
-- `_rss_max_mb` forwards from `session.py` onto `session_cleanup.py`. Its
+- `_rss_max_mb` forwards from `session_parts/state_views.py` onto `session_cleanup.py`. Its
   settings loader is still imported from *inside* the ACP package.
 
 Those four are now a boundary question about where the SDK reads them, not a
@@ -320,9 +320,9 @@ kinds of undeclared hole:
 
 | Kind | Count | Failure mode when the companion omits it |
 |---|---|---|
-| `getattr`-by-name seams whose target the core never defines — `getattr(self, "_write_claude_local_settings", None)` (`acp/client.py:2742`) | 2 | Silent: no permission mode, and the context window collapses from 1M to 200K |
-| Methods returning a neutral value purely so a companion can override them — `_session_mcp_servers() -> []` (`acp/client.py:2335-2346`) is the type case | 6 | Silent: a CC session gets **zero MCP tools**, as the docstring itself states |
-| `ClaudeCodeProvider is not None and isinstance(...)` guards against a name hard-coded to `None` (`session.py:170`, `subagent.py:131`) | 11 sites | Statically unreachable; nine `session.py` branches and two `subagent.py` branches are dead-but-maintained |
+| `getattr`-by-name seams whose target the core never defines — `getattr(self, "_write_claude_local_settings", None)` (`AcpClient._write_claude_local_settings`) | 2 | Silent: no permission mode, and the context window collapses from 1M to 200K |
+| Methods returning a neutral value purely so a companion can override them — `_session_mcp_servers() -> []` (`AcpClient._session_mcp_servers`) is the type case | 6 | Silent: a CC session gets **zero MCP tools**, as the docstring itself states |
+| `ClaudeCodeProvider is not None and isinstance(...)` guards against a name hard-coded to `None` (`ClaudeCodeProvider` in `session_parts/provider_probes.py`, `subagent.py:131`) | 11 sites | Statically unreachable; nine `session.py` branches and two `subagent.py` branches are dead-but-maintained |
 | Defensive attribute probes across the provider boundary (`session_pid.py` (`_collect_active_pids`) probes `_proc` and `_active_proc`, `chat_runner.py:867`, `knowledge/llm_pool.py:325`) | 4 | Duck typing in place of a type |
 | Comment clusters naming the companion or a deleted module as the supplier of behaviour | 19 | The seam's real contract lives in prose |
 | Refusal / downgrade mechanisms, including the degrade log in `acp_backends.resolve_selected_backend()` and five capability non-memberships | 9 | — |
@@ -555,7 +555,7 @@ currently appear in 14 non-ACP modules: `AgentError`, `AgentAuthRequired`,
 required — **`AgentRuntimeMissing`**, raised by `AgentSupervisor.preflight()` when
 a declared auxiliary runtime cannot be resolved. Today a missing
 `CLAUDE_CODE_EXECUTABLE` produces a warning log and then death at `session/new`
-(`acp/client.py:2807-2820`); a declared requirement plus a preflight turns that
+(`_resolve_claude_code_executable` in `acp/harness/claude.py`); a declared requirement plus a preflight turns that
 into a diagnosable refusal. `AgentAuthRequired` must remain distinguishable
 because the readiness gate depends on it (§10.4).
 
@@ -592,17 +592,17 @@ below. All `:NNN` references in the middle column are `acp_backends.py`.
 | `permission_config_required` | `permission_config_for()` over `ACP_BACKEND_PERMISSION_CONFIG` |
 | `bills_host_credits` | `bills_kiro_credits` membership |
 | `reports_subagent_progress` | descriptor level |
-| `activates_agent_by_mode` | `acp/client.py:3521` `if self._is_kiro:` |
-| `native_slash_commands` | `providers/acp.py:1263` `if self.is_claude_backend:` |
-| `reports_compaction_status` | a comment at `providers/acp.py:1297-1306` |
-| `resume_needs_local_transcript` | `acp/client.py:3408` `if self._is_claude:` |
+| `activates_agent_by_mode` | `AcpClient._initialize_session` `if self._is_kiro:` |
+| `native_slash_commands` | `AcpProvider.stream_command` (`providers/acp_turns.py`) `if self.is_claude_backend:` |
+| `reports_compaction_status` | a comment in `AcpProvider.compact` (`providers/acp_turns.py`) |
+| `resume_needs_local_transcript` | `AcpClient._initialize_session` `if self._is_claude:` |
 | `injects_mcp_per_session` | `acp/client.py` |
-| `advertised_ids_comparable` | `acp/client.py:2438` `if self._is_kiro and self._model_is_unusable(...)` |
-| `substitutes_models_at_session_new` | `acp/client.py:3323` |
-| `can_reset_config_default` | `providers/acp.py:1139` |
-| `effort_applied_at_spawn` | `providers/acp.py:957` |
+| `advertised_ids_comparable` | `AcpClient.set_model` `if self._is_kiro and self._model_is_unusable(...)` |
+| `substitutes_models_at_session_new` | `AcpClient._apply_startup_model` |
+| `can_reset_config_default` | `AcpProvider.clear_effort` (`providers/acp_model_effort.py`) |
+| `effort_applied_at_spawn` | `AcpProvider._apply_initial_effort` (`providers/acp_model_effort.py`) |
 | `permission_mode_is_spawn_scoped` | the companion’s provider, itself `getattr(client, "_is_claude", False)` |
-| `writes_own_transcripts` | `acp/client.py:3505` `if self._session_id and self._is_kiro:` |
+| `writes_own_transcripts` | `AcpClient._initialize_session` `if self._session_id and self._is_kiro:` |
 
 Two of these deserve a note because an earlier draft got them wrong.
 `recyclable_on_host_logout` was drafted as `own_identity_store`, which **inverts**
@@ -621,7 +621,7 @@ land is PR 3's to settle (§7).
 **Not every backend question is a session question, and one of these is not.**
 `SessionCapabilities` is read off a live session, which makes it the wrong home for
 a question asked in order to decide *how to build* that session.
-`ACP_BACKENDS_ACP_RUNTIME` is exactly that case: a helper in `session.py`
+`ACP_BACKENDS_ACP_RUNTIME` is exactly that case: a helper in `session_parts/policy.py`
 (spelled `_bg_runtime_backends()` today) computes
 `ACP_BACKENDS_ACP_RUNTIME & selectable_backends()` per call, and its callers
 consult the result against the configured `agent.acp_backend` **string** to choose
@@ -651,7 +651,7 @@ def spawnable_multiplexed_selections() -> frozenset[str]:
 ```
 
 `multiplexes_sessions` stays on `SessionCapabilities` for the post-session
-question (the existing spelling, `providers/acp.py:466-476`, needs a started
+question (the existing spelling, `AcpProvider.is_session_sharing_eligible`, needs a started
 process, which is what makes it post-session). A registry function was chosen over
 an `AgentSupervisor.can_multiplex(selection) -> bool` method for two reasons: the
 answer is genuinely set-valued, so a boolean accessor throws away the shape at
@@ -675,10 +675,10 @@ capabilities as booleans beside them. Checking that draft against Claude Code
 found the flaw: **capabilities gate behaviour, but not method presence.** A
 foreign host's profile is not "kiro-cli minus a few flags" — it is a set of
 absences that change control-flow *shape*. No `set_mode` removes the home of a
-fail-closed privilege check (`acp/client.py:3513-3536`). No compaction
+fail-closed privilege check (`AcpClient._initialize_session`). No compaction
 notification inverts a two-call API into one. No `commands/execute` deletes a
-method the draft never drew at all, though `acp/client.py:4860-4920` is real
-surface with a real degradation branch at `providers/acp.py:1263-1268`. Under a
+method the draft never drew at all, though `AcpClient.stream_command` is real
+surface with a real degradation branch in `AcpProvider.stream_command` (`providers/acp_turns.py`). Under a
 flat mandatory interface every absence becomes an implement-and-raise stub, and
 the `not is_claude` inference the frozensets were built to kill reappears at the
 SDK boundary where consumers can no longer see it.
@@ -709,13 +709,13 @@ Optional, presence-tested:
 `compact()` returns a `CompactionResult` rather than being a two-call
 `compact` + `wait_for_compaction` pair, because the two-call form encodes Kiro's
 asynchronous model. On a host that compacts synchronously inside `session/prompt`
-no status notification ever arrives, `providers/acp.py:1378-1386` leaves the
+no status notification ever arrives, `AcpProvider.compact` (`providers/acp_turns.py`) leaves the
 result unset, and the wait can only time out. A driver that *does* report status
 additionally implements `AgentCompactionReporting`.
 
 `set_mode` is deliberately **not** a live setter in `AgentSessionConfig`. It is
 step 4 of session initialization and it carries a fail-closed privilege check
-(`acp/client.py:3513-3536`), so agent activation belongs to `create_session`;
+(`AcpClient._initialize_session`), so agent activation belongs to `create_session`;
 `AgentModeSwitchable` exists only for hosts that can also switch mid-session. A
 driver whose host cannot activate an agent by mode must declare
 `activates_agent_by_mode = False`, and the SDK must refuse to *silently* widen
@@ -726,7 +726,7 @@ privilege when it is absent.
 | Member | Note |
 |---|---|
 | `preflight() -> None` | Resolves the entry point and every declared auxiliary runtime; raises `AgentRuntimeMissing`. Runs before a session is attempted. |
-| `create_session(request) -> AgentSession` | May return a session whose served model differs from the requested one; the substitution is reported as an event (`acp/client.py:3313-3332`). |
+| `create_session(request) -> AgentSession` | May return a session whose served model differs from the requested one; the substitution is reported as an event (`AcpClient._apply_startup_model`). |
 | `destroy_session`, `cleanup_session` | `cleanup_session` is a real member, not a shim: on a host that writes its own transcripts it must delete them (the companion does exactly this today). |
 | `adopt_session` | Ownership transfer of a live session. |
 | `persist_permission_mode(mode)` | Spawn-scoped on hosts where auto mode is a file consumed at the *next* spawn, hence a supervisor concern rather than a session setter. |
@@ -747,15 +747,15 @@ override.
 
 The 11 private shims stay out. Exactly one of them
 (`_drain_post_compaction_metadata`, reached by `getattr` at
-`providers/acp.py:1474`) has a cross-package caller today, and it is inside the
+`AcpProvider.wait_for_compaction` in `providers/acp_turns.py`) has a cross-package caller today, and it is inside the
 would-be driver — so nothing outside loses access.
 
 ### 5.4 The supervisor owns process and session lifecycle
 
-Moved into the SDK: the warm pool (`session.py:1108`), the shared background
+Moved into the SDK: the warm pool (`session_pool.py`), the shared background
 runtime, the per-parent subagent runtime map, the RSS
 watchdog threshold and its settings loader, provider adoption
-(`session.py`), and agent-process PID tracking, sweeping and reaping (currently
+(`_Session.adopt_provider` in `session_parts/record.py`), and agent-process PID tracking, sweeping and reaping (currently
 `session_pid.py`).
 
 This is the step that makes the boundary real. Without it `SessionManager` still
@@ -1085,7 +1085,7 @@ What moved:
 - Each of the six identity checks now reads a field: the model-id namespace
   (`config/loader.py`, `dashboard/chat_handlers.py`), whether the backend's own
   advertised list must be read back (`dashboard/handlers/agents.py`,
-  `dashboard/chat_runner.py`'s pinned-model verdict), which provider seam serves
+  `dashboard/chat_turn/model_fallback.py`'s pinned-model verdict), which provider seam serves
   the session (`dashboard/chat_runner.py`'s billing label, `subagent.py`'s
   session-file cleanup), whether compaction finishes inline
   (`dashboard/chat_runner.py`), and which channel carries an effort change
@@ -1558,7 +1558,7 @@ does not handle fails too.
    cannot express audit-only must declare the gap. A presence-tested protocol
    makes the absence type-visible; a boolean beside a mandatory method does not.
 4. **Skipping agent activation must not widen privilege.** `set_mode` carries a
-   fail-closed check (`acp/client.py:3513-3536`). A driver declaring
+   fail-closed check (`AcpClient._initialize_session`). A driver declaring
    `activates_agent_by_mode = False` must cause the SDK to refuse, not to proceed
    with an unactivated agent.
 5. **Credential scrub stays in the driver.** `scrub_agent_denied_env` and
@@ -1757,7 +1757,7 @@ reopens it.
    DECIDED: a `ChildAttribution | None` value object,** non-`None` only on
    subagent-related events.
    Measured rather than assumed. Outside `acp/` and `providers/`, the three
-   fields have **10 references across 4 files**: `dashboard/chat_runner.py:6624`; `subagent.py:1719`;
+   fields have **10 references across 4 files**: `dashboard/chat_runner.py:6624`; `subagent.py`;
    `messaging/driver.py:468`; plus two comment lines. `mcp_identity_ambiguous`
    has **zero** external readers. The 466-usage figure in §2.1 counts the whole
    `EVENT_*` / `STOP_REASON_*` vocabulary; almost none of it reads attribution.

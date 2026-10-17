@@ -53,7 +53,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from kiro_crew import platform_compat
-from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import (
     _JIRA_TOKEN_RE,
     CRED_JIRA_API_TOKEN,
@@ -67,6 +66,7 @@ from kiro_crew.config.loader import (
     vault_channel_env_value,
     warn_undecodable_env,
 )
+from kiro_crew.hidden_leaf_staging import publish_env
 from kiro_crew.mcp_gateway.secret_uri import SECRET_URI_PREFIX
 from kiro_crew.secrets import SecretVault
 from kiro_crew.secrets.vault import entry_revision
@@ -649,12 +649,11 @@ def migrate_env_secrets(
                         f"change is not clobbered. Re-run `kirocrew secrets import "
                         f"--apply` to finish rewriting the .env references."
                     )
-                atomic_write(
+                publish_env(
                     ep,
                     bom + new_text.encode("utf-8", errors="surrogateescape"),
-                    mode=0o600,
+                    restrict_on_error="raise",
                     fsync=True,
-                    restrict_to_owner=True,
                 )
         except BaseException:
             # The .env rewrite failed (or never ran). Roll back every vault entry

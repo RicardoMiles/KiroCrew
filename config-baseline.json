@@ -26,8 +26,10 @@
         "provider": "acp",
         "mcp_registry_mode": false,
         "mcp_quarantine_after_failures": 3,
-        "acp_backend": "",
+        "acp_backend": "kas",
         "member_acp_backend": "kas",
+        "kas_bundle": false,
+        "kas_bundle_url": "https://kas.crew.kiro.dev",
         "default_agent": "",
         "deepseek_env": {},
         "sweep_agents_backups": false,
@@ -66,6 +68,7 @@
         "recovery_backoff_max_secs": 120.0,
         "session_start_concurrency": "auto",
         "child_env_defaults": {},
+        "env": {},
         "cold_start_concurrency": "auto",
         "runtime_spawn_concurrency": "auto",
         "adaptive_concurrency": true,
@@ -341,10 +344,10 @@
       "sensitive": false,
       "tags": [],
       "label": "ACP Backend",
-      "help": "Which ACP agent to drive: '' = kiro-cli (default), or any other registered selectable backend id (e.g. 'kas' = kiro-agent). The live list of values is served by GET /api/config/schema.",
+      "help": "Which ACP agent to drive. Omitted or '' means no choice: KAS is the default. 'kiro' selects kiro-cli; any other value must be a registered selectable backend id. The live list is served by GET /api/config/schema.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": ""
+      "defaultValue": "kas"
     },
     {
       "path": "agent.member_acp_backend",
@@ -355,10 +358,39 @@
       "sensitive": false,
       "tags": [],
       "label": "Crew member ACP backend",
-      "help": "Backend for crew-member DM sessions: 'kas' (default) or another dispatch-capable backend (claude, codex, opencode, goose). Members dispatch work into worker sessions through session-control tools mounted per session over the wire, which the kiro-cli v2 backend cannot carry — a value resolving to kiro leaves member threads as plain chat (no dispatch tools), logged at session start.",
+      "help": "Backend for crew-member DM sessions: 'kas' (default when omitted or '') or another dispatch-capable backend (claude, codex, opencode, goose); 'kiro' selects kiro-cli. Members dispatch work into worker sessions through session-control tools mounted per session over the wire, which the kiro-cli v2 backend cannot carry — a value resolving to kiro leaves member threads as plain chat (no dispatch tools), logged at session start.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": "kas"
+    },
+    {
+      "path": "agent.kas_bundle",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "KAS: run Kiro Crew's own engine bundle",
+      "help": "When true, the 'kas' backend spawns the @kiro/agent build that 'kirocrew kas install' laid down under the data home (engines/kas/) with its own Node runtime, instead of reaching the engine through kiro-cli's ACP relay. kiro-cli is not needed on this route, and the engine always takes its credential from Kiro Crew's own sign-in (the dashboard's Sign in), never from kiro-cli's store. A true value with nothing installed refuses the spawn and names the install command.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false,
+      "requiresRestart": true
+    },
+    {
+      "path": "agent.kas_bundle_url",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "KAS bundle base URL",
+      "help": "https:// base the KAS engine manifest is fetched from (<base>/kas/<version>/manifest.json). Every artifact is sha256-pinned by that manifest and the manifest by this release, so the url chooses WHERE the pinned build is fetched from and never what is trusted. Only an https:// url is accepted; redirects that leave the host are refused.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": "https://kas.crew.kiro.dev"
     },
     {
       "path": "agent.default_agent",
@@ -988,6 +1020,34 @@
     },
     {
       "path": "agent.child_env_defaults.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
+    },
+    {
+      "path": "agent.env",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Agent Environment Variables",
+      "help": "Environment variables set on every agent process Kiro Crew starts for a chat session, background session or subagent, on every backend, and therefore inherited by everything that agent runs: shell tool calls, the MCP servers the agent itself starts, and their children. Not the gateway, MCP servers the gateway hosts, or Kiro Crew's own one-shot helper commands. For non-sensitive configuration such as a proxy, a CA bundle, an AWS profile or a package registry, e.g. {\"HTTPS_PROXY\": \"http://proxy.example:3128\", \"NO_PROXY\": \"localhost,127.0.0.1\", \"AWS_PROFILE\": \"dev\"}. A value set here wins over the same variable in the gateway's own environment; variables Kiro Crew sets for the session itself still win over this map, except defaults it fills in only when a name is unset (agent.child_env_defaults, the pytest-xdist worker cap), which this map overrides. A name this map refuses is rejected when the setting is saved (kirocrew config set or a dashboard write fails and names the key and the reason), and dropped with a warning naming the key if a hand edit puts it in config.json. Values are stored in plaintext, so a name that looks like a credential, with a name segment that is or ends in KEY, TOKEN, SECRET, PASSWORD, PASSWD or CREDENTIAL (API_KEY, GITHUB_TOKEN, APIKEY), is refused: keep credentials under Settings > Secrets. GOPRIVATE and TOKENIZERS_PARALLELISM are not credential names. Also refused: names Kiro Crew or the sandbox owns (PATH, HOME, TMPDIR, DBUS_*_BUS_ADDRESS, KIROCREW_*, KIRO_*, OPENCODE_*, ...); names known to make a shell, the loader, a runtime or a tool run code the command did not name (LD_*, DYLD_*, PYTHON*, NODE_OPTIONS, BASH*, SHELLOPTS, PS4, ZDOTDIR, IFS, SSH_*, GIT_* except GIT_TERMINAL_PROMPT and GIT_SSL_CAINFO, and any name ending in PATH, LIB, OPT, OPTS, OPTIONS, FLAGS, COMMAND, SHELL, EXECUTABLE, EDITOR, PAGER, ASKPASS, BROWSER, ...), including the location of a config file a tool may read a program from (KUBECONFIG, AWS_CONFIG_FILE, any name ending in CONFIG, CONFIG_DIR, CONFIG_FILE or CONFIG_HOME); the variables that move a harness's sign-in directory (CLAUDE_CONFIG_DIR, CODEX_HOME, XDG_CONFIG_HOME, XDG_DATA_HOME, ...); and names the agent environment scrub removes. Takes effect for agent processes started after the change: warm pooled processes and the shared background process are replaced, while a session that is already running, and subagents sharing its process, keep the environment that process started with.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {}
+    },
+    {
+      "path": "agent.env.*",
       "kind": "core",
       "type": "string",
       "required": false,
@@ -3374,6 +3434,8 @@
         "enabled": true,
         "provider": "local",
         "model": "base",
+        "custom_model_path": "",
+        "custom_model_sha256": "",
         "language_code": "auto",
         "polish": false,
         "streaming": true,
@@ -3385,7 +3447,8 @@
         "timeout_secs": 300,
         "transcribe_region": "us-east-1",
         "transcribe_profile": "",
-        "transcribe_vocabulary": ""
+        "transcribe_vocabulary": "",
+        "transcribe_languages": []
       }
     },
     {
@@ -3430,15 +3493,44 @@
       "sensitive": false,
       "tags": [],
       "label": "Model",
-      "help": "Which speech model the local provider downloads and runs. Bigger is more accurate and a longer first-time download: `tiny` on a machine short of memory, `base` for everyone, `small` when accents or jargon are being misheard, `large-v3-turbo` for the best accuracy available -- though on a CPU-only build it can recognise slower than you speak: an 11-second clip took 13.6 s on a 16-thread aarch64 CPU, 1.24x the audio. The Voice panel says so beside the choice when the build it measured has no acceleration.",
+      "help": "Which speech model the local provider downloads and runs. Bigger is more accurate and a longer first-time download: `tiny` on a machine short of memory, `base` for everyone, `small` when accents or jargon are being misheard, `large-v3-turbo` for the best accuracy available -- though on a CPU-only build it can recognise slower than you speak: an 11-second clip took 13.6 s on a 16-thread aarch64 CPU, 1.24x the audio. The Voice panel says so beside the choice when the build it measured has no acceleration. `custom` runs your own whisper.cpp model file named by `custom_model_path` instead, checked against `custom_model_sha256`.",
       "hasChildren": false,
       "enumValues": [
         "tiny",
         "base",
         "small",
-        "large-v3-turbo"
+        "large-v3-turbo",
+        "custom"
       ],
       "defaultValue": "base"
+    },
+    {
+      "path": "stt.custom_model_path",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": true,
+      "tags": [],
+      "label": "Custom Model File",
+      "help": "The file name of a whisper.cpp ggml model (`.bin`) to run INSTEAD of a catalog model, used when `model` is `custom`. Put the file in the speech models folder (`models/whisper` under the Kiro Crew home) first: the path must resolve to a regular file inside that folder, so `..`, an absolute path elsewhere, and a symlink pointing out of it are refused. Nothing is downloaded. Both this and the digest must be set; otherwise `custom` degrades to the default model with a warning.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
+    },
+    {
+      "path": "stt.custom_model_sha256",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": true,
+      "tags": [],
+      "label": "Custom Model SHA-256",
+      "help": "The 64-character hex sha256 of the file at `custom_model_path`. The file is hashed on every load and not used unless it matches, so a file swapped in the models folder is refused. A `sha256:` value or a `sha256sum` line is accepted too. Get it with `shasum -a 256 <file>` (or `Get-FileHash <file> -Algorithm SHA256` on Windows).",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
     },
     {
       "path": "stt.language_code",
@@ -3607,6 +3699,34 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""
+    },
+    {
+      "path": "stt.transcribe_languages",
+      "kind": "core",
+      "type": "array",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Transcribe Languages",
+      "help": "Languages to detect when speakers switch between them in one recording, such as vi-VN and en-US (`transcribe` provider, streaming only). With two or more, Amazon Transcribe identifies the language of each part and transcribes it in that language; with fewer, Language Code is used. At most five, and one dialect per language: en-US and en-GB cannot be picked together.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": []
+    },
+    {
+      "path": "stt.transcribe_languages.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
     },
     {
       "path": "computer_use",
@@ -7402,6 +7522,7 @@
         "language": "",
         "recent_tint_count": 0,
         "folder_sort": "custom",
+        "session_sort": "date-desc",
         "update_nudge": {},
         "onboarded": false,
         "import_onboarded": false,
@@ -7423,6 +7544,7 @@
         "github_hosts": [],
         "gitlab_hosts": [],
         "jira_hosts": [],
+        "bitbucket_server_hosts": [],
         "jira_auth": [],
         "link_patterns": []
       }
@@ -8204,6 +8326,29 @@
       "defaultValue": false
     },
     {
+      "path": "dashboard.terminal.external_app",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "External terminal app",
+      "help": "Desktop app only, on the machine running the gateway: adds \"Open in <your terminal app>\" to the Files tab's Project actions menu, which opens this app in the project directory. Empty = no external terminal; the built-in terminal is unaffected either way.",
+      "hasChildren": false,
+      "enumValues": [
+        "",
+        "alacritty",
+        "ghostty",
+        "gnome-terminal",
+        "kitty",
+        "konsole",
+        "wezterm",
+        "xfce4-terminal"
+      ],
+      "defaultValue": ""
+    },
+    {
       "path": "dashboard.terminal.completion",
       "kind": "core",
       "type": "object",
@@ -8365,6 +8510,27 @@
         "created"
       ],
       "defaultValue": "custom"
+    },
+    {
+      "path": "dashboard.session_sort",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Sidebar Session Order",
+      "help": "How the chat sidebar orders sessions: 'date-desc' / 'date-asc' by last activity, 'created-desc' / 'created-asc' by creation time, 'name-asc' / 'name-desc' by title. A view preference only; pinned sessions keep their own order. Stored here (not only in the browser) so the choice follows the user across browsers and the desktop app.",
+      "hasChildren": false,
+      "enumValues": [
+        "date-desc",
+        "date-asc",
+        "created-desc",
+        "created-asc",
+        "name-asc",
+        "name-desc"
+      ],
+      "defaultValue": "date-desc"
     },
     {
       "path": "dashboard.update_nudge",
@@ -8690,6 +8856,34 @@
     },
     {
       "path": "dashboard.jira_hosts.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
+    },
+    {
+      "path": "dashboard.bitbucket_server_hosts",
+      "kind": "core",
+      "type": "array",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Bitbucket Server Hosts",
+      "help": "Exact hostnames (optionally host:port) of Bitbucket Server or Bitbucket Data Center instances whose pull-request URLs the Changes panel and session source links may read, read-only, over the instance's REST API. Empty = none (deny-by-default): a /projects/KEY/repos/SLUG/pull-requests/N URL is only fetched when its host is an exact member of this list. Suffixes and wildcards are not matched, and bitbucket.org is never a Bitbucket Server host. A host that is also listed in gitlab_hosts, jira_hosts or github_hosts is refused. The gateway sends an HTTP access token only to the listed host it belongs to: the vault secret BITBUCKET_SERVER_TOKEN serves a single listed host, and BITBUCKET_SERVER_TOKEN_<HEX> (the host's hex encoding, as the panel's setup message names it) serves one host of several. Without a token the read is anonymous.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": []
+    },
+    {
+      "path": "dashboard.bitbucket_server_hosts.*",
       "kind": "core",
       "type": "string",
       "required": false,
@@ -9140,6 +9334,34 @@
       "defaultValue": ""
     },
     {
+      "path": "agents.*.worker_model",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Worker Model",
+      "help": "Model for the sessions this crewmate dispatches through session_create when the call names none. Empty copies the crewmate's model pin when set; with both fields empty, no session model is pinned and the worker's own agent or the global default decides. Unlike 'model', 'auto' is a real pin here: workers run on the backend's own default, which is how a crewmate on a costly model keeps its workers cheap. An explicit model on the call wins.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
+    },
+    {
+      "path": "agents.*.worker_reasoning_effort",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Worker Reasoning Effort",
+      "help": "Reasoning effort for the sessions this crewmate dispatches through session_create when the call names none. Empty means: while the workers run the crewmate's own model (worker_model empty and no model on the call) they take the crewmate's own effort (the field above); under any other model no level is pinned and the worker's agent decides as usual (its own crew pin if it runs as a crewmate, else agent.reasoning_effort, else the model default). Set, one of the five standard levels. An explicit effort on the call wins.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
+    },
+    {
       "path": "agents.*.approval_mode",
       "kind": "core",
       "type": "string",
@@ -9491,6 +9713,48 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": "default"
+    },
+    {
+      "path": "apps",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Apps",
+      "help": "Per-app user settings, keyed by the app's manifest name.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {}
+    },
+    {
+      "path": "apps.*",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": null
+    },
+    {
+      "path": "apps.*.model",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Model",
+      "help": "Model this app's sessions and background agents start on when nothing more specific picks one. Empty inherits, so the app runs exactly as it would without this setting. A model picked for the session, the app's own pick (a Research campaign, the Spec Builder default), and a model pinned on the agent or crew all win over it; it wins over the global default. A model this account cannot run is withheld like any other pin.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
     },
     {
       "path": "auto_update",

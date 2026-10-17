@@ -9,8 +9,9 @@ mapped through both. Every untrusted value is screened or scrubbed here before i
 lands beside a trusted frame.
 
 The member section, the rules gate and the lifecycle verdict that decides both stay
-at the ``members.member_turn_context`` chokepoint in :mod:`kiro_crew.context`, as do
-the trigger-matched skill bodies and the request boundary itself.
+at the ``members.member_turn_context`` chokepoint in ``ContextBuilder.build_message``
+(:mod:`kiro_crew.context_assembly.turn_message`), as do the trigger-matched skill
+bodies and the request boundary itself.
 
 New per-turn blocks belong here.
 """
@@ -116,7 +117,9 @@ def post_compaction_parts(
         parts.append(
             "[Memory tools] Call memory_recall with specific keywords for prior facts and tasks.\n"
         )
-    _inject, _globs = ctx._skills_injection_plan(agent, is_cc=is_cc, project_dir=project)
+    _inject, _globs = ctx._skills_injection_plan(
+        agent, is_cc=is_cc, project_dir=project, provider_type=provider_type
+    )
     if _inject:
         _cfg = ctx.KiroCrewConfig.load()
         lazy_skills = bool(getattr(_cfg.skills, "lazy_load", False))

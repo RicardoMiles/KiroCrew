@@ -86,16 +86,18 @@ an edited or shortened prefix refuses acknowledgement. Receipts are not pruned.
   mode tightening. It carries routing data; ordinary auth remains independent.
 - `memory_stores.py` resolves configured store paths and explicit member creation.
   `members.py` owns persisted member IDs and manual member documents.
-- `memory_schema.py` defines the authoritative member tables. `vector_memory.py`
-  owns exclusive creation, strict open and the store's one connection and lock.
+- `memory_schema.py` defines the authoritative member tables.
+  `vector_memory_member.py` owns exclusive creation and strict open, and
+  `VectorMemoryStore` (`vector_memory.py`) the store's one connection and lock.
   Learned reads/writes, FTS and vectors run on that connection, split between the
   store and the `vector_memory_runtime/` modules it delegates to (see
   [Store composition](#store-composition-vector_memorypy-and-vector_memory_runtime));
   `memory_record_metadata.py` maintains revisions, proposals and provenance.
 - `memory.py` is the facade for manual documents and learned history. V2 learned
   operations delegate to its admitted SQLite handle; V1 keeps its file layout.
-- `history_consolidation.py` publishes a member span atomically and recovers its
-  receipt. `context.py` and `member_essential_context.py` assemble manual context
+- `history_consolidation_pass.py` (`HistoryConsolidator._consolidate`, bound
+  through the `history_consolidation.py` facade) publishes a member span
+  atomically and recovers its receipt. `context.py` and `member_essential_context.py` assemble manual context
   from the captured member, with an optional SQLite learned-rule component.
 - `member_memory_backup.py` and `memory_startup.py` coordinate ordinary backup,
   staged restoration and connection lifetime without a second identity authority.
@@ -240,6 +242,33 @@ live. Namespace admission and store-lifetime coordination prevent a directory
 replacement while a writer retains a handle. Startup recovery runs before memory
 consumers open the selected generation. Failures retain the old data and report
 unavailability; no read creates a replacement database.
+
+A reader whose view of `memory_stores/` refuses writes (a read-only mount, or a
+script cron's sandbox that binds the tree read-only) still takes both locks:
+`hold_stores_for_read` opens the existing `.namespace.lock` and each store's
+`.store-use.lock` read-only and takes the same `flock`, which contends on the
+inode the gateway's writers lock. A lock file absent from such a view is read
+without, with a warning; a namespace lock that appears during that read refuses
+it, and nested namespace operations on the reading thread share that lockless
+hold. A lock file this process's user does not own is refused. On the same view
+a closed WAL store database (no `-wal`, no `-journal`) cannot get the `-shm` an
+ordinary `mode=ro` open creates. When that open fails with SQLite's read-only,
+cannot-open or permission result, the snapshot copies it `immutable=1` while
+holding the POSIX read lock an ordinary SQLite reader holds on the file, from
+before the copy until after its check: a rollback-journal writer cannot change
+the file meanwhile, and a WAL writer's last close cannot remove its `-wal`. A
+writer already holding a conflicting lock refuses the copy, and where the lock
+cannot be taken (Windows, or a filesystem without record locks) the open's own
+refusal stands. The copy is refused if the file's identity (size, mtime or
+ctime) moved, a `-wal` or `-journal` appeared beside it, or the staged copy
+fails `quick_check`.
+A store the gateway holds open keeps its `-wal` and `-shm`, and the ordinary
+`mode=ro` open reads it through a read-only `-shm`. A lock file the read
+refuses (redirected, not a private regular file, or a namespace lock that
+appeared mid-read) ends `kirocrew snapshot` with exit 1 and its reason,
+audited as `snapshot_rejected` with `reason=memory_store_refused`.
+Allocation, replacement and restore keep the writable open and fail on such a
+view.
 
 `MemoryStore` keeps Global V1 index placement unchanged:
 `MemoryStore()` uses `<home>/memory_index.db`, while an explicitly supplied
@@ -612,30 +641,22 @@ Structured memory system backed by SQLite + FAISS + in-process embeddings (vendo
 `VectorMemoryStore` is the one owner of a store's SQLite connection and its
 `_db_lock`. The class keeps:
 
-- the store lifecycle (`init`, `close`, `reconfigure`, lineage binding, owner-only
-  file lockdown) and the member-database operations;
-- the history files and their FTS index (`append_history`, `read_history_entries`,
-  `read_editable_history`, `replace_today_history`, `search_memory`,
-  `rebuild_memory_index`, `consolidation_receipt`);
-- record revisions and the eligibility filter (`_record_mutation`,
-  `with_record_metadata`, `_eligible_rows`);
-- the facet and event-log readers (`count_by_facet`, `list_by_facets`,
-  `get_events`), event rotation (`rotate_events`), the `_log_event` and
-  `memory_meta` helpers and the read counters;
-- the episodic list, cap, delete and restore paths, the per-row embed calls
-  (`embed_episodic`, `embed_lesson`), `get_semantic`, the statistics readers
-  (`memory_stats`, `get_rejection_stats`), the embedding-space guards and the
-  invalidation of both resident scoring sets;
-- the write paths whose source the read-only guards pin to `vector_memory.py`:
-  `_write_semantic` with its consolidation branches, `write_episodic` and
-  `write_episodic_outcome`, `write_lesson`, `apply_consolidation`, `import_memory`,
-  and the writer loops of `migrate_from_markdown`, `promote_episodic_patterns` and
-  `seed_item_if_absent`.
+- the instance state every collaborator reads, built in `__init__`, and the lineage
+  binding (`_bind_lineage`);
+- `reconfigure`, the locked fetch helpers and read counters, the properties,
+  `get_semantic`, `_cosine_sim` and the derived-vector transaction `_vector_commit`.
 
 The other rules live in
-the modules of `kiro_crew.vector_memory_runtime`. Each store method keeps its name
-and signature and delegates to the function that owns the rule (`set_semantic` to
-`semantic.write_value`, for example):
+collaborator modules, and each member keeps its name and signature. Most delegate in
+one line to the runtime function that owns the rule (`set_semantic` to
+`semantic.write_value`, for example). The rest are bound: the class attribute IS
+the owner module's function, moved verbatim from the class body, which takes the
+store as `self` (annotated `self: VectorMemoryStore`) where a delegated rule takes it as
+`store`, and no module mixes the two; the class lists the bound members under one
+header per owner. A bound member reports its owner module as `__module__` and its bare
+function name as `__qualname__` (`write_lesson`, not `VectorMemoryStore.write_lesson`);
+nothing reads either. New code for a member goes to the module that owns it. In
+`kiro_crew.vector_memory_runtime`:
 
 | Module | Owns |
 |---|---|
@@ -649,6 +670,23 @@ and signature and delegates to the function that owns the rule (`set_semantic` t
 | `recall` | `recall`, its single-inference retry, and the bounded evidence payload |
 | `migration` | Legacy `lessons.jsonl` parsing, Markdown parsing through the `MemoryFiles` the store resolves, the episode clustering promotion uses, and promotion's key inference (`infer_semantic_key`) |
 | `text_scoring` | Stemming, the row-token memo, keyword and hybrid scores, MMR, the dense-script keyword floor and the list-search predicate |
+| `write_outcomes` | What a write reports: `SemanticRejectCode`, `LessonWriteOutcome`, `EpisodicWriteOutcome` and `LessonWriteResult`, which keep `kiro_crew.vector_memory` as their `__module__` |
+| `lesson_write` | `write_lesson` (refusal screens, the scope-local dedup scan and its authority pre-pass, deferred supersede, the lesson vector) and `embed_lesson` |
+| `episodic_write` | `write_episodic` and `write_episodic_outcome` (screens, dedup, capacity, the FAISS add; the facade's `_injection_audit_snippet` redacts the injection-refusal snippet), forget, restore, cap eviction and row reads |
+| `bulk_ingest` | The writer loops of `migrate_from_markdown`, `import_memory` and `promote_episodic_patterns` |
+| `store_bookkeeping` | Record revisions and eligibility (`_record_mutation`, `with_record_metadata`, `_eligible_rows`), the `memory_events` audit trail (`_log_event`, `get_events`, `rotate_events`, `get_rejection_stats`) and the `memory_meta` helpers |
+| `derived_state` | Vector-space currency (the embedding token and the config guard a managed vector is published under) and the invalidation of both resident scoring sets |
+
+Beside the facade, and bound the same way, live the owners a runtime module may not
+be: the code that opens the connection, and the code that names a relation only the
+crew lineage has:
+
+| Module | Owns |
+|---|---|
+| `vector_memory_lifecycle` | `init`, `_init_database`, `close`, owner-only file lockdown, and the V1 schema (`_SCHEMA_V1`, `_migrate_v2`, `_MEMORY_META_TABLE`, `_MIGRATIONS`) |
+| `vector_memory_member` | Member-database provisioning and admission identity (`create_member_database`, `read_member_database_identity`, `open_member_database`, `declared_store`), the history files and their FTS index, `consolidation_receipt`, `apply_consolidation` and `seed_item_if_absent` |
+| `vector_memory_semantic_write` | `_write_semantic` with its consolidation branches |
+| `vector_memory_inventory` | `get_episodic_list`, the facet readers (`list_by_facets`, `count_by_facet`) and `memory_stats` |
 
 A runtime function that works on a store takes it as its first argument. Every
 statement it runs, its commits and its `memory_meta` and `memory_events` writes
@@ -672,15 +710,19 @@ it through the owner module (`_text_scoring._MMR_MAX_POOL`,
 owner reaches every caller. `lessons` keeps one copy on purpose, `_stem_one`, because a test
 patches it apart from `text_scoring._stem_one`; a class is imported by name, since
 a patch of a class lands on the object every binding shares.
-`vector_memory.py` imports every runtime module when it loads and still
-binds every name it defined or imported from another `kiro_crew` module, and the
-runtime modules log on the `kiro_crew.vector_memory` logger.
+`vector_memory.py` imports every owner module when it loads and still
+binds every name it defined or imported from another `kiro_crew` module, and every
+owner logs on the `kiro_crew.vector_memory` logger.
 `test/test_vector_memory_composition_contract.py` pins that surface, the seams and
 the one-binding rule for a name two modules read, the import and logger rules and the through-the-store call
 rule, and re-applies the source guards that scan
 `vector_memory.py` by name — the lineage relation and kind-guard checks, the
 facet-in-view check, the redaction-sink and md5 checks — to every runtime module,
 each with a planted violation proving the re-applied check can fail.
+`test/test_vector_memory_owners.py` pins the bound members (each is its owner's
+function, the inventory is frozen per owner, none needs the class body), applies the
+same placement and seam rules to the owners beside the facade, and pins where the
+injection-refusal snippet is redacted.
 
 ### Live reconfiguration (`VectorMemoryStore.reconfigure`)
 
@@ -735,8 +777,9 @@ a column the `WHERE` clause excluded), while a concurrent FAISS `add` during a
 `search` can corrupt the C++ index outright. `self._db_lock` (a reentrant
 `threading.RLock`, so a locked method may call another locked method)
 serializes every statement on that connection. The structural regression guard
-scans `vector_memory.py` and every `vector_memory_runtime` module (where the store
-is the `store` parameter), recognizes explicit lock scopes and `_vector_commit`,
+scans `vector_memory.py`, the owners beside it and every `vector_memory_runtime`
+module (where the store is `self` in a bound owner function and `store` in a
+delegated rule), recognizes explicit lock scopes and `_vector_commit`,
 checks the latter's actual `ExitStack.enter_context(_db_lock)` acquisition, and
 fails if that acquisition is removed. Its negative fixtures retain checks before acquisition, after scope
 exit, on failed admission and in deferred nested functions. Generation rechecks
@@ -762,8 +805,8 @@ The critical sections that matter most:
 
 An async caller offloads every operation that can reach `_db_lock`, including
 `close()`, so contention never stalls the event loop. The source gate derives
-the ordinary method set from the store call graph, following each delegate into
-the runtime function that implements it, pins that set, and separately tracks
+the ordinary method set from the store call graph, following each delegate and each
+bound member into the owner function that implements it, pins that set, and separately tracks
 constructor-bound receivers for the generic lifecycle names `init` and `close`.
 
 **The lock is never held across an embedding call.** An embed on a loaded model
@@ -793,8 +836,8 @@ carve facets, with v1's relation names re-presented over it as views. **Every ot
 file, above all `config_dir()/"memory.db"`, is the v1 lineage**, frozen at
 `schema_version` `{1, 2, 3}` with `semantic_memory` and `episodic_memories` as real
 tables. Two lineages, one engine: no cutover, no dual write, no backfill, and no
-`CONTRACT_VERSION` bump. `memory_schema.py` owns the crew lineage; `vector_memory.py`
-keeps owning v1's `_MIGRATIONS`.
+`CONTRACT_VERSION` bump. `memory_schema.py` owns the crew lineage;
+`vector_memory_lifecycle.py` owns v1's `_MIGRATIONS`, which `vector_memory` re-exports.
 
 **`memory_events` and `memory_meta` have ONE definition, and it is not per-lineage.**
 They are the only product tables the engine reaches with no relation indirection —
@@ -859,7 +902,7 @@ never becomes a second, divergent notion of what a lesson is.
 
 **`semantic_memory` and `episodic_memories` survive as READ-ONLY VIEWS presenting v1's
 exact columns in v1's exact order.** The read statements naming them in the
-engine (`vector_memory.py` and `vector_memory_runtime/`) are therefore unchanged, and `SELECT *` still hands `sqlite3.Row`
+engine (`vector_memory.py`, its `vector_memory_*.py` owners and `vector_memory_runtime/`) are therefore unchanged, and `SELECT *` still hands `sqlite3.Row`
 the columns the engine expects. Splitting by `kind` is also what keeps the vector scorers
 partitioned by RELATION: episodic blobs are L2-normalized at write and semantic and
 lesson blobs are not, and three of the four places that score a stored blob take a bare
@@ -957,8 +1000,8 @@ indexes.
 twice over.** It names `memory_items`, a relation only the crew lineage has, so the same
 literal inside the engine would be a statement that raises on every v1 file — which is
 exactly what `test_memory_lineage_drift`'s "every relation the module names exists in both
-lineages" refuses for `vector_memory.py`, and the composition contract refuses for the
-`vector_memory_runtime` modules. And it keeps the one place a facet NAME is spliced into SQL beside
+lineages" refuses for `vector_memory.py` and its owners, and the composition contract
+refuses for the `vector_memory_runtime` modules. And it keeps the one place a facet NAME is spliced into SQL beside
 the dataclass those names come from.
 
 **Names come from an allowlist derived from the dataclass; values are bound.**
@@ -1539,6 +1582,18 @@ exact product-prompt URI stays in the product session-start path, not in
 essentials. Essential sources are validated on every member turn; their
 complete snapshot is submitted only when the conversation needs it.
 
+Between the permanent rules and the briefing the section carries `[YOUR GOALS]`
+when the member has any: every goal (user-owned), numbered as the Goals tab
+numbers them, and its key results' text, target and the numbers of the goals
+each serves, read from the gateway-only
+goal record (`member_goals.context_block`, `trust/member-goals/<slug>.json`,
+capped at `member_goals.CONTEXT_MAX_CHARS`). Unlike the rules it is total: an
+unreadable record omits the block instead of aborting the turn. It carries no
+readings: the essentials ride every turn and are dropped from the wire only
+while byte-identical to the last acknowledged snapshot, so a reading in the
+block would resend the whole section on every `key_result_progress`. The
+crewmate reads current values with `goal_read`.
+
 `ContextBuilder` injects the owner's identity, current permanent rules and
 bound custom-template persona on fresh, warm, resumed, post-compaction and
 minimal turns, including delegated and cron turns with no DM member argument.
@@ -1716,7 +1771,16 @@ refuses, and so does a link under any other declared glob. The launch-record siz
 check (`_declared_files_fit`, `projected_launch_paths`) does not opt in: it measures
 what kiro-cli loads and cannot measure a link it does not follow, so a link still
 withholds that record (the size check reports unfit, the path read refuses) and the
-folder sends every guide itself. There is no mtime-only content cache or automatic
+folder sends every guide itself. A steering document (implicit global or project
+scan, or a declared match with a `steering` path component) that passes the path
+screen, containment and the managed-state check but that the no-follow descriptor
+read still refuses -- a hard link an installer placed, a reparse point that is not
+a link, a file that changed shape between the walk and the open -- is likewise left
+out unread: the snapshot names it in one core
+`essential-context#unreadable-skipped:<template>` note, and the KAS document reader and `kiro_launch_documents` skip it with a
+warning. The read itself is unchanged, so the file is never opened through the
+second name. Any other declared source the read refuses still refuses the turn,
+and an oversized or non-UTF-8 steering file still raises. There is no mtime-only content cache or automatic
 retrieval on the warm path.
 
 Structural-marker scanning copies contiguous ASCII segments without per-character
@@ -3330,6 +3394,20 @@ TEXT: the deleted row is a tombstone, so by the time the caller looks it is abse
 by the `learn add` CLI and the `learn_add` tool, because that text is the last readable
 copy of the removed rule.
 
+A `deduped` result also names the stored lesson that claimed the write: `winner` is
+that row's display text (rule plus NOT-clause) and `winner_repo_scope` its stored
+scope, `None` when global. Both `deduped` reasons (`substring_covered`,
+`semantic_similarity`) fill them; every other outcome leaves them `None`.
+`POST /api/lessons` adds `winner` (redacted through `_redact_memory_field`, like
+`superseded`) and `winner_repo_scope` only when a winner exists. On the wire the scope
+is the `DELETE /api/lessons` selector for the winner's row, from `_lesson_scope_selector`:
+`""` for a global row, the fragment for a scoped one, and `null` when the fragment is
+unusable or the redaction chain would alter it. The `learn_add` tool prints the winner
+verbatim; with a string selector the replace path names `learn_remove` with that
+`repo_scope`, so the remove reaches only the winner's scope, and without one it keeps
+the `learn_list` wording. The `semantic_similarity` reply still never suggests
+removing the protected lesson.
+
 **The result's truth value is the old bool, deliberately.** `bool(result)` is `wrote`,
 byte-for-byte the predicate the previous `-> bool` return answered, so the three callers
 that only branch on success (`history.py` consolidation counting, the
@@ -3341,7 +3419,8 @@ bare assertion would keep passing while asserting nothing — a silent hazard my
 flag, since a bare `if` on any object is legal. `stored` is the separate property for
 "is my lesson in the store" (true for a no-op re-submit, which is NOT a write). Surfaces
 that report to a human or a model — the `learn add` CLI, the `POST /api/lessons` response
-(`ok` / `outcome` / `reason` / `superseded`), the `learn_add` tool result — read `outcome`
+(`ok` / `outcome` / `reason` / `superseded`, plus `winner` / `winner_repo_scope` on a
+deduped write), the `learn_add` tool result — read `outcome`
 and `reason`, and name the `superseded` rules when there are any.
 The dashboard Memory tab clears its draft and refreshes the list only for `inserted`
 or `enriched`; `unchanged` clears the draft but reports that it was already stored,
@@ -3530,9 +3609,11 @@ Debug catalog logs separate snapshot loading, directory scanning, metadata
 assembly and index persistence. This reduces cold latency without promising a
 constant-time scan of an arbitrary filesystem.
 
-**Loader composition (`skills.py` and `skill_runtime/`).** `SkillsLoader` keeps
-its state, its locks and every member it had. Each delegated method keeps its name
-and signature and calls the function that owns the rule in `kiro_crew.skill_runtime`:
+**Loader composition (`skills.py`, `skill_runtime/` and the `skills_*` owners).**
+`SkillsLoader` keeps its state, its locks and every member it had, each with the same
+name, kind and signature. Its behaviour lives in two families of owner modules. A member
+that delegates to `kiro_crew.skill_runtime` keeps a one-line body in `skills.py` that
+calls the function owning the rule:
 
 | Module | Owns |
 |---|---|
@@ -3545,30 +3626,65 @@ and signature and calls the function that owns the rule in `kiro_crew.skill_runt
 | `auto_skills` | Generated-skill create, refine and similarity, the lifecycle (archive, restore, eviction), the slug allocator and staging, and queue dismissal and pruning |
 | `versions` | Live auto-skill versions, `.versions/` snapshots and their pruning, and the frontmatter rewrite an update approval writes |
 
-`skills.py` keeps what repository guards pin to it by path: the enumerated-read
-choke point and its readers (`_read_enumerated_skill_bytes`, `_cached_frontmatter`,
-`load_skill`), the `repo_scope` gate sites (`get_always_skills`,
-`get_triggered_skills` with its `trigger_score` call, `scoped_skills`,
-`read_scoped_skill`), `delete_skill` and `_candidate_has_symlink` (the link-screen
-baseline), every redactor call site (the pending list, detail read, verdict,
-preview and approval that `security_posture` registers as this file's redaction
-sink, and the consent-picker `catalog_project_skills`), the tree walk
-`_iter_skill_files` (the resolved-path gate's call sites are counted per file), and
-the packaged-skill sync with its provenance, currency and cron-source checks.
-Trust enforcement and its audit stay beside the choke point they feed. A function a
-loader member delegates to carries that member's name, which keeps the link-screen
-gate's name-keyed resolver set unchanged. A method delegate passes the loader
-first; the function works on the loader's state under the loader's locks, reaches
-other loader behaviour through `loader.<method>()` so a class-level patch reaches
-every caller, reads the facade's constants and every name the facade imports from
-another `kiro_crew` module through `kiro_crew.skills` at call time, and logs on the
-`kiro_crew.skills` logger. A patch of one of those names on the facade therefore
-still reaches the moved code. A helper that moved is patched on its owner module,
+A member whose body lives in a top-level `kiro_crew.skills_<role>` owner is bound instead:
+the owner's module function carries the member's name and takes `self`, left unannotated
+so every pinned signature is unchanged, and the class binds it by name
+(`load_skill = _body_reads.load_skill`, `staticmethod(...)` for a static member), under one
+comment header per owner. The module-level code these owners hold is re-imported by
+`skills.py`, so every public name, and every name a test patches through
+`kiro_crew.skills`, stays importable from it as the same object:
+
+| Module | Owns |
+|---|---|
+| `skills_auto_model` | The `auto/` namespace and its on-disk layout, `AutoSkillProvenance` and the generated `SKILL.md` renderer, `ClaimRefusal`, and the pending-queue observer hooks |
+| `skills_discovery` | The skills directory, the packaged and trusted provider roots, the installed package's RECORD admission of a hardlinked `SKILL.md`, screening and adoption of the configured extra roots (`reconfigure`), the tree walk `_iter_skill_files` with its no-follow traversal of a trusted project, and the bounds on how long a walk's answer is served |
+| `skills_builtin_provenance` | The tree fingerprint, the provenance marker, the ownership check (`_verified_unchanged_fingerprint`), `installed_skill_currency` and the deployed cron-script source verdicts |
+| `skills_builtin_sync` | The packaged-skill sync (`_ensure_builtin_skills`, `sync_builtins`) with its claim, retirement, quarantine and opt-out carry, stale and relocated cleanup (`_RELOCATED_SKILLS`), and `remove_retired_conductor_skill` |
+| `skills_body_reads` | The project trust key and its audit, the enumerated-read choke point (`_read_enumerated_skill_bytes`) and the frontmatter cache, `load_skill` and the global body reader, exact-key reads of the scoped catalog with their paging, and the shapes that mark a tool call as a skill-body read |
+| `skills_selection` | `get_always_skills`, `get_triggered_skills` with its `trigger_score` call and the live per-message cap, the `repo_scope` gate, `scoped_skills`, and the user-first order of the startup index and the bounds it is rendered under |
+| `skills_candidate_tree` | A pending candidate's tree read without following a link: the link screen, the top-level layout guard both the verdict and the approve paths enforce, and the script collection walks with their entry and depth budgets |
+| `skills_review` | Operator review of untrusted skill text: the pending list, detail, script verdict, update preview and both approve paths, the consent picker's `catalog_project_skills`, and the redaction of everything they serve; it is the module `security_posture` registers as the pending detail and promotion redaction sink |
+
+`skills.py` keeps `__init__` and `close`, the `skill_runtime` delegates, `delete_skill` and
+`_safe_name` (the link-screen baseline names `SkillsLoader.delete_skill`), `search_skills`,
+the frontmatter grammar (`_parse_frontmatter`, `_parse_frontmatter_text`,
+`strip_frontmatter`), and three constants it defines itself (`_DIR_FD_SUPPORTED`,
+`_DOLLAR_SKILL_PATTERN`, `_MAX_DOLLAR_SKILLS`). Every other constant a `skill_runtime` owner
+reads through `kiro_crew.skills` is defined in the `skills_*` owner whose row above names
+its bound, and re-exported by `skills.py`. Code a repository guard pins by path goes to a
+`skills_*` owner; the loader's other rules go to a `skill_runtime` owner. Trust
+enforcement and its audit stay beside the choke point they feed, in `skills_body_reads`. A
+function a loader member delegates to or binds carries that member's name, which keeps the
+link-screen gate's name-keyed resolver set unchanged.
+
+A `skill_runtime` delegate passes the loader first; the function works on the loader's
+state under the loader's locks, reaches other loader behaviour through `loader.<method>()`
+so a class-level patch reaches every caller, reads the facade's constants and every name
+the facade imports from another `kiro_crew` module through `kiro_crew.skills` at call time,
+and logs on the `kiro_crew.skills` logger. A patch of one of those names on the facade
+therefore still reaches the moved code. A helper that moved is patched on its owner module,
 and a sibling owner calls it as an attribute of that module
-(`_listing._dedupe_identical_skills(...)`), never through a by-name import, so the
-patch reaches every caller. `skills.py` imports every runtime module when it loads and re-exports every
-module-level name that moved. `test/test_skills_composition_contract.py` pins that
-surface, the seams and these placement rules.
+(`_listing._dedupe_identical_skills(...)`), never through a by-name import, so the patch
+reaches every caller.
+
+A bound `skills_*` function reads its names as its own module's globals, and `skills.py`
+installs the facade mirror (`kiro_crew._facade_mirror`) over the `skills_*` owners: a write
+of a name `skills.py` binds reaches every owner binding the same object, so
+`monkeypatch.setattr(skills, "sel", ...)` reaches the moved readers exactly as it reached
+one module global. The two pending-queue hook globals live in `skills_auto_model` alone,
+because their setters rebind them there, and the mirror serves reads and writes of them
+through `skills.py`. The `skills_*` owners never import `kiro_crew.skills`, log on the
+`kiro_crew.skills` logger and keep their bodies' `self.<member>()` calls, so a class-level
+patch reaches them too. A bound function's `__module__` and `__qualname__` are its owner's
+(`kiro_crew.skills_body_reads`, `load_skill`); the generated link-screen baseline keys
+sites by that owner file and name. A moved class keeps its owner's `__module__`, except
+`PendingApprovalRefused`: a traceback names a raised class by it, so it keeps
+`kiro_crew.skills`. `skills.py` imports every owner when it loads and
+re-exports every public name that moved and every name a test patches through it; a
+private name only its owner reads stays on that owner.
+`test/test_skills_composition_contract.py`
+pins the surface, the seams and the `skill_runtime` placement rules, and
+`test/test_skills_bindings.py` pins the bindings, the owner order and the mirror's reach.
 
 **Source precedence** (project-level wins): `$KIROCREW_PROJECT_DIR/skills/` → `builtin_skills/` (bundled). Auto-copied to `~/.kiro/crew/skills/` on first run. Copies entire skill directories (scripts, assets, etc.).
 
@@ -4052,7 +4168,7 @@ See
 [context management](../../architecture/context-management.md#4-default-agent-vs-other-agents)
 for native view and inherited steering behavior.
 
-**Usage ledger (`skill_usage.py`, `SkillUsageLedger`):** in-memory per-skill hit tally with debounced, atomic persistence to `skill-usage.json` (`SKILL_USAGE_FILENAME`, co-located with the Kiro Crew home). Entries older than a 30-day TTL (`_MAX_AGE_SECS`) are dropped on load/flush so a stale skill stops occupying a top-K slot. Hits are recorded wherever a body reaches the model: the **body-delivery loop** in `context.py` (`_record_use`, called only after `load_skill` succeeds and the body is appended to the prompt), `resolve_dollar_skills`, an exact `skill_search` read (below), and direct reads of `SKILL.md` (see **Direct reads**). Since `max_triggered` defaults to 0 the body-delivery recorder is inactive in stock config, so the other three supply the hits unless the trigger matcher is re-enabled (`max_triggered > 0`). A trigger match alone does NOT earn a hit — only actual delivery does, so pointer-only skills and false-positive matches do not inflate the ranking. Best-effort: ledger init failure falls back to recency-only / unweighted ranking without breaking skill loading.
+**Usage ledger (`skill_usage.py`, `SkillUsageLedger`):** in-memory per-skill hit tally with debounced, atomic persistence to `skill-usage.json` (`SKILL_USAGE_FILENAME`, co-located with the Kiro Crew home). Entries older than a 30-day TTL (`_MAX_AGE_SECS`) are dropped on load/flush so a stale skill stops occupying a top-K slot. Hits are recorded wherever a body reaches the model: the **body-delivery loop** in `context_assembly/turn_message.py` (`ContextBuilder.build_message`; `_record_use`, called only after `load_skill` succeeds and the body is appended to the prompt), `resolve_dollar_skills`, an exact `skill_search` read (below), and direct reads of `SKILL.md` (see **Direct reads**). Since `max_triggered` defaults to 0 the body-delivery recorder is inactive in stock config, so the other three supply the hits unless the trigger matcher is re-enabled (`max_triggered > 0`). A trigger match alone does NOT earn a hit — only actual delivery does, so pointer-only skills and false-positive matches do not inflate the ranking. Best-effort: ledger init failure falls back to recency-only / unweighted ranking without breaking skill loading.
 
 **Dollar-load transcript snapshot:** the dashboard chat runner records each
 successful `$skillname` selection as one `system` row with
@@ -4081,7 +4197,13 @@ not recorded for older turns.
 A signed session resolves its active template and project at the gateway. An
 unreadable or missing custom template fails scope resolution rather than widening
 to the global catalog. A custom template with no mapping has an empty scope; only
-the default `kirocrew` template without mappings gets the global catalog. An
+the default `kirocrew` template without mappings gets the global catalog. Every
+spec Kiro Crew generates for itself counts as a custom template under that rule, so
+each generated agent whose prompt names a skill carries a `skill://` entry for it,
+written by `agent_materialization/skill_resources.py` from `skills_dir()` at
+install time and merged into whatever `resources` already hold. Without it those
+agents searched an empty scope and could not find the operating procedure their own
+prompt told them to read. An
 unsigned caller searches the global installed catalog, without borrowing a session.
 Search combines metadata and body term matches: query coverage first, then inverse
 term frequency, metadata coverage, usage and stable full key. This prevents common
@@ -5020,7 +5142,7 @@ repeats within one session; the opt-out also saves the first send, for a skill
 whose author declares it an offer rather than a mandate. The two are orthogonal,
 and confined project skills take neither (they always get the full body).
 
-**What `_record_use` counts.** Actual body delivery — the call sits in the body-delivery loop in `context.py`, after `load_skill` confirms the content and the body is appended to the prompt. Only skills whose body is actually injected earn a hit; pointer-only skills (`inject_on_trigger: false`) and undelivered false positives contribute nothing to the ranking. Three recorders feed it: trigger body delivery (inactive in stock config, where `max_triggered` defaults to 0), `$skillname` resolution in `resolve_dollar_skills` (an intentional user action), and a completed direct read of a skill's `SKILL.md` through a tool (`skill_runtime/read_credit.credit_skill_reads`, credited only after the read completes, so a denied or failed call leaves no delivery). This ensures the lazy-load hotness ledger ranks by actual utility to the agent, not by how often the word-overlap matcher fires on common words.
+**What `_record_use` counts.** Actual body delivery — the call sits in the body-delivery loop of `ContextBuilder.build_message` (`context_assembly/turn_message.py`), after `load_skill` confirms the content and the body is appended to the prompt. Only skills whose body is actually injected earn a hit; pointer-only skills (`inject_on_trigger: false`) and undelivered false positives contribute nothing to the ranking. Three recorders feed it: trigger body delivery (inactive in stock config, where `max_triggered` defaults to 0), `$skillname` resolution in `resolve_dollar_skills` (an intentional user action), and a completed direct read of a skill's `SKILL.md` through a tool (`skill_runtime/read_credit.credit_skill_reads`, credited only after the read completes, so a denied or failed call leaves no delivery). This ensures the lazy-load hotness ledger ranks by actual utility to the agent, not by how often the word-overlap matcher fires on common words.
 
 **Context Budget endpoint.** `GET /api/skills/-/budget` returns the 30-day
 per-skill injection cost with alias folding across renamed/aliased ledger keys.
@@ -5134,7 +5256,13 @@ alias was deleted or a symlink retargeted. Repeat calls avoid a re-walk only thr
 - `create_skill` is **all-or-nothing**: a failure mid-body (a short write, ENOSPC, an
   interrupt) rolls back the `SKILL.md` *and* the directory the call created, both
   through descriptors, and **both halves verify identity** because both address a NAME
-  under a descriptor: the leaf via `pinned_fs.unlink_verified`, which stats through the
+  under a descriptor. The leaf is `pinned_fs.write_new_file_pinned(dir_fd, "SKILL.md",
+  data, mode=0o666)` — the ONE pinned create-if-absent transaction, shared with the
+  steering create and the prompt create's by-name fallback, so the `O_EXCL` open, the
+  in-guard identity probe, the write loop, the in-guard close and the rollback below are
+  spelled once rather than per surface; `create_skill` keeps only its own taxonomy
+  (`FileExistsError` on the directory → `False` → 409) and the directory half. The leaf
+  rolls back via `pinned_fs.unlink_verified`, which stats through the
   directory's own fd and unlinks only if the inode is still the one the create made, and
   the directory via `pinned_fs.remove_dir_verified`, which stages it aside under the
   pinned parent and re-checks `(st_dev, st_ino)` before removing it. A rival that
@@ -5201,7 +5329,7 @@ and exfiltration URLs; clean assets are copied byte-for-byte, including leading
 and trailing whitespace. No per-asset preview truncation is used for either the
 security decision or the copied content.
 
-**Dashboard endpoints**: GET/POST `/api/skills`, GET/PUT/DELETE `/api/skills/{name:.+}`. POST sanitizes name to lowercase + hyphens + slashes. The mutating verbs (POST, PUT, DELETE) are owner-only and SEL-audited — app tokens and non-owner subjects get a 403 before any write — and the same owner gate fronts pending approve/dismiss/dismiss-all, pin, and inject-on-trigger, so every mutating skill endpoint in `prompts.py` refuses non-owner callers (the discover-module install endpoint carries its own internal-secret refusal instead; see learn-cron-dashboard.md's Skills CRUD entry). The two open-standard territories are read-only through this endpoint (`READONLY_SKILL_KEY_PREFIXES` in `handlers/prompts.py`): PUT or DELETE on a `kiro-user/` or `kiro-workspace/` key answers 405 with `Allow: GET` and `code: readonly_skill_prefix`, and a POST whose *sanitized* name lands in either territory answers 400 with `code: reserved_skill_prefix`. POST also bounds the sanitized name's length against `MAX_PROMPT_NAME_BYTES` and answers 400 with `code: name_too_long` before any write, measured on the whole name so that one bound covers a component past the filesystem cap, a joined path past `PATH_MAX`, and a nesting depth that would make `create_skill`'s `mkdir(parents=True)` recurse per level. Those keys resolve per-machine / per-session on read (`_resolve_skill_root`) while `create/update/delete_skill` join the key onto the core skills root, so a write would edit a different file than the reader was shown; GET is unaffected. GET `/api/skills` discovery (kirocrew `list_skills()` os.walk + frontmatter, `list_kiro_skills`, and the skill→agent annotation) is fully offloaded to the dedicated `discovery_executor` pool (`executors.py`) via `collect_skills_blocking`, so it never stalls the event loop past the loop-stall watchdog on large catalogs. The annotation is O(agents) — `annotate_skills_with_agents` parses the agent JSONs and pre-expands each agent's `skill://` globs once, then matches every skill against that in-memory set. The discovery pool is deliberately separate from the reaper-critical `maintenance_executor` so browser-triggered scans can't starve the orphan sweep. When `?agent=<name>` names an agent whose `skill://` globs are non-empty (the filter is actually applied), the response is the envelope `{"skills": [...], "agent_scoped": true, "agent": <name>}` instead of the bare array; every unscoped path keeps the bare-array shape (see the fuller rationale in learn-cron-dashboard.md's Skills CRUD entry).
+**Dashboard endpoints**: GET/POST `/api/skills`, GET/PUT/DELETE `/api/skills/{name:.+}`. POST sanitizes name to lowercase + hyphens + slashes. The mutating verbs (POST, PUT, DELETE) are owner-only and SEL-audited — app tokens and non-owner subjects get a 403 before any write — and the same owner gate fronts pending approve/dismiss/dismiss-all, pin, and inject-on-trigger, so every mutating skill endpoint in `prompts.py` refuses non-owner callers (the discover-module install endpoint carries its own internal-secret refusal instead; see learn-cron-dashboard.md's Skills CRUD entry). The two open-standard territories are read-only through this endpoint (`READONLY_SKILL_KEY_PREFIXES` in `handlers/prompts.py`): PUT or DELETE on a `kiro-user/` or `kiro-workspace/` key answers 405 with `Allow: GET` and `code: readonly_skill_prefix`, and a POST whose *sanitized* name lands in either territory answers 400 with `code: reserved_skill_prefix`. GET `/api/skills/{name}` returns `hash`, the sha256 of the returned SKILL.md text, and PUT takes it back as `base_hash`, using the prompts PUT's `base_hash` / `content_conflict` names, though here the base is optional and the PUT response carries no hash: a PUT without it writes unconditionally, a malformed one (not 64 lowercase hex) answers 400 `code: base_hash_required`, and when the file on disk differs from the base (an agent rewrote it, which sends the dashboard no push) the write is refused with 409 `code: content_conflict` (SEL-audited as rejected, reason `content_conflict`). A `base_hash` against a file the loader cannot read or refuses is not written and answers the ordinary 404. The compare and the write run together under one process-wide lock rather than through `verified_replace_file_nolink`: GET hashes the decoded text `load_skill` serves (BOM stripped, CRLF folded) while that primitive hashes raw bytes, and `update_skill` carries the skills root's pinned-directory, cache and hardlink handling; a successful PUT returns `{"ok": true}` with no hash, so the next edit base comes from a GET. On a conflict the Skills tab re-reads the file, shows its current text beside the kept draft and lets the user discard the draft or replace the file; the editor also re-reads SKILL.md when it opens rather than seeding from its page-lifetime cache (#13765). POST also bounds the sanitized name's length against `MAX_PROMPT_NAME_BYTES` and answers 400 with `code: name_too_long` before any write, measured on the whole name so that one bound covers a component past the filesystem cap, a joined path past `PATH_MAX`, and a nesting depth that would make `create_skill`'s `mkdir(parents=True)` recurse per level. Those keys resolve per-machine / per-session on read (`_resolve_skill_root`) while `create/update/delete_skill` join the key onto the core skills root, so a write would edit a different file than the reader was shown; GET is unaffected. GET `/api/skills` discovery (kirocrew `list_skills()` os.walk + frontmatter, `list_kiro_skills`, and the skill→agent annotation) is fully offloaded to the dedicated `discovery_executor` pool (`executors.py`) via `collect_skills_blocking`, so it never stalls the event loop past the loop-stall watchdog on large catalogs. The annotation is O(agents) — `annotate_skills_with_agents` parses the agent JSONs and pre-expands each agent's `skill://` globs once, then matches every skill against that in-memory set. The discovery pool is deliberately separate from the reaper-critical `maintenance_executor` so browser-triggered scans can't starve the orphan sweep. When `?agent=<name>` names an agent whose `skill://` globs are non-empty (the filter is actually applied), the response is the envelope `{"skills": [...], "agent_scoped": true, "agent": <name>}` instead of the bare array; every unscoped path keeps the bare-array shape (see the fuller rationale in learn-cron-dashboard.md's Skills CRUD entry).
 
 **Skill browse containment** (`_resolve_skill_root`, `read_skill_file` in `handlers/_shared.py`): the tree (`/api/skills/{name}/-/tree`) and file (`/api/skills/{name}/-/file`) endpoints serve any directory the resolver returns, so the resolver is the containment boundary. A candidate's *parent* must resolve at or under its own root (that is what rejects a symlinked intermediate directory), and so must the RESOLVED candidate itself — with two exceptions, both in `_leaf_is_contained`: `LEAF_SYMLINK_PREFIX` = `kiro-user/`, where an edition may install `~/.kiro/skills/<name>` as a link into its own tree; and a leaf whose resolved target is a directory an app DECLARES as a skill, because `apps.bridges._register_skills` symlinks each declared skill into the kirocrew skills root (flat AND `skills/<app>/` namespaced) with the target in the app's own tree — without that the browse side would be stricter than the loader and list skills in `GET /api/skills` that 404 when opened. The admissible set is the manifest's own `skills` entries, read through `bridges._registration_source` (the immutable package copy for a shipped builtin), NOT the app's root: an app tree also holds that app's data, tokens and rendered configs, and a link planted at `<root>/x -> <app>/data` must not serve them. The `package/` branch returns before that shared block, so it applies the same containment itself against the resolved `_edition_package_roots()` set — an edition packager can plant an escaping link in its own root like any other, and `package/` carries no allowance. Checking the parent alone for every prefix was a whole-filesystem read primitive: `<project>/.kiro/skills/x -> /etc` resolved to `/etc` and the endpoints enumerated up to `SKILL_TREE_MAX_ENTRIES` names and returned up to `SKILL_FILE_MAX_BYTES` per file from it, and `is_sensitive_path` is no backstop there (it is a `$HOME`-anchored credential denylist, not a containment check). A deliberate cross-checkout leaf link (`<project>/.kiro/skills/x -> ~/dotfiles/skills/x`) is indistinguishable from the exfiltration shape and is refused with it; the sanctioned way to browse a skill tree that lives elsewhere is `skills.extra_paths`, which makes that location a root of its own. `enumerate_skill_catalog`/`_collect_skills_under` carry the same per-prefix policy, because a key enumeration offers must be one the resolver accepts. File bytes then come from `hooks.safe_read_file_bytes_nolink(within_root=…)`, so containment holds on the opened descriptor rather than on a path resolved earlier: re-opening by name left a check-to-use window (an ancestor swapped for a symlink after the check) and no hardlink guard — `resolve()` does not follow a hardlink, so a link to a file outside the root passed the path check and was served. The root is passed as `within_root_is_canonical=True`, because it is already resolved: re-`realpath`ing it at read time would let the skill directory replaced by a link redefine the root it is being contained to. `list_skill_tree` walks by name, so a root replaced after admission is enumerated as whatever its name then denotes — filenames only, and the same exposure the rest of the by-name filesystem surface carries; holding the root across a traversal needs the walk itself to be descriptor-relative, which is a separate change. Every descriptor-level refusal answers one message (`access denied`, 403) rather than naming which guard fired. Refusals are already SEL-audited by the endpoints (`api_skill_tree` / `api_skill_file` outcomes), and the read is NOT trust-gated by design — reading a `SKILL.md` is how an operator decides whether to grant project-skill trust.
 
@@ -5294,7 +5422,7 @@ imported definition. Malformed effective-source JSON or non-object
 `mcpServers` values contribute no names and cannot abort an import. Repeated
 imports deduplicate through the provenance ledger.
 
-## Auto Skill Creation (`skills.py` + `history_consolidation.py` + `skill_runtime/auto_skills.py`)
+## Auto Skill Creation (`skills.py` + `skills_auto_model.py` + `skills_review.py` + `history_consolidation_skills.py` + `skill_runtime/auto_skills.py`)
 
 Hermes-style autonomous skill creation from completed sessions. **Opt-in, and STAGED for approval** — generation is **off by default** (`skills.auto_create_from_sessions` defaults **false**; enable via `kirocrew config set skills.auto_create_from_sessions true` or dashboard Settings → Skills). When on, candidates land in a pending-approval queue (`skills.approval_required` defaults **true**) and nothing goes live unattended. The queue lives in Customize → Skills (`/capabilities?tab=skills`); Settings → Skills links there and forwards a `?review=<slug>` it receives, re-encoded. Pipeline: detect (during consolidation) → generate → metadata dedupe → pending queue → human approval → live → archive-if-unused.
 
@@ -5328,7 +5456,7 @@ Skill detection runs only when ALL hold:
 | Condition | Source |
 |-----------|--------|
 | `skills.auto_create_from_sessions: true` | Config flag, default **off** (opt-in; when on, candidates STAGED, not live) |
-| `skills_loader` instance passed | Wired from `cli.py`, `cli_server.py`, `dashboard/server_runtime/skill_learning.py` and `slack/gateway.py` |
+| `skills_loader` instance passed | Wired from `cli_knowledge.py`, `cli_server.py`, `dashboard/server_runtime/skill_learning.py` and `slack/gateway_runtime/service_boot.py` |
 | `include_history=True` | Idle path only, not prefs-only |
 | Not a private member store (`member_memory` false) | Auto-skills are shared install-wide, so private member experience is not published |
 | `≥ skills.auto_min_tool_calls` messages with non-empty `tools` | Default 5 |
@@ -5464,7 +5592,8 @@ manager subscribes to the `hooks` section, so a `config.json` write re-parses th
 flat hook keys onto the running manager. Subscription is opt-in rather than
 automatic because a DERIVED manager must not follow config: the heartbeat-scoped
 manager (`_build_heartbeat_hooks`) deliberately drops the user's
-`auto_approve_tools` so `HEARTBEAT_SAFE_TOOLS` is the sole approval authority, and
+`auto_approve_tools` so the heartbeat allowlist (`_heartbeat_approval`) is the sole
+approval authority, and
 re-reading the section would hand that widening straight back. It is re-derived
 from the primary each cycle, so it inherits the reload without subscribing.
 
@@ -5498,7 +5627,7 @@ governance checks remain independent of memory routing.
 
 `hooks.py` is the hook subsystem's import path and its patch surface: over a hundred production
 modules import it, and the tests rebind its names. The rules live in the modules of
-`kiro_crew.hook_runtime`, and `hook_runtime.compose` runs every function they define
+`kiro_crew.hook_runtime`, and `_facade_compose.compose` runs every function they define
 on `hooks.py`'s globals, so a patch of `hooks.<name>` reaches the moved code wherever
 it sits. Nothing but `hooks.py` imports an owner.
 A new owner module is appended to the `compose(...)` tuple and to `_BASE_OWNERS` in
@@ -5515,12 +5644,14 @@ wedged owner frame still reads as a gate stall.
 | `search_targets` | The file-search deny target: the scope-only grammar, its percent encoding, the home-variable substitution and the lexical root normalization |
 | `windows_paths` | UNC shape, the extended-length fold, the trusted-root probe gate, OS-layer representability and one link target's normalization |
 | `descriptor_identity` | Whether the descriptor a reader holds is still the regular file its validated name admitted: the pinned witness walk, the macOS case alias, the hardlink sibling and kernel-pathname containment |
-| `safe_reads` | `validate_file_path` and the guarded readers — the text and byte reads, the identity samples, the no-hardlink bounded read, the prefix sniff and the private copy |
+| `safe_reads` | `screen_file_path` (the path screen, which says whether a decline is lasting, `PathDecline.REFUSED`, or a check that did not complete, `PathDecline.UNCHECKED`), `validate_file_path` (the same screen with every decline as `None`) and the guarded readers — the text and byte reads, the identity samples, the no-hardlink bounded read, the prefix sniff and the private copy |
 | `pinned_writes` | The descriptor-pinned replace and its two entry points, including the compare-and-swap hash and the directory-fd-relative staged rename |
 | `internal_reads` | The edition registration seam, the fixed-path sensitive read and the two SEL audit entry points |
 | `script_validation` | The fail-soft timeout normalization and the raising field validator both store write paths share |
 | `stream_caps` | A hook's bounded output drain, the truncation-marking decode and the concurrent stdin/stdout/stderr exchange |
 | `hook_dispatch` | The global store accessors, the strict on-disk read a store-less process uses, the informational tool-call fire, and the PreToolUse block gate with the names a matcher meets |
+| `hook_types` | The pipeline's value types: `HookResult`, the tool gate's verdict `ToolHookResult` (its constructors emit the approval-decision counter, which `test/metrics/test_business_counters.py` reads in this file), the rule dataclasses, `UserDeniedPattern`, and `HooksConfig` with its defensive parse of the `hooks` section |
+| `script_hooks` | Running script hooks: a hook process's environment (`_hook_subprocess_env`, the one reader of `_HOOK_BASE_ENV_KEYS`), one hook's sandboxed run (`run_script_hook`) and its `ScriptHookResult`, and `ScriptHookStore`, which persists the Hooks page's hooks, validates every edit and fires the hooks an event matches; `fire` sits beside `run_script_hook`, and `test_hook_events_kas_triggers` reads its source through the object |
 
 What stays in `hooks.py`, and why, because a guard or a contract reads it there:
 
@@ -5530,29 +5661,33 @@ What stays in `hooks.py`, and why, because a guard or a contract reads it there:
   An owner defines none, so a test that rebinds one here is the binding every function
   sees, and a `global` statement inside a rebound owner function writes this module's
   namespace;
-- the public result and config types (`HookResult`, `ToolHookResult`, `HooksConfig`,
-  `ScriptHook`, `ScriptHookResult`, `FileTooLargeError` and the rule dataclasses), so
-  their `__module__` and shapes are unchanged;
-- `ToolHookResult._count`, whose counter `test/metrics/test_business_counters.py` reads
-  in this file, and `uncounted_gate`'s ContextVar;
+- `ScriptHook` and `FileTooLargeError`. `ScriptHook`'s `event` field defaults to
+  `HOOK_EVENT_USER_PROMPT_SUBMIT`, and a class body runs in its own module: in an owner it
+  would read that constant before this module defines it. The other result and config
+  types live in `hook_types`, and a class keeps its owner's `__module__`: `compose`
+  selects the classes whose methods it rebinds by it, and nothing else reads it. Their
+  shapes are unchanged;
+- `uncounted_gate` and its ContextVar: a `contextmanager`'s generator is not a function
+  `compose` rebinds, so in an owner it would read the owner's globals (the one owner
+  `contextmanager`, `ScriptHookStore._atomic_mutation`, is rebound onto this module's
+  globals right after `compose`);
 - the tool gate's ORDER: `GATE_TIERS`, its row types (`GateTier`, `GateRule`) and kind
   vocabulary, and the literal `SHELL_DENY_TIERS`. The table is data a security review
   reads in one place, and it is built after `compose` so every row holds the rebound
   tier function (a row built before it would keep the owner's original, which a patch
   of `hooks.<name>` never reaches). `SHELL_DENY_TIERS` is a literal because
   `scripts/deny_diff.py` reads it as text (see the table below);
-- `HookManager` with every method. `judge(call, *, session_key, agent, app,
-  classifier_only)` walks `GATE_TIERS` under `_fail_closed_on_gate_crash`;
-  `on_tool_call` is its keyword form for the dispatchers that hold a call as keywords
-  (`**hook_gate_kwargs(event)`), keeps its signature, and is what every production
-  surface calls — the tests patch it at class and instance level;
-- `ScriptHookStore` with every method: `fire` is the dispatch the placement ruling
-  keeps beside `run_script_hook`, `test_hook_events_kas_triggers` reads its source, and
-  a class's methods do not split across files;
-- `ScriptHook.from_dict` and `run_script_hook`, the redaction call sites
-  `security_posture.NON_EGRESS_REDACTION_MODULES` classifies by this file's name;
-- `_hook_subprocess_env`, kept beside `_HOOK_BASE_ENV_KEYS` by choice: it is the one
-  reader of the allowlist this page tells an operator to edit;
+- `HookManager` with every method, and `_fail_closed_on_gate_crash`. `judge(call, *,
+  session_key, agent, app, classifier_only)` walks `GATE_TIERS` under
+  `_fail_closed_on_gate_crash`; `on_tool_call` is its keyword form for the dispatchers
+  that hold a call as keywords (`**hook_gate_kwargs(event)`), keeps its signature, and
+  is what every production surface calls — the tests patch it at class and instance
+  level. Both are wrapped when the class body runs, and `compose` rebinds no function
+  held in a closure, so in an owner the wrapped bodies would read the owner's globals;
+  moving the manager is a decomposition (collaborators behind the class), not a move;
+- `ScriptHook.from_dict`, a redaction call site `security_posture.NON_EGRESS_REDACTION_MODULES`
+  classifies by this file's name (`run_script_hook`, the other one, has the
+  `hook_runtime/script_hooks.py` row);
 - `_screen_windows_links`, which `test/link_screen_sites.py` keys by this path;
 - `_cu_read_only_auto_approve`, which `governance.md` names here (the Plane A gate
   threading it names beside it is the `governance` tier in `gate_tiers`);
@@ -5581,7 +5716,7 @@ deny blocked:
 | `governance` | deny_policy | the ceiling ∩ active profile (`_governance_denial`) |
 | `app-own-server` | grant | a builtin app agent calling its own declared MCP server |
 | `operator-grants` | grant | the operator's `auto_approve_tools` patterns, unless a `confirm_tools` pattern names the call or the list is unknown |
-| `read-only` | classify | the read-only classifier, except for an MCP call `confirm_tools` names (or any MCP call while the list is unknown); the only auto-approve under `classifier_only` |
+| `read-only` | classify | the read-only classifier, except for an MCP call `confirm_tools` names (or any MCP call while the list is unknown) and a shell command that runs `git` at any command position (`readonly_bash.command_invokes_git`), which falls through to the surface's own approval; the only auto-approve under `classifier_only` |
 
 `classifier_only` skips both grant rows (each grant body steps aside, after resolving the owner app as before). `gate_tier_problems` checks the table when
 the module loads; an unsound table is not raised at import (that would fail every
@@ -5596,8 +5731,9 @@ grant, and pins `SHELL_DENY_TIERS` to the projection.
 
 New work goes to the owner of its responsibility. A new gate check is a tier body in
 `gate_tiers` plus its row in `GATE_TIERS`, placed by kind; a new fact about a call is a
-`ToolCall` field filled by `from_event`. A new module-level value, a new `HookManager`
-method and a new store method go here.
+`ToolCall` field filled by `from_event`. A new module-level value and a new
+`HookManager` method go here; a new store method goes to `script_hooks`, and a new
+result or config type to `hook_types`.
 
 ### Script hooks (`ScriptHook`, `run_script_hook`) — the shell per platform
 
@@ -6152,14 +6288,19 @@ their reported benchmark gains are not Kiro Crew measurements.
 #### Ownership
 
 `context.py` is the facade and the assembly owner. `ContextBuilder.build_session_context`
-and `build_message` decide block order and which lifecycle carries each block. It
-also keeps the per-target store handles and their routing (`store_of_session`,
-`prepare_store_vectors`, `ContextBuilder.ensure_store`, `_build_store_vectors`),
-every transcript read and redaction a prompt replays, the agent-spec reads
-(`_load_agent_prompt`, `_load_steering_resources`), the critical-rules contract, the
-UI-language renderers, and each name callers rebind on it. The rest is composed from
-`src/kiro_crew/context_assembly/`, and every name stays importable from
-`kiro_crew.context`:
+and `build_message` decide block order and which lifecycle carries each block.
+`ContextBuilder` is defined there with its state (`__init__`), its constants and its
+store handles (`get_memory_for`, `get_lessons_for`, the async `ensure_store`); the
+bodies of its other methods live in the owners below and are bound onto the class
+(`build_message = ...`, `staticmethod(...)` for the static ones), so
+`ContextBuilder.<method>` is the moved function itself and a class or instance patch
+of it applies everywhere. Their `__qualname__` and `__module__` name the owner; nothing
+reads either. The facade also keeps the per-target store caches and their routing
+(`store_of_session`, `prepare_store_vectors`, `_build_store_vectors`), the transcript
+reads a prompt replays and the redaction of the session replay
+(`build_session_replay`), every async function, and each name callers rebind on it.
+The rest is composed from `src/kiro_crew/context_assembly/`, and every name stays
+importable from `kiro_crew.context`:
 
 | Owner | Responsibility; new work of this kind goes here |
 |---|---|
@@ -6171,9 +6312,16 @@ UI-language renderers, and each name callers rebind on it. The rest is composed 
 | `member.py` | the member identity section and the V2 essentials envelope; delivery stays at the `member_turn_context` chokepoint |
 | `store_admission.py` | which store answers each memory and lesson section, the per-message lessons block, the shown-lesson record |
 | `turn.py` | follow-up turn additions (post-compaction re-injection, Slack thread context, per-turn rails, guidance) and the user's own turn text |
+| `output_contract.py` | the output contract a session starts with: the critical-rules block per runtime (`_critical_rules_for`) and the `[UI LANGUAGE]` steer (`ui_language_tag` stays on the facade) |
+| `session_start.py` | `ContextBuilder.build_session_context`: the session-start block's order, its section timings (`_mark`, `_emit_context_section_timings`) and the redaction of replayed thread history |
+| `turn_message.py` | `ContextBuilder.build_message`: what one turn sends and in which order, the trigger-matched skill-body delivery and its audit, the request boundary |
+| `agent_spec.py` | the agent prompt (`_resolve_agent_prompt`, `_load_agent_prompt`, `_read_prompt_file`), its templates and the per-session readings they resolve to (`_session_reading`), and the agent-spec reads (`_read_include_crew_context`, `_load_steering_resources`, `steering_target_admissible`) |
+| `delivery_records.py` | per-session records of what a session was already sent: the shown-lesson record's upkeep and the sent skill bodies with their per-turn undo (`rollback_skill_bodies`, `commit_skill_bodies`) |
+| `member_gates.py` | the member desk and dispatch gates (`_desk_withheld`, `_member_dispatch_held`) and the builder's entry points into `member.py` (`_build_member_section`, `_build_v2_essentials`) |
 
 At module scope an owner imports only its sibling owners and type-checking-only
-names; any other Kiro Crew import is function-local. Owners read every name callers
+names; any other Kiro Crew import is function-local. An owner defines no async function
+and never reads `__file__`: those stay on the facade. Owners read every name callers
 rebind on `kiro_crew.context` through it at call time, so a patch there still
 reaches the moved code; `test/test_context_composition_contract.py` derives that set
 from the tests and pins it.
@@ -6295,7 +6443,7 @@ An id none of them lists is unknown, and unknown keeps the 1,000,000-token refer
 nothing shrinks an undeclared model. A fresh session has no live window, so a
 declared one is what budgets its first prompt. The declaration is the operator's
 statement and is never probed or measured. `coerce_model_context_tokens`
-(`config/sections.py`) bounds it: a real integer from 1,024 to 10,000,000 per key, a
+(`config/sections_agent_fields.py`) bounds it: a real integer from 1,024 to 10,000,000 per key, a
 non-empty id of at most 256 characters with no surrounding whitespace as the key, the
 first 64 entries read, a warning per dropped entry. The dashboard server's config
 watcher installs it through `model_registry.apply_operator_windows` at boot and on each

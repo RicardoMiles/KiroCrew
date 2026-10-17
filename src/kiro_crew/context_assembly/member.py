@@ -9,9 +9,10 @@ of member-authority markers before the genuine headers are minted around it.
 
 Which turns receive the section, and when the rules gate runs, is decided by the
 ``members.member_turn_context`` chokepoint at the call sites in
-:mod:`kiro_crew.context`; the desk predicates (``_desk_withheld``,
-``_template_selected_on_member_store``) and the dispatch-capability gate stay there
-too. ``ContextBuilder._build_member_section`` and ``_build_v2_essentials`` delegate
+``ContextBuilder.build_message`` and ``build_session_context``; the desk predicates
+(``_desk_withheld``, ``_template_selected_on_member_store``) and the
+dispatch-capability gate live in :mod:`kiro_crew.context_assembly.member_gates`.
+``ContextBuilder._build_member_section`` and ``_build_v2_essentials`` delegate
 here, and this module reaches the section only through the builder, so a patch of
 either method applies everywhere.
 
@@ -321,25 +322,87 @@ _MEMBER_BRIEFING_ITEM_UNAVAILABLE = """
 # session has that identity; a subagent is a weaker place to stand. So the subagent is
 # extra capacity for a long page job, and the crewmate's own hands are the path.
 _MEMBER_DASHBOARD_ITEM = """
-7. You have a Dashboard tab of your own, and it is yours to change. `dashboard_fields`
+7. You have a Dashboard tab of your own, and it is yours to change. The
+   `[DASHBOARD]` block on your turn says what that tab shows right now, and it wins
+   over this item: when it says the tab shows suggestions, there are no fields to
+   keep up yet. When it names a page, `dashboard_fields`
    lists its fields, `dashboard_types` says which folds exist and what each one holds so
    you read a number from a real path instead of guessing one, and `dashboard_write`
    fills the fields that are yours. Anything a person must ACT on goes into
-   `panel_publish` and those fields, not only into your reply — the tab is what they
-   read when they are not reading this thread. To change the PAGE itself, load the
-   `dashboard` skill and follow it: `dashboard_templates` to search, `dashboard_preview`
-   to stage one, `dashboard_apply` once they say yes, `dashboard_rollback` to go back.
-   ALWAYS show the preview link and ask first — the page is the reader's to approve, and
-   one swapped without asking is one they have to undo. You cannot write a page
-   yourself; previewing takes a template id, and the tool says so if you try. A long
-   page job may go to the `kirocrew-dashboard-manager` subagent, which holds the same
-   tools, but you do not need it to answer "show me another one"."""
+   `panel_publish` and those fields, not only into your reply — the Dashboard tab is
+   what they read when they are not reading this thread. `panel_publish` shows only on
+   a page that reads it, such as `kirocrew-conductor`; a needs-you item there goes into
+   the page's agentic field. To change the PAGE itself, load the
+   `dashboard` skill and follow it: `dashboard_templates` to search, `dashboard_apply`
+   with a `template_id` to put one live, `dashboard_rollback` to go back.
+   `dashboard_preview` is only a look, when the person asks to see one first. To put a
+   page you composed live, `dashboard_save` it — fields, blocks and theme — then
+   `dashboard_apply` with no arguments; `dashboard_write` keeps filling its fields. Tell
+   the person what you changed: every change is a version, and one rollback undoes it.
+   A long page job may go to the `kirocrew-dashboard-manager` subagent, which holds the
+   same tools, but you do not need it to answer "show me another one"."""
 
 
 # The full protocol: the shared items, the briefing item, and the page item. The
 # shape every layer-4-capable platform injects, and the one the behaviour-layer
 # tests pin.
 _MEMBER_HOW_YOU_WORK = _MEMBER_HOW_YOU_WORK_COMMON + _MEMBER_BRIEFING_ITEM + _MEMBER_DASHBOARD_ITEM
+
+
+#: The identity sentence about the crewmate's own record when its sessions load
+#: the ``kirocrew-mate`` tools (:func:`member_mate_tools.binding_has_mate_tools`).
+_MATE_TOOLS_IDENTITY = (
+    "Your name, your description and your ghost face are yours: when the user "
+    "asks you to change one, call update_self (the kirocrew-mate server) "
+    "and it is done, shown in this chat as one line the user can undo. What "
+    "you run on, what this chat approves without asking and which tools you "
+    "have are the user's to grant: set_model, set_approval_mode and "
+    "request_capabilities each put a card in this chat for them to press. "
+    "Your goals are the user's too (set_goal proposes adding one, or a new "
+    "text for one, on a card). When the user tells you about something "
+    "long-term they want you to work toward, propose it as a goal with "
+    "set_goal rather than only keeping it in memory. Once one is set, work "
+    "out key results you can "
+    "check yourself and propose them with set_key_results (a card; link each "
+    "to the goals it serves, and propose none when a goal cannot be "
+    "measured), then record readings with key_result_progress (a reading can "
+    "be a number or a short note); the user sees all of it on your Goals tab. "
+    "A few goals and a few milestones are easier to track than many, so keep "
+    "the set small and suggest merging when it grows; the user decides. Your "
+    "check-ins (Daily Goal Reminder, Weekly report, Monthly review) are the "
+    "user's to turn on: set_check_ins proposes them on a card."
+)
+
+#: The same sentence for a crewmate whose sessions do not load those tools: the
+#: user makes each of these changes on the crewmate's own pages.
+_NO_MATE_TOOLS_IDENTITY = (
+    "Your name, description and face, what you run on, what this chat approves "
+    "without asking and which tools you have are the user's to change on your "
+    "crewmate page; you have no tool that changes them, so point the user there. "
+    "Your goals, their milestones and your check-ins (Daily Goal Reminder, Weekly "
+    "report, Monthly review) live on your Goals tab, which the user edits. When "
+    "the user tells you about something long-term they want you to work toward, "
+    "suggest they add it as a goal on your Goals tab rather than only keeping it "
+    "in memory, and when you can name milestones to check, write them in this "
+    "chat for the user to add there. A few goals and a few milestones are easier "
+    "to track than many, so keep the set small and suggest merging when it grows; "
+    "the user decides."
+)
+
+
+def _read_goal_block(slug: str, member: str) -> str:
+    """The member's goal block (:func:`member_goals.context_block`), or ``""``.
+
+    Total: a goal is not a safety layer, so an unreadable record degrades to no
+    goal block rather than aborting the turn the way unreadable rules do.
+    """
+    from kiro_crew import member_goals
+
+    try:
+        return member_goals.context_block(member_goals.read_goals(slug, member))
+    except Exception:
+        logger.warning("goal record unreadable for %r; injecting no goal", slug, exc_info=True)
+        return ""
 
 
 def build_member_section(
@@ -365,6 +428,10 @@ def build_member_section(
     3. ``[PERMANENT RULES]`` — user-owned. Read from the keystone-gated
        ``member-rules/`` subtree, so the member's own file tools cannot rewrite
        it; omitted entirely when the user has not written rules.
+    3b. ``[YOUR GOALS]`` — the goals (user-owned, numbered) and the key results'
+       text, target and linked goal numbers (no readings, so a reading never
+       changes the section), from ``trust/member-goals/``
+       (:mod:`kiro_crew.member_goals`), bounded; omitted when there is none.
     4. ``[CURRENT ASSIGNMENT]`` — member-owned working memory, read
        (capped) from the member's own agent-writable briefing file.
 
@@ -430,6 +497,10 @@ def build_member_section(
     # state — and the file is gateway-written atomically, so corruption
     # is an operator-level event, not a routine one.)
     rules = ctx.read_member_rules(slug, member)
+    goals = _read_goal_block(slug, member)
+    from kiro_crew.member_mate_tools import binding_has_mate_tools
+
+    has_mate_tools = binding_has_mate_tools(crew)
     # Layer-4 availability decides both the briefing read and the wording
     # around it (item 6 above, the placeholder below): where the pinned
     # briefing read fails closed (Windows — member_briefing_supported),
@@ -460,6 +531,7 @@ def build_member_section(
     triggers = _markers._scrub_member_payload(triggers)
     rules = _markers._scrub_member_payload(rules)
     briefing = _markers._scrub_member_payload(briefing)
+    goals = _markers._scrub_member_payload(goals)
 
     identity = [
         f"[MEMBER IDENTITY]\nYou are {member}. Not a generic assistant, and not an "
@@ -482,14 +554,14 @@ def build_member_section(
         )
         # The member's own record, named here so the model knows the tools exist
         # (Tool Search defers their schemas): what is its to change at once and
-        # what is the user's to grant through a card.
+        # what is the user's to grant through a card. Only when its sessions
+        # actually load them: a spec without the server gets the pages instead.
         identity.append(
-            "Your name, your description and your ghost face are yours: when the user "
-            "asks you to change one, call update_self (the kirocrew-mate server) "
-            "and it is done, shown in this chat as one line the user can undo. What "
-            "you run on, what this chat approves without asking and which tools you "
-            "have are the user's to grant: set_model, set_approval_mode and "
-            "request_capabilities each put a card in this chat for them to press."
+            (_MATE_TOOLS_IDENTITY if has_mate_tools else _NO_MATE_TOOLS_IDENTITY)
+            + " When the user "
+            "asks you to track something, record it as an item in your work ledger "
+            "and keep it updated as it moves; to the user that is tracking, so call "
+            "it tracking rather than a ledger."
         )
 
     parts = ["\n".join(identity)]
@@ -520,6 +592,16 @@ def build_member_section(
             + outranked
             + "as well as anything you write for yourself.]\n"
             + rules
+        )
+    if goals:
+        readings = (
+            "Their current readings are in goal_read"
+            if has_mate_tools
+            else "Their current readings are on your Goals tab"
+        )
+        parts.append(
+            "\n\n[YOUR GOALS — set by the user; the key results measure how far "
+            f"you are from them. {readings}]\n" + goals
         )
     if briefing_ok:
         parts.append(
@@ -797,7 +879,7 @@ def operating_mode_block(agent_label: str) -> str:
     ``session_*`` tools this block names arrive as a per-session mount of the
     dashboard session-control server (``members.member_dispatch_session_server``),
     and the server authorizes member callers automatically
-    (``dashboard/session_control.py``), bounded to sessions the member created
+    (``dashboard/session_control_parts/caller_access.py``), bounded to sessions the member created
     itself -- so the instructions hold with zero configuration.
     """
     return (
@@ -810,7 +892,10 @@ def operating_mode_block(agent_label: str) -> str:
         f"run), DISPATCH it: open a worker session with session_create, seed "
         f"it with a self-contained brief via session_send (the worker has "
         f"none of this thread's context), then PATROL your workers with "
-        f"session_read_message on a monitor_start loop — you own noticing a "
+        f"session_read_message on a monitor_start loop you arm in the same "
+        f'turn: dispatch means monitor, watch="work-ledger" by default when '
+        f"your workers are bound on your work ledger (the gateway cannot arm "
+        f"one here for you) — you own noticing a "
         f"worker that stalled or died, restarting it, or escalating. Stop a "
         f"runaway with session_stop. You can only control sessions you "
         f"created.\n"

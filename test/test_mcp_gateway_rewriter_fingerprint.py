@@ -720,14 +720,14 @@ def test_effective_user_site_policy_change_invalidates(
     _rewrite(tmp_path)
     overlay = tmp_path / "mcp-gateway" / "agents" / "agent-0.json"
     first_args = json.loads(overlay.read_text())["mcpServers"]["srv"]["args"]
-    assert first_args[:2] == ["-m", rewriter._STUB_MODULE]
+    assert first_args[:3] == ["-P", "-m", rewriter._STUB_MODULE]
 
     before = rewrite_counter["n"]
     monkeypatch.setattr(rewriter.platform_compat.site, "ENABLE_USER_SITE", False)
     _rewrite(tmp_path)
     assert rewrite_counter["n"] == before + 1, "a user-site policy change must not serve cache"
     second_args = json.loads(overlay.read_text())["mcpServers"]["srv"]["args"]
-    assert second_args[:3] == ["-s", "-m", rewriter._STUB_MODULE]
+    assert second_args[:4] == ["-s", "-P", "-m", rewriter._STUB_MODULE]
 
 
 def test_path_env_change_invalidates(

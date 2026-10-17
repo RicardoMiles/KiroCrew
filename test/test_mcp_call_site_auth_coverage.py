@@ -106,6 +106,7 @@ _UNKNOWN = "{X}"
 # than listed so a new tool module is scanned the day it is added.
 _SOURCES = (
     _CORE,
+    *sorted((_SRC / "mcp_core_parts").glob("*.py")),
     _SRC / "mcp_shared.py",
     _SRC / "mcp_work.py",
     _SRC / "mcp_crew_log.py",
@@ -121,6 +122,7 @@ _SOURCES = (
     _SRC / "cron_trigger.py",
     _SRC / "apps/builtins/code_review_sage/sage_lib/review_driver.py",
     _SRC / "computer_use/screencast.py",
+    _SRC / "doctor_checks/workload.py",
     *sorted((_SRC / "mcp_tools").glob("*.py")),
 )
 

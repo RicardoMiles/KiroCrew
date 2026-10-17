@@ -1472,8 +1472,8 @@ def _open_slot_transcript_keys(state: DashboardState) -> set[str]:
 #: * ``handlers/_shared.py`` — colon-only, wf-family only, to dispatch a memory-mode
 #:   lookup. Includes ``wf-scope``.
 #: * ``handlers/cron.py`` — colon-only, wf-family plus ``subagent``, to answer whether a
-#:   session is live and shared. Omits ``wf-scope``; suspected pre-existing gap in that
-#:   predicate rather than a deliberate exclusion.
+#:   session is live and shared. Omits ``wf-scope`` on purpose: that prefix names a
+#:   workflow run's memory anchor, and no session is created under it.
 #: * this one — matches PERSISTED folded keys via ``_in_namespace``, adds ``secretary``
 #:   and ``channel``, and deliberately excludes ``cron``, ``side`` and ``taskrunner``
 #:   because each of those holds conversations a reader started.
@@ -1483,8 +1483,9 @@ def _open_slot_transcript_keys(state: DashboardState) -> set[str]:
 #:
 #: It is spelled literally rather than derived from
 #: ``messaging.link._TELEMETRY_LOCAL_PREFIXES`` because that registry exists to bound
-#: telemetry label cardinality, and ``wf-unpooled``, ``wf-worker`` and ``wf-scope`` are
-#: all live session keys absent from it — a derived filter cannot see them.
+#: telemetry label cardinality, and ``wf-unpooled`` and ``wf-worker`` are live session
+#: keys absent from it, as is the ``wf-scope`` memory-anchor prefix — a derived filter
+#: cannot see them.
 #:
 #: Absent on purpose:
 #:
@@ -1668,6 +1669,30 @@ def _app_bulk_history_refusal(request: web.Request, operation: str) -> web.Respo
     return _app_not_found(request_app, operation, "sessions=*", "whole-history route")
 
 
+_SHORT_SLOT_NAME_RE = re.compile(r"chat-\d+")
+_DASHBOARD_SLOT_STEM_RE = re.compile(r"dashboard_(chat-\d+)-(\d+)")
+
+
+def _sessions_named(
+    canonical_key: Callable[[str], str], sessions: list[dict], name: str
+) -> list[dict]:
+    """The rows of *sessions* minted under the short slot name *name*, oldest first.
+
+    A row matches when its canonical transcript stem is ``dashboard_<name>-<ts>``.
+    Anything that is not a short name (a full key, a channel key, junk) matches
+    nothing, so the filter can never widen the list it narrows.
+    """
+    if not _SHORT_SLOT_NAME_RE.fullmatch(name):
+        return []
+    matched: list[tuple[int, dict]] = []
+    for row in sessions:
+        m = _DASHBOARD_SLOT_STEM_RE.fullmatch(canonical_key(row.get("key", "")))
+        if m and m.group(1) == name:
+            matched.append((int(m.group(2)), row))
+    matched.sort(key=lambda pair: pair[0])
+    return [row for _, row in matched]
+
+
 async def api_sessions(request: web.Request) -> web.Response:
     """GET /api/sessions — list conversation session files.
 
@@ -1694,6 +1719,12 @@ async def api_sessions(request: web.Request) -> web.Response:
         its metadata line. That is a tab opened and closed without a message
         (for example the blank tab the chat page opens when no tab is left).
         It has nothing to resume, and it too would show its storage key.
+      - ``name``: a dashboard session's SHORT name (``chat-7``). Keeps only the
+        dashboard transcripts minted under that name, open or closed, oldest
+        first by the mint time in the key. A slot number is reused across
+        gateway generations, so one name can match several sessions. Any other
+        value matches nothing. This is how a ``/chat?sid=chat-7`` link finds
+        the session it names.
 
     Returns ``{sessions, total, has_more}`` for pagination.
     """
@@ -1717,6 +1748,11 @@ async def api_sessions(request: web.Request) -> web.Response:
     # the event loop freezes chat, heartbeat, and every other coroutine for the
     # full duration. Offload to a worker thread.
     all_sessions = await asyncio.to_thread(state.conversation_log.list_sessions)
+    if "name" in request.query:
+        # Before the app filter, which reads each row's transcript under its lock.
+        all_sessions = _sessions_named(
+            state.conversation_log._canonical_key, all_sessions, request.query["name"]
+        )
     request_app = str(request.get("app") or "")
     if request_app:
         # Before every count, so ``total`` and ``has_more`` describe the app's
@@ -4000,9 +4036,11 @@ async def _clear_history_rows(
         failed,
         len(undeletable),
     )
+    # ``ok`` means nothing clearable was left behind: an undeletable row stays on
+    # disk exactly as a failed one does, so either one makes the clear partial.
     return web.json_response(
         {
-            "ok": failed == 0,
+            "ok": failed == 0 and not undeletable,
             "cleared": count,
             "skipped": skipped,
             "failed": failed,
@@ -4717,7 +4755,8 @@ def _spec_failure_kind(path: Path, exc: BaseException) -> str:
 
 
 def _ambiguous_spec_reason(agent_name: str, exc: AmbiguousAgentSpecError) -> str:
-    """The wire ``reason`` for two specs declaring *agent_name*: names, not paths.
+    """The wire ``reason`` for two differing specs declaring *agent_name*: names,
+    not paths.
 
     The exception's own message quotes each file's full path for the terminal
     it was written for; this text reaches the MCP client's model-visible
@@ -4730,10 +4769,10 @@ def _ambiguous_spec_reason(agent_name: str, exc: AmbiguousAgentSpecError) -> str
         return str(exc)
     names = ", ".join(repr(path.name) for path in exc.paths)
     return (
-        f"{len(exc.paths)} specs in the agents directory declare the name {agent_name!r}: "
-        f"{names}. Which one is live is undefined, so the policy for {agent_name!r} is "
-        f"unknown. Remove or rename one of them in the agents directory (~/.kiro/agents "
-        f"unless relocated); no restart needed."
+        f"{len(exc.paths)} specs in the agents directory declare the name {agent_name!r} "
+        f"with differing content: {names}. Which one is live is undefined, so the policy "
+        f"for {agent_name!r} is unknown. Remove or rename one of them in the agents "
+        f"directory (~/.kiro/agents unless relocated); no restart needed."
     )
 
 
@@ -4960,8 +4999,12 @@ def _read_managed_tool_policy_uncached(agents_dir: Path, agent_name: str) -> dic
     not answer it with the same empty body a policy-free agent gets.
 
     Propagates :class:`kiro_crew.agent_discovery.AmbiguousAgentSpecError` when
-    two specs declare *agent_name*: that is not "no policy" either, and the
-    caller records it as a denial rather than answering it silently.
+    two specs declare *agent_name* with differing content: that is not "no
+    policy" either, and the caller records it as a denial rather than answering
+    it silently. Two IDENTICAL specs declaring the name are one policy, and the
+    scan answers it (see ``spec_by_declared_name``): a package installer that
+    flattens dependencies writes such twins, and whichever of them the session
+    runs, its policy is this one.
     """
     # The file the policy was read from, when it was a direct-filename read.
     # The declared-name scan returns a parse and not a path (see

@@ -39,6 +39,10 @@ from kiro_crew.security import (
 )
 from kiro_crew.testing.wait import wait_until
 
+# This file replaces ctypes.CDLL, find_library or a cached libc handle for a test,
+# so the shared macOS handle caches are put back after each one (see conftest.py).
+pytestmark = pytest.mark.usefixtures("fresh_darwin_libc_handles")
+
 _GOLDEN = Path(__file__).parent / "fixtures" / "denied_commands_golden.json"
 
 # Captured at import, before the autouse fixture stubs the module attribute:
@@ -116,7 +120,7 @@ class TestCatalog:
         # Then: the sandbox-escape ssh-to-self row was added (111 -> 112). The
         # flagged-file delivery self-protection floor added no row: it is an
         # ungated argv-floor subcommand (see ``_UNGATED_TEMPLATES``), not a catalog rule.
-        assert len(BUILTIN_DENIED_RULES) == 112
+        assert len(BUILTIN_DENIED_RULES) == 113
         ids = [r.id for r in BUILTIN_DENIED_RULES]
         assert len(set(ids)) == len(BUILTIN_DENIED_RULES)
 
@@ -558,18 +562,19 @@ class TestSelfProtectionFlagInterposition:
         A verb added to the CLI without a decision here would otherwise walk past
         the floor silently, which is the failure mode the enumeration invites.
 
-        Read by AST rather than by calling a builder, because ``cli.py`` builds its
-        parser inline in ``main()``; and by AST rather than by grepping the source,
-        because a substring assertion stays green when the construct it names moves
-        or is wrapped.
+        Read by AST rather than by calling a builder, because ``cli.main()`` builds
+        its parser inline from the ``cli_parser_*`` registrars; and by AST rather
+        than by grepping the source, because a substring assertion stays green when
+        the construct it names moves or is wrapped.
         """
         import ast
         import inspect
 
-        from kiro_crew import cli
+        from kiro_crew import cli, cli_parser_admin, cli_parser_agent, cli_parser_gateway
         from kiro_crew.security import argv_floor
 
-        tree = ast.parse(inspect.getsource(cli))
+        parser_modules = (cli, cli_parser_gateway, cli_parser_agent, cli_parser_admin)
+        tree = ast.parse("\n".join(inspect.getsource(module) for module in parser_modules))
         choices: "list[str] | None" = None
         required = None
         for node in ast.walk(tree):
@@ -10761,6 +10766,33 @@ class TestHostsFileWarmUp:
         _argv_floor._warm_hosts_file_cache()  # the next pass, key now stable
         assert _argv_floor._host_is_self("ownalias") is True
         assert _denied_by("ssh farbox uptime") is None
+
+    def test_own_set_growing_during_the_gate_parse_keeps_an_absent_name_open(self, monkeypatch):
+        # The first ssh vet in a cold process seeds the own set AND starts
+        # the enrichment worker, whose netlink publish lands while this
+        # same call parses the hosts file.  The file did not change, so a
+        # name absent from it is absent under any own set and must fall
+        # through to the DNS layer, not be refused as pending; a local
+        # entry is still local; only a remote entry is held.
+        path = self._hosts(monkeypatch, "127.0.0.1 loopalias\n10.4.4.4 farbox\n")
+        real_parse = _argv_floor._parse_hosts_file
+        grown = iter(range(1, 1000))
+
+        def _parse_then_grow(*args, **kwargs):
+            table = real_parse(*args, **kwargs)
+            own = _argv_floor._OWN_HOST_NAMES_CACHE or frozenset()
+            _argv_floor._OWN_HOST_NAMES_CACHE = own | {f"10.77.0.{next(grown)}"}
+            return table
+
+        monkeypatch.setattr(_argv_floor, "_parse_hosts_file", _parse_then_grow)
+        assert _argv_floor._hosts_file_verdict("backuphost") is None
+        assert _argv_floor._hosts_file_verdict("loopalias") is True
+        assert _argv_floor._hosts_file_verdict("farbox") is True  # held, not served
+        assert "kirocrew-hosts-warm" in self.started
+        assert _argv_floor._HOSTS_FILE_CACHE == {}  # a moved key caches nothing
+        assert path not in _argv_floor._HOSTS_FILE_CACHE
+        assert _denied_by("ssh -o ConnectTimeout=10 backup@host uptime") is None
+        assert _denied_by("ssh loopalias uptime") == self._RULE
 
     def test_an_own_address_learned_later_re_marks_a_cached_alias(self, monkeypatch):
         self._hosts(monkeypatch, "198.51.100.44 lateownalias\n")

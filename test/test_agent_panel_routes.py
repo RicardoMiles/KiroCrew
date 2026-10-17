@@ -9,6 +9,7 @@ operator can trust whose state they are reading.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -33,6 +34,11 @@ from kiro_crew.crew_log import emit as crew_log_emit
 from kiro_crew.crew_log import projection as crew_log_projection
 from kiro_crew.dashboard.handlers import agent_panel as routes
 from kiro_crew.dashboard_templates.instance import preview_url as instance_preview_url
+
+# Bound at collection, before conftest's autouse ``gateway_posts`` swaps
+# ``mcp_core._post`` for its recorder in each test.
+from kiro_crew.mcp_core import _get as _real_mcp_get
+from kiro_crew.mcp_core import _post as _real_mcp_post
 
 pytestmark = pytest.mark.asyncio
 
@@ -2440,28 +2446,25 @@ async def test_a_write_is_refused_for_every_package_state_that_has_no_model(
         assert (await resp.json())["code"] == code
 
 
-async def test_a_live_package_is_refused_while_the_display_still_reads_the_template(
-    vetted, monkeypatch
-):
-    """Fails CLOSED on this base, because the two paths select different Models.
+async def test_a_live_package_checks_the_write_against_its_own_model(vetted, monkeypatch):
+    """The page draws the package, so the write is checked against it.
 
-    The write would be checked against the PACKAGE's Model, while
-    ``api_member_dashboard`` renders the TEMPLATE instance -- that route reads no
-    package on this base. A package declaring a field with a different type than the
-    displayed template therefore lets a write land that the display cannot draw: a
-    string where the page reads a list empties the cards, with no error anywhere.
-
-    A refusal the agent can act on is the honest answer until the display reads the
-    same package, which is the change that lifts this.
+    A package-bound write is not refused for being package-bound: it is checked
+    against the package's own field table, so a value of the wrong shape is refused
+    by that table and not by the provenance of the read.
     """
-    from kiro_crew import dashboard_package
+    from kiro_crew import dashboard_agentic, dashboard_package
+    from kiro_crew.dashboard.handlers.member_dashboard_fields import package_manifest
 
-    # A LIVE read of a real PACKAGE, which is exactly what `read_package_model` answers
-    # for one: no Model, because the field table is not translated on this base, and
-    # `from_package` to say where the answer came from. The refusal turns on that flag
-    # and never needs a manifest, so this stand-in carries none either.
+    package = {
+        "bound_to": "crewmate:atlas",
+        "model": {"types": {"for_you": {"type": "text", "source": {"agentic": True}}}},
+    }
     live = dashboard_package.PackageRead(
-        None,
+        dashboard_agentic.Instance(
+            manifest=package_manifest(package, slug="dash-atlas", version=2),
+            instance_version=2,
+        ),
         dashboard_package.STATE_LIVE,
         "package 'dash-atlas' version 2",
         from_package=True,
@@ -2470,15 +2473,12 @@ async def test_a_live_package_is_refused_while_the_display_still_reads_the_templ
     async with _client() as c:
         resp = await c.post(
             WRITE_PATH,
-            json={"field": "for_you", "value": "approve the plan"},
+            json={"field": "for_you", "value": ["not", "text"]},
             headers={"X-Session-Key": "dashboard:chat-1"},
         )
         assert resp.status == 400, await resp.text()
         body = await resp.json()
-        assert body["code"] == "package_display_pending", body
-        # The remedy has to name WHY, or an agent reads it as "your value was wrong"
-        # and retries the same write forever.
-        assert "display" in body["error"].lower(), body
+        assert body["code"] == "wrong_type", body
 
 
 async def test_the_write_route_asks_for_a_package_by_member_and_not_by_slug(vetted, monkeypatch):
@@ -2775,6 +2775,132 @@ async def test_a_write_succeeds_for_a_crewmate_that_adopted_nothing(vetted, monk
         assert body["written"] == {"field": "for_you", "type": "array"}, body["written"]
 
 
+async def test_an_unadopted_conductor_writes_needs_you_to_its_own_board(vetted):
+    """A crewmate named ``kirocrew-conductor`` that adopted nothing is shown the shipped
+    page of that id, so its ``needs_you`` write lands through THIS route, and the
+    ``goal-board`` field ``asks`` is refused, as the goal-conductor skill says.
+
+    Driven off the REAL registry and instance store rather than the seam stubs above:
+    what is pinned is that this route resolves the same slug-named page the read route
+    renders.
+    """
+    async with _client("kirocrew-conductor") as c:
+        resp = await c.post(
+            WRITE_PATH,
+            json={"field": "needs_you", "value": ["approve the plan"]},
+            headers={"X-Session-Key": "dashboard:chat-1"},
+        )
+        assert resp.status == 200, await resp.text()
+        assert (await resp.json())["written"] == {"field": "needs_you", "type": "array"}
+
+        refused = await c.post(
+            WRITE_PATH,
+            json={"field": "asks", "value": {}},
+            headers={"X-Session-Key": "dashboard:chat-1"},
+        )
+        assert refused.status == 400, await refused.text()
+        assert (await refused.json())["code"] == "unknown_field"
+
+
+async def test_clear_through_the_panel_server_empties_an_array_field(vetted, monkeypatch):
+    """``dashboard_write`` ``clear: true`` empties a field, end to end past the client.
+
+    An MCP client can drop ``value: []`` from a call before the panel server reads it,
+    so ``clear: true`` is how a crewmate empties its board. This drives the server's
+    own entry point (argument schema, handler, and its real loopback POST) into this
+    route, the real registry and the real instance store, then reads the field back
+    through the field list. Two writes, so the read proves the clear REPLACED a
+    value rather than finding a field nobody wrote.
+    """
+    from kiro_crew import mcp_core, mcp_panel
+
+    # ``mcp_panel`` binds ``_post`` by name on its first import. When that import
+    # happens inside a test, it binds conftest's recorder and no write leaves the
+    # process, so the real client is bound here: the test passes run alone and
+    # beside files that import the server at collection.
+    monkeypatch.setattr(mcp_panel, "_post", _real_mcp_post)
+
+    async with _client("kirocrew-conductor") as c:
+        monkeypatch.setattr(mcp_core, "_API", f"http://127.0.0.1:{c.server.port}")
+        monkeypatch.setattr(mcp_core, "_API_UNIX_SOCKET", "")
+        monkeypatch.setattr(mcp_core, "_internal_secret", lambda: "unused-by-this-app")
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:chat-1")
+
+        filled = await asyncio.wait_for(
+            asyncio.to_thread(
+                mcp_panel._call_tool,
+                "dashboard_write",
+                {"field": "needs_you", "value": ["approve the plan"]},
+            ),
+            timeout=30,
+        )
+        assert filled.startswith("Wrote `needs_you` (array)"), filled
+
+        cleared = await asyncio.wait_for(
+            asyncio.to_thread(
+                mcp_panel._call_tool, "dashboard_write", {"field": "needs_you", "clear": True}
+            ),
+            timeout=30,
+        )
+        assert cleared.startswith("Wrote `needs_you` (array)"), cleared
+
+        crew_log_projection.forget_slot_folds()
+        listed = await c.get(FIELDS_PATH, headers={"X-Session-Key": "dashboard:chat-1"})
+        assert listed.status == 200, await listed.text()
+        rows = {row["field"]: row for row in (await listed.json())["fields"]}
+
+    assert rows["needs_you"]["written"] is True, rows["needs_you"]
+    assert rows["needs_you"]["value"] == [], rows["needs_you"]
+
+
+async def test_clear_through_the_panel_server_empties_an_object_field(vetted, monkeypatch):
+    """``dashboard_write`` ``clear: true`` empties an object field end to end.
+
+    Same path as the array case: drives the real entry point through a loopback POST.
+    ``goal-board.asks`` is an object field whose upkeep says to drop entries once
+    answered, so clearing it to ``{}`` is the documented final step.
+    """
+    from kiro_crew import mcp_core, mcp_panel
+
+    monkeypatch.setattr(mcp_panel, "_post", _real_mcp_post)
+    monkeypatch.setattr(mcp_panel, "_get", _real_mcp_get)
+
+    async with _client("goal-board") as c:
+        monkeypatch.setattr(mcp_core, "_API", f"http://127.0.0.1:{c.server.port}")
+        monkeypatch.setattr(mcp_core, "_API_UNIX_SOCKET", "")
+        monkeypatch.setattr(mcp_core, "_internal_secret", lambda: "unused-by-this-app")
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:chat-1")
+
+        seed = {"it_1": {"options": ["Yes, merge it"]}}
+        filled = await asyncio.wait_for(
+            asyncio.to_thread(
+                mcp_panel._call_tool, "dashboard_write", {"field": "asks", "value": seed}
+            ),
+            timeout=30,
+        )
+        assert filled.startswith("Wrote `asks` (object)"), filled
+
+        cleared = await asyncio.wait_for(
+            asyncio.to_thread(
+                mcp_panel._call_tool, "dashboard_write", {"field": "asks", "clear": True}
+            ),
+            timeout=30,
+        )
+        assert cleared.startswith("Wrote `asks` (object)"), cleared
+
+        crew_log_projection.forget_slot_folds()
+        listed = await c.get(FIELDS_PATH, headers={"X-Session-Key": "dashboard:chat-1"})
+        assert listed.status == 200, await listed.text()
+        rows = {row["field"]: row for row in (await listed.json())["fields"]}
+
+    assert rows["asks"]["written"] is True, rows["asks"]
+    assert rows["asks"]["value"] == {}, rows["asks"]
+    # A clear must not leave a wrong_type entry in the mistake book.
+    data = await listed.json()
+    mistakes = [m for m in (data.get("mistakes") or []) if m.get("field") == "asks"]
+    assert not any(m.get("code") == "wrong_type" for m in mistakes), mistakes
+
+
 async def test_an_unadopted_crewmate_is_refused_when_the_registry_ships_no_default(
     vetted, monkeypatch
 ):
@@ -2898,13 +3024,18 @@ def _page_store(monkeypatch, **over: Any) -> SimpleNamespace:
         InstanceRefused=InstanceRefused,
         InstanceLocked=InstanceLocked,
         InstanceError=Exception,
+        MAX_PREVIEW_AGE_MS=30 * 60 * 1000,
         read=lambda _slug: SimpleNamespace(template_id="fixture-board"),
         # `wire` takes the crew NAME and builds the link from it with the real
         # builder, so a route that forgets to pass the name fails here.
         stage_preview=lambda _slug, **_kw: SimpleNamespace(
             wire=lambda member: {**staged, "preview_url": instance_preview_url(member)}
         ),
+        discard_preview=lambda _slug: None,
         apply_preview=lambda _slug, **_kw: SimpleNamespace(
+            instance_version=5, template_id="fixture-board"
+        ),
+        adopt=lambda _slug, _template_id, **_kw: SimpleNamespace(
             instance_version=5, template_id="fixture-board"
         ),
         rollback=lambda _slug, _to, **_kw: SimpleNamespace(
@@ -3103,7 +3234,11 @@ class TestTheApplyAndRollbackRoutesOverHttp:
             monkeypatch.setattr(
                 state, "broadcast_ws", lambda kind, data: frames.append((kind, data))
             )
-            resp = await c.post(APPLY_PATH, json={}, headers={"X-Session-Key": "dashboard:chat-1"})
+            resp = await c.post(
+                APPLY_PATH,
+                json={"template_id": "fixture-board"},
+                headers={"X-Session-Key": "dashboard:chat-1"},
+            )
             assert resp.status == 200, await resp.text()
             body = await resp.json()
         assert body["instance_version"] == 5 and body["template_id"] == "fixture-board"
@@ -3112,7 +3247,7 @@ class TestTheApplyAndRollbackRoutesOverHttp:
 
     @pytest.mark.parametrize(
         ("path", "body"),
-        [(APPLY_PATH, {}), (ROLLBACK_PATH, {"to_version": 2})],
+        [(APPLY_PATH, {"template_id": "fixture-board"}), (ROLLBACK_PATH, {"to_version": 2})],
         ids=["apply", "rollback"],
     )
     async def test_the_reply_hands_the_new_page_block_and_upkeep_pointer(
@@ -3132,18 +3267,18 @@ class TestTheApplyAndRollbackRoutesOverHttp:
             reply = await resp.json()
         assert reply["dashboard"] == f"[DASHBOARD for {SLUG}]\nUpkeep: x"
 
-    async def test_apply_with_nothing_staged_is_a_refusal(self, vetted, monkeypatch) -> None:
-        store = _page_store(monkeypatch)
-
-        def _nothing(_slug, **_kw):
-            raise store.InstanceRefused("there is no page staged to keep")
-
-        monkeypatch.setattr(store, "apply_preview", _nothing)
+    async def test_apply_with_no_template_and_no_saved_page_is_a_refusal(
+        self, vetted, monkeypatch
+    ) -> None:
+        _page_store(monkeypatch)
+        monkeypatch.setattr(
+            routes, "_dashboard_artifact_store", lambda: SimpleNamespace(list=lambda **_kw: [])
+        )
         async with _client() as c:
             resp = await c.post(APPLY_PATH, json={}, headers={"X-Session-Key": "dashboard:chat-1"})
             assert resp.status == 400, await resp.text()
             body = await resp.json()
-        assert body["code"] == "refused" and "no page staged" in body["error"]
+        assert body["code"] == "refused" and "nothing to apply" in body["error"]
 
     async def test_rollback_reports_the_version_it_landed_on(self, vetted, monkeypatch) -> None:
         """Two different numbers: the one asked for, and the one now current.

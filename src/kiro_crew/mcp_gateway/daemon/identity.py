@@ -96,8 +96,9 @@ class _StubConn:
         #: indistinguishable from one nothing has named yet, and that is the one
         #: state the stub-initiated recaller is allowed to fill, so without this
         #: flag a refusal would hand the stub a way to name any session it likes.
-        #: Refused is a VERDICT, not an absence: only claim-push may clear it, by
-        #: naming this connection's own token.
+        #: Refused is a VERDICT, not an absence: only claim-push may clear it —
+        #: either a tokenless claim (which retargets every connection on the pid
+        #: unconditionally) or a tokened claim naming this connection's own token.
         self.identity_refused = False
         self.pid_start_ids = pid_start_ids if pid_start_ids is not None else {}
         self.stub_session_token = stub_session_token
@@ -591,8 +592,9 @@ def _apply_recaller(msg: dict[str, Any], conn: _StubConn, pool_label: str) -> No
         # state it leaves must not read as "nothing has named me yet" and let the
         # recaller fill it: the recaller key comes from the stub's own
         # process-tree walk, which on a shared runtime is the very per-runtime
-        # answer the refusal rejected. Only a claim carrying this connection's
-        # own token may name it now.
+        # answer the refusal rejected. Only claim-push may name it now: a
+        # tokenless claim (PID-wide reach) or a tokened claim naming this
+        # connection's own token.
         logger.warning(
             "stub %s sent recaller after a co-tenancy refusal; only claim-push may name it",
             stub_uuid,

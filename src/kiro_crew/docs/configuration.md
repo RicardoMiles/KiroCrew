@@ -126,8 +126,9 @@ provider.
 
 | Value | Harness | Notes |
 |-------|---------|-------|
-| `""` (default) | kiro-cli | The built-in default path. |
+| absent or `""` | Kiro Agent (KAS) | No choice: the default. Falls back to kiro-cli when KAS is unavailable. |
 | `kas` | Kiro Agent (KAS) | Served through kiro-cli's `acp --agent-engine v3` relay. |
+| `kiro` | kiro-cli | The Kiro CLI choice. |
 | `claude` | Claude Code | Uses the public `claude-agent-acp` adapter. |
 | `codex` | Codex | Uses the Codex ACP adapter. |
 | `opencode` | OpenCode | Uses OpenCode's native ACP server. |
@@ -155,6 +156,19 @@ runs kiro-cli instead; the dashboard's KAS row lists `kiro-cli acp --agent-engin
 v3` as missing. `config.json` keeps `kas`, so updating kiro-cli and restarting
 returns to KAS. A check that cannot run leaves KAS selected.
 
+KAS can also run with **no kiro-cli at all**. `kirocrew kas install` downloads
+the `@kiro/agent` version this Kiro Crew release pins, plus its own Node runtime,
+from a sha256-pinned manifest (`agent.kas_bundle_url`) into
+`<data home>/engines/kas/<version>/`. Each Kiro Crew release runs exactly one
+engine version; after a Kiro Crew update run `kirocrew kas install` again. And
+`agent.kas_bundle: true` makes the `kas` backend spawn that engine directly. On
+this route Kiro Crew is always the credential owner: sign in from the dashboard
+(Sign in) — kiro-cli's login is not consulted. `kirocrew kas status` shows what is
+installed and whether the route is on; `kirocrew doctor` reports it under
+"KAS backend". The engine directory is read-only inside the agent sandbox and
+fenced from the agent's file tools, so a session cannot rewrite the code its next
+session runs; only the install command (your own terminal) writes there.
+
 Harness capabilities differ: agent-spec projection, MCP transport, model
 selection, permission routing, resume, compaction, and subagent continuation are
 not inferred from the harness name. See [Agent Spec Field
@@ -163,7 +177,8 @@ contract](../../../docs/system-specs/modules/agent-host-contract.md) for the
 per-harness capability matrix.
 
 Set a registered value with, for example,
-`kirocrew config set agent.acp_backend kas`.
+`kirocrew config set agent.acp_backend kiro`. `agent.member_acp_backend`, the
+harness for crew-member DM sessions, reads the same values.
 
 ## Key Settings
 
@@ -171,7 +186,6 @@ Set a registered value with, for example,
 {
   "agent": {
     "provider": "acp",
-    "acp_backend": "",
     "approval_mode": "auto",
     "model": "auto",
     "reasoning_effort": "",
@@ -247,6 +261,8 @@ Set a registered value with, for example,
 |-----|-------------|---------|
 | `agent.provider` | LLM provider backend. `"acp"` (KiroACP / kiro-cli) is the only accepted value | `"acp"` |
 | `agent.default_agent` | Default agent name for new sessions. Empty resolves from the agent config | `""` |
+| `agent.kas_bundle` | Run the `kas` backend from Kiro Crew's own installed engine bundle (`kirocrew kas install`) with its bundled Node, instead of kiro-cli's ACP relay. kiro-cli is not needed; the engine signs in through Kiro Crew's own login only. `true` with nothing installed refuses the spawn and names the install command | `false` |
+| `agent.kas_bundle_url` | `https://` base `kirocrew kas install` fetches the engine manifest from (`<base>/kas/<version>/manifest.json`). Every artifact is sha256-pinned by the manifest and the manifest by the release, so this chooses where the pinned build is fetched from, never what is trusted. Non-https values fall back to the default | the project's release bucket |
 | `agent.deepseek_env` | Provider keys handed to the DeepSeek Harness (`agent.acp_backend: deepseek`) as environment variables at spawn: a map of environment-variable NAME to a `secret://<vault name>` reference. Store the key under Settings → Secrets first, then map it — e.g. `{"DEEPSEEK_API_KEY": "secret://my-dsh-key"}`. Any provider name the harness knows works. A plaintext value is refused at write time — the `config set` itself fails, so no key is ever stored in `config.json` — and, at spawn, so is a name the harness would forward to its own shell children, a name Kiro Crew sets itself, or one Kiro Crew's agent environment scrub strips: the session is refused before it starts, naming the offending key. Empty means no key — a locally served model needs none. Other backends ignore it | `{}` |
 | `agent.approval_mode` | `"auto"` or `"interactive"` | `"auto"` |
 | `agent.model` | Default LLM model for new sessions. `"auto"` defers to the agent config, then to Kiro's own default. Editable from Settings → Chat → Model; a per-session model picker overrides it for that session only | `"auto"` |
@@ -268,7 +284,7 @@ Set a registered value with, for example,
 | `agent.subagent_max_turns` | Default tool-call budget per subagent; stored user values are preserved on upgrade | `1000` |
 | `agent.chat_turn_timeout_secs` | Wall-clock limit for one chat turn, in seconds. A turn that reaches it ends with a notice naming the limit. Clamped to 300–86400 (24h) and cannot be turned off; for work spanning many hours, use a monitor loop or a task instead of one long turn. Also set in Settings → Chat → Advanced → **Turn Time Limit**. One dashboard session can run under its own limit in the same range, set from its session menu under **Turn time limit** | `14400` |
 | `agent.spawn_min_memory_gb` | Free memory (GB) that must remain available after a subagent start is admitted. A dedicated-process start is priced at what such a runtime settles at: about 1 GB until runs of that agent have been measured, then their learned size capped at 2 GB, never below `agent.subagent_cost_gb`. A start that shares its parent's runtime is priced about 0.35 GB lower. A nested start that shares its parent's runtime is admitted at the floor itself, since its parent already holds its memory. A spawn that does not fit waits in the queue, never refused: in the durable queue, or in memory for a temporary or incognito memory mode. It is re-checked when memory can have moved (a subagent ending, or a reading every few seconds while something waits, which also sees a warming subagent settle), and while another chat's subagents wait, a chat already running its share of dedicated subagents (weighted by `agent.lane_weights`) waits for its next top-level start. On macOS a start also waits while the kernel reports memory pressure and one of this gateway's dedicated subagents is running. An install still carrying the old `4.0` default moves to `2.0` once; a value set back afterwards is kept. 0 disables the check, that wait included | `2.0` |
-| `agent.subagent_queue_max_wait_secs` | Longest a subagent spawn may wait for memory, counted as the time `agent.spawn_min_memory_gb` has held it back, in the durable queue or in memory. Past it the spawn ends without starting: its parent gets the result `never started: waiting for memory` like any other subagent result, and the spawn leaves the parent's queued count. Time a spawn spends waiting only for a free slot is not counted. It also bounds the macOS memory-pressure hold: a start it has held that long with no other top-level start from the same chat beginning in the meantime ends without starting (a chat whose queue keeps starting does not expire the spawns waiting behind them, whichever `spawn_run` batch they belong to), and while one pressure episode lasts longer than this, new starts it would hold end at once. Applies live, without a restart. `0` waits without a bound | `1800` (30 min) |
+| `agent.subagent_queue_max_wait_secs` | Longest a subagent spawn may wait for memory, counted as the time `agent.spawn_min_memory_gb` has held it back, in the durable queue or in memory. Past it the spawn ends without starting: its parent gets the result `never started: waiting for memory (not enough memory freed up in time); retry once memory frees up` like any other subagent result, and the spawn leaves the parent's queued count. Time a spawn spends waiting only for a free slot is not counted. It also bounds the macOS memory-pressure hold: a start it has held that long with no other top-level start from the same chat beginning in the meantime ends without starting (a chat whose queue keeps starting does not expire the spawns waiting behind them, whichever `spawn_run` batch they belong to), and while one pressure episode lasts longer than this, new starts it would hold end at once. Applies live, without a restart. `0` waits without a bound | `1800` (30 min) |
 | `agent.completion_keep` | Which end of the subagent transcript to keep in the completion event injected into the parent session: `"head"`, `"tail"`, or `"both"` (head + middle marker + tail) | `"head"` |
 | `agent.completion_keep_chars` | Max characters retained in the completion event after applying `completion_keep`. `0` disables truncation. The full transcript stays on disk (see `subagent_result_ttl_secs`) | `3000` |
 | `agent.subagent_result_ttl_secs` | How long a delivered subagent's `result.txt` is retained before the reaper prunes it, so the parent can read the full transcript on demand instead of re-running the subagent. Measured from the moment the completion reaches the parent, not from when the run finished | `3600` (1h) |
@@ -283,7 +299,7 @@ Set a registered value with, for example,
 | `session.idle_exempt_keys` | Session keys the idle timeout never ends, for a chat that automation wakes hours apart and that would otherwise start cold on every wake. A dashboard chat's key is `dashboard:` followed by the `sid` in its URL, unless the tab is linked to a cron job or a channel thread, which uses that link's key instead (for example `cron:<job id>`). Closing a dashboard or cron tab still ends its process; a channel thread's session belongs to the channel, so closing its viewer does not. `session.watchdog_rss_max_mb`, when set, still applies. A listed session with no tab, such as a cron job that runs without one, keeps running even after its job is deleted, so take a deleted job's key off the list. The RSS limit or a gateway restart still ends it. On the kiro-cli or KAS backend, a Kiro sign-out from the dashboard ends it at once, whatever account it signed in with. After any other switch or sign-out of the Kiro account it signed in with, the next dashboard chat turn ends it, and so does the next agent cron run unless Kiro Crew then cannot tell which account is signed in, as with a social login. A session that is mid-turn then ends later instead, when its next turn starts or at a later dashboard chat turn or agent cron run. Re-read every cleanup tick, so a change needs no restart. At most 10 keys of up to 512 characters each are kept, because each listed key can keep a whole kiro-cli process tree running; a longer key is dropped, not cut short, and the gateway log warns once per load when any key is dropped | `[]` |
 | `session.empty_response_auto_continue` | After two consecutive empty model responses, send transcript-visible `continue` nudges on the same session | `true` |
 | `session.empty_response_max_continues` | How many `continue` nudges may run back to back before the give-up card (clamped 1-10; above 1 the notice shows "recovery N of M") | `1` |
-| `session.autocompact_pct` | Context usage percentage at which auto-compaction triggers (5-90). Lower compacts sooner and keeps per-turn cost down; higher retains more conversation before rewriting it. Applies to new installs: an existing `config.json` keeps its stored value | `70.0` |
+| `session.autocompact_pct` | Context usage percentage at which auto-compaction triggers (5-90). Lower compacts sooner and keeps per-turn cost down; higher retains more conversation before rewriting it. Applies to new installs: an existing `config.json` keeps its stored value. On the KAS backend it does not trigger compaction: KAS decides when to compact on its own | `70.0` |
 | `session.compact_wait_secs` | Seconds to wait for a compaction to finish: automatic, the task runner's context-overflow compaction, and a manual `/compact` on any surface (dashboard, chat channels). Past it, the session manager's automatic compaction and the task runner's compaction restart the session, a chat channel's near-limit compaction gives up and keeps the session, and a manual `/compact` reports that it timed out. `0` (the default) uses the built-in budget. A positive value below 60 is raised to 60 and a value above 3600 is capped. Raise it on a host where compaction on a large context window regularly needs longer than the built-in budget; a stuck compaction also waits the full budget | `0.0` |
 | `session.pool_size` | Number of pre-spawned kiro-cli processes kept ready for instant session start. 0 disables | `0` |
 | `session.pool_agent` | Agent for warm-pool processes. Empty uses `agent.default_agent` | `""` |
@@ -345,7 +361,9 @@ transcribed the same way.
 |-----|-------------|---------|
 | `stt.enabled` | Turn spoken input into text you can send | `true` |
 | `stt.provider` | `"local"` (this machine, no account), `"apple"` (the on-device recognizer built into macOS 26 and later), `"transcribe"` (AWS Transcribe, which bills your AWS account), or `"off"` (no recognizer runs, the same as turning speech input off). `kirocrew config set` refuses any other value. A stored unknown value runs as `off` with a log warning, and `kirocrew config defaults --adopt stt.provider` rewrites it to `off` rather than switching to `local`; a retired name reads as `local` (see below) | `"local"` |
-| `stt.model` | Which speech model the local provider downloads and runs: `tiny`, `base`, `small`, or `large-v3-turbo`. Bigger is more accurate and a longer first-time download — and on a CPU-only build the largest can recognise slower than you speak (an 11-second clip took 13.6 s on a 16-thread aarch64 CPU, 1.24x the audio), which Settings → Voice says beside the choice | `"base"` |
+| `stt.model` | Which speech model the local provider downloads and runs: `tiny`, `base`, `small`, `large-v3-turbo`, or `custom` to run your own (see below). Bigger is more accurate and a longer first-time download — and on a CPU-only build the largest can recognise slower than you speak (an 11-second clip took 13.6 s on a 16-thread aarch64 CPU, 1.24x the audio), which Settings → Voice says beside the choice | `"base"` |
+| `stt.custom_model_path` | File name of a whisper.cpp ggml model in the speech models folder (`models/whisper` under the Kiro Crew home), run instead of a catalog one when `model` is `custom`. Must resolve to a regular file inside that folder; nothing is downloaded | `""` |
+| `stt.custom_model_sha256` | The 64-character hex sha256 of the file at `custom_model_path`, checked on every load. Required for `model: "custom"`; with either half missing or malformed, `custom` degrades to the default model with a warning | `""` |
 | `stt.language_code` | Language for speech recognition, e.g. `en-US`, `fr-FR`. `"auto"` auto-detects on the local provider | `"auto"` |
 | `stt.streaming` | Show words in the message box while you are still speaking rather than only once you stop. Every provider supports it; turning it off spends less CPU on `local` and fewer API calls on `transcribe` | `true` |
 | `stt.silence_ms` | How long a pause must last before what you said is treated as a finished phrase. Raise it if you are being cut off mid-sentence, lower it if the text lags behind you. A value outside 200-5000 ms is clamped into that range. Set here only: Settings -> Voice offers no picker, because nobody can tell 700 ms from 750 ms by feel, and the setting most people actually want when dictation cuts them off is `stt.endpointing` | `700` |
@@ -358,6 +376,7 @@ transcribed the same way.
 | `stt.transcribe_region` | AWS region for the Transcribe API (`transcribe` provider only) | `"us-east-1"` |
 | `stt.transcribe_profile` | AWS profile for the Transcribe API. Empty uses the default credential chain (`transcribe` provider only) | `""` |
 | `stt.transcribe_vocabulary` | Name of an Amazon Transcribe custom vocabulary to recognise your names and terms, from the same region. Its language must match `stt.language_code`, or Amazon Transcribe refuses it and dictation fails. Empty uses none (`transcribe` provider only) | `""` |
+| `stt.transcribe_languages` | Languages speakers switch between in one recording, for example `["vi-VN", "en-US"]`. With two or more, a live Transcribe stream identifies the language of each part and transcribes it in that language instead of using `stt.language_code`; with fewer, `stt.language_code` is used. At most five, one dialect per language (`en-US` and `en-GB` cannot be listed together), and a list that breaks either rule is ignored with a log warning. Applies to streaming dictation and meetings; a voice message, or dictation with `stt.streaming` off, still uses `stt.language_code`, because Amazon Transcribe identifies several languages only in a raw PCM stream. A custom vocabulary is then sent in the form identification accepts, and its language should be one of the candidates. Needs `amazon-transcribe` 0.6.3 or newer (`transcribe` provider only) | `[]` |
 
 #### The local provider downloads one model, once
 
@@ -377,7 +396,7 @@ again.
 Desktop users install nothing else by hand: the app already carries the
 recognizer, decoder, and AWS client. In a source environment the recognizer and
 AWS client are the optional `voice` extra, installed as its own dependencies
-(`pip install 'boto3>=1.34,<2' 'amazon-transcribe>=0.6,<1' 'pywhispercpp>=1.5,<2'`):
+(`pip install 'boto3>=1.34,<2' 'amazon-transcribe>=0.6.3,<1' 'pywhispercpp>=1.5,<2'`):
 
 - **Intel Macs have no prebuilt recognizer.** Every other platform Kiro Crew
   supports (Apple silicon macOS, glibc and musl Linux on x86_64 and arm64, and
@@ -387,7 +406,7 @@ AWS client are the optional `voice` extra, installed as its own dependencies
   different fixes.
 
   If you would rather not build it, installing only the cloud half
-  (`pip install 'boto3>=1.34,<2' 'amazon-transcribe>=0.6,<1'`) gets you the AWS
+  (`pip install 'boto3>=1.34,<2' 'amazon-transcribe>=0.6.3,<1'`) gets you the AWS
   Transcribe client on its own. `pip` resolves an extra all-or-nothing, so on a
   platform without the recognizer wheel the full `voice` extra installs *nothing* —
   including the Transcribe client, which has no such limitation. This is the way to
@@ -645,6 +664,28 @@ member-memory sandbox is required.
 | `auto_update` | Where the install can apply updates, `true` installs them and restarts the gateway; `false` only notifies. When work is running, a checkout waits before applying, while the `cli.sh` managed venv builds the new version alongside and waits only to restart. Elsewhere it has no effect. On those same installs a policy minimum version applies regardless. A hand-edited recognized boolean spelling (such as `"false"`) is honoured; any other non-boolean value reads as off; an absent key stays on. See [Updates](#updates) | `true` |
 | `timezone` | IANA timezone name, e.g. `"America/Los_Angeles"` | `""` (falls back to UTC) |
 | `snapshot_dir` | Where `kirocrew snapshot` writes tarballs | `""` (`~/.kiro/crew/snapshots`) |
+
+## Running a custom speech-to-text model
+
+Put a whisper.cpp ggml model file in the speech models folder, `models/whisper` under the Kiro Crew home (`~/.kiro/crew/models/whisper` by default). Then set `stt.model` to `custom`, `stt.custom_model_path` to the file's name, and `stt.custom_model_sha256` to its 64-character hex sha256:
+
+```json
+{
+  "stt": {
+    "model": "custom",
+    "custom_model_path": "ggml-my-model.bin",
+    "custom_model_sha256": "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe"
+  }
+}
+```
+
+Settings → Voice does the same: pick **Custom**, then enter the file name and the SHA-256. Get the digest with `shasum -a 256 <file>` (`Get-FileHash <file> -Algorithm SHA256` on Windows).
+
+The path must resolve to a regular file inside the models folder. A name with `..`, an absolute path elsewhere, a symlink that points out of the folder, and a built-in model's file name (`ggml-base.bin` and the like, which the built-in download replaces) are all refused, and Settings → Voice says why. Nothing is downloaded for a custom model.
+
+The file is hashed on every load and is not used unless it matches the digest, so a file replaced in the models folder is refused rather than run. If either setting is missing or malformed, `custom` falls back to the default model with a warning.
+
+Only whisper.cpp ggml weights work. This picks a different model for the bundled recognizer, not a different recognizer.
 
 ## Environment Variables
 

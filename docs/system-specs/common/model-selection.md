@@ -108,9 +108,24 @@ of the stale `session/new` id. The record is cleared before each start-path
 `set_mode`, so only that activation's frame counts. The spec file is not read
 again: it can change after kiro-cli read it, and only the host knows which copy of
 the agent it loaded. No frame, or a frame without a model, is no evidence and
-changes nothing. Both `create_session` and `load_session` run it. The non-pooled
-`AcpClient._initialize_session` kiro branch sends `set_mode` without waiting for its
-answer and does not run this second check yet.
+changes nothing. Both `create_session` and `load_session` run it.
+
+The non-pooled `AcpClient._initialize_session` kiro branch sends `set_mode` without
+waiting for its answer, so it judges the frame wherever it is read instead.
+`_note_agent_switched` records the `model` of the first agent/switched frame after
+that `set_mode`, read by the start drain or inside a later prompt, unless a
+`session/set_model` went out in between (the session runs that model instead). The
+record is judged by `_judge_activated_model`: after the start drain, and in
+`ensure_ready` before the next prompt when the frame came later. A served model is
+adopted as `_resolved_model_id` with no write; an unserved one goes through
+`_ensure_served_default`. Any `session/set_model` write drops a pending record.
+
+A live pooled session switched with `AcpSessionHandle.set_mode` is judged the same
+way. The handle clears the runtime's record for the session before sending, and each
+`_run_turn` takes the recorded model (`AcpRuntime.take_switched_model`) before the
+turn starts and passes it to `ensure_served_default(activated_model=...)`. A frame
+not yet read is looked for again at the following turn; a `set_model` that lands
+first ends the wait, since the session runs that model.
 
 KAS sends no `models` object; its list is only the `configOptions` `model`
 select, and it defaults a new session to `auto`. The pooled check asks that select
@@ -347,7 +362,7 @@ serving that other model.
 
 Three more sites apply the same rule on the wire, and one on the picker:
 `AcpClient._apply_startup_model`, the shared-runtime cold start in
-`providers/acp.py`, the warm-pool post-claim switch in `session_allocation.py`
+`providers/acp_runtime_start.py`, the warm-pool post-claim switch in `session_allocation.py`
 (through the injected `model_pin_applies` dep), and `_scoped_default` behind
 `GET /api/models`. A harness-scope refusal logs at INFO on wire paths and at
 DEBUG on display paths, and MUST NOT take the entitlement warning path: harness
@@ -395,7 +410,8 @@ its own once the cache refreshes with a list that carries it.
   hides the ones it can.
 - **A pin's save gate accepts every id its picker offers.** The config PATCH gives
   every validated model pin (`agent.role_models.*`, `agent.fallback_model`,
-  `agent.refusal_fallback_model` and the `decisions.model_route` tiers) one
+  `agent.refusal_fallback_model`, the per-app `apps.<name>.model` and the
+  `decisions.model_route` tiers) one
   grammar, `_MODEL_PIN_PATTERN` in `dashboard/handlers/core.py`: a bare id, or the
   provider-qualified `provider/model` form OpenCode advertises, built from the
   same `QUALIFIED_MODEL_PATTERN` the spawn and cron model-name check uses (so
@@ -405,12 +421,20 @@ its own once the cache refreshes with a list that carries it.
   (its picker lists the same names) without the entitlement check. `decisions.nudge_wake.llm_model` keeps the bare-id
   grammar, because the decision gate scrubs any model `is_model_id` refuses.
 - Backends with `resolves_model_from_advertised_list` use their own advertised
-  model namespace. Claude retains its registry display-name reconciliation.
-  Other advertised-selection backends use their live session's model ids, then
-  their persisted namespace cache, preserving exact wire ids (including Pi
-  provider/model ids) without substituting the Kiro CLI catalog. A cold cache
-  offers `auto` and a scoped configured default until that backend advertises
-  its choices.
+  model namespace: their live session's model ids, then their persisted
+  namespace cache (`_advertised_cc_models`), so "no session is up" is never read
+  as "nothing advertised". Claude retains its registry display-name
+  reconciliation over that list, and shows the registry unfiltered only when
+  the cache is empty too. Other advertised-selection backends preserve exact
+  wire ids (including Pi provider/model ids) without substituting the Kiro CLI
+  catalog. A cold cache offers `auto` and a scoped configured default until
+  that backend advertises its choices.
+- Whether a canonical registry key is a display-only spelling is the backend's
+  `model_id_namespace` question, the same field `_wire_model_id` translates
+  through: a provider namespace whose registry row carries an id for the key
+  accepts it, and the `acp` namespace (kiro, KAS) refuses it
+  (`_model_rejected_reason`). A pick is judged on the harness of the slot it
+  lands on, so a member DM is judged on `agent.member_acp_backend`.
 - The chat composer reads `GET /api/chat/slots/{slot}/selection-capabilities` for
   the active ACP session's backend, effort support, and ordered effort levels. A
   missing session answers `known: false`; the composer then uses its existing
@@ -436,6 +460,20 @@ its own once the cache refreshes with a list that carries it.
   model, or a default the surface cannot read carries no marker. When the config
   read or the agent-pin read fails (`useSettingsDefaultModel` reports `failed`),
   the composer shows an inline "failed to load config" notice instead.
+- **A dashboard chat slot with an empty `slot.model` inherits**, and keeps inheriting
+  across turns. When neither the slot nor its crewmate pins a model, the turn resolves
+  the default the slot inherits (`_default_session_model`). While that default is
+  non-empty, neither `slot.model` backfill site writes the provider's served model
+  into the slot; the composer chip reads it from `served_model`. The backfill still
+  runs when every tier defers to the backend. A settings change to the default
+  rebuilds the provider factory but leaves live sessions alone, so the next turn of an
+  inheriting slot compares its live session's allocation stamp
+  (`allocation_requested_model`) with the default it inherits now. When they differ
+  it queues the same reset a model pick queues, consumed with `skip_if_busy`, so a
+  turn already streaming on that session is never cut. An empty stamp is unknown and
+  triggers nothing. A slot or crewmate pin never triggers it. A `slot.model` an
+  earlier backfill stored is indistinguishable from a person's pick and stays until
+  the user picks Auto.
 - Codex advertises `model[effort]` pairs, but its `model` config option accepts the
   base ID and its `reasoning_effort` option accepts the level. The live capability
   marks only backends in `ACP_BACKENDS_MODEL_EFFORT_PAIR_IDS` for pair grouping;
@@ -460,18 +498,21 @@ its own once the cache refreshes with a list that carries it.
   that level before the setting write completes.
 - **Pin a cheaper model** for the worker roles only through
   `agent.role_models.<role>` (`background`, `subagent`), read by
-  `AgentConfig.resolve_model(role)` in `config/sections.py`. Roles default to
+  `AgentConfig.resolve_model(role)` in `config/sections_agent.py`. Roles default to
   `"auto"` and deliberately do NOT inherit `agent.model`, so a user's chat model
   does not silently become the price of every background task. The sessions a
   crewmate dispatches with `session_create` are the one decided exception
-  ([rfc-worker-model-inheritance](../../request-for-change/rfc-worker-model-inheritance.md),
-  pending its implementation in
-  [#19368](https://github.com/kirodotdev/KiroCrew/pull/19368)): once that lands
-  they inherit the CREWMATE's own model and effort (the pin the person chose on
-  that crewmate's profile, never the user's chat model), and the per-crewmate
-  cost cap is that profile's `worker_model` / `worker_reasoning_effort`, where
-  `"auto"` is a real pin on the backend default. Until then a dispatched session
-  starts on the default like any other.
+  ([rfc-worker-model-inheritance](../../request-for-change/rfc-worker-model-inheritance.md)):
+  they take the CREWMATE profile's explicit model and effort pins (the values
+  the person chose on that crewmate's profile, never the user's chat model).
+  An empty crewmate pin leaves that half unpinned, so the worker's selected agent
+  or the global default decides. The per-crewmate cost cap is that
+  profile's `worker_model` / `worker_reasoning_effort`, where
+  `"auto"` is a real pin on the backend default. `worker_session_defaults` in
+  `config/sections_agent_fields.py` resolves the pair, and an explicit argument on the call
+  wins. An inherited model the picker guard refuses, or one the worker's harness
+  does not serve, is dropped and the session starts on the default; the full
+  rule is in [session-control](../modules/session-control.md).
 - **A served context window** is declared only through `agent.model_context_tokens`, one
   entry per EXACT model id as `agent.model` carries it (`model_registry.model_window`
   matches it as written, so two servers of the same weights stay distinct). It is an
@@ -479,6 +520,22 @@ its own once the cache refreshes with a list that carries it.
   nobody declared and no registry tier lists stays unknown and keeps the 1,000,000-token
   reference. See [memory-skills-hooks](../modules/memory-skills-hooks.md) "Model-window
   metadata" for the resolution order.
+- **Pin a model for one app** only through `apps.<name>.model` (Settings → Chat →
+  Model → Apps, one row per enabled app). Empty inherits, so an app nobody picked
+  for resolves exactly as it would without the setting. It applies to the sessions
+  the app owns (`slot._app`) and to the app's background spawns that pass no
+  `model`, and nowhere else. It sits below the session's own pick, the app's own
+  pick (a Research campaign's model and the Spec Builder default ride the slot's
+  model) and a model pinned on the agent or crew, and above the global default:
+  tier 3 of `config.loader.resolve_effective_model(..., app_name=)` for a session,
+  `config.loader.resolve_app_spawn_model` for a spawn, which leaves `model` empty
+  when the spawned agent pins its own. Because it fills the spawn's `model`, a set
+  value also outranks `agent.role_models.subagent` for that app's spawns. The
+  config PATCH matches the path by the manifest's kebab-case name grammar, since
+  apps install at runtime, and validates the value like every pin above; a value
+  the account later stops serving is withheld at session start like any inherited
+  default. It never re-purposes `decisions.model_route`, whose tiers are the Auto
+  router's.
 - **Entitlement checks** always use the shared predicate
   `acp.client.model_is_unusable(id, advertised)` together with
   `advertised_model_ids(...)`. It is one predicate on purpose: two spellings of "can
@@ -510,8 +567,8 @@ its own once the cache refreshes with a list that carries it.
   is read as accepted and the model is recorded, as it was before the wait existed.
   A startup pin that a kiro session withholds because the account does not serve
   it (`AcpClient._apply_startup_model` on the dedicated runtime, the kiro start in
-  `providers/acp.py` on the shared one) is recorded in `model_pin_refused` the same
-  way, so the cron acquire step in `slack/gateway.py` annotates the result and
+  `providers/acp_runtime_start.py` on the shared one) is recorded in `model_pin_refused` the same
+  way, so the cron acquire step in `slack/gateway_runtime/cron_fire.py` annotates the result and
   blanks the pinned model on the usage row instead of billing a model that never ran.
   Both refusals carry `advertised_but_refused` from the same verdict, which selects
   the adapter-mismatch wording; `AcpModelUnavailable` requires `backend=` and shows

@@ -58,6 +58,12 @@ interface CollapsibleToolGroupProps {
    * call prompts again (#5400 on the spawn card, #5434 on this row).
    */
   canTrust?: boolean
+  /**
+   * Offer the "Ask the agent" hand-off on the failed-decision notice. Default
+   * `true`. A host holding unsaved local state the hand-off's navigation would
+   * drop (ChatEmbed's composer draft) passes `false`.
+   */
+  askAgent?: boolean
   /** Callback to open the Activity Viewer. */
   onViewActivity?: () => void
   /** Whether the Activity Viewer is currently open. */
@@ -107,7 +113,7 @@ function derivedHeading(meta?: Record<string, unknown>): string {
 
 /** Collapsible row that wraps tool/thinking/permission messages — collapsed unless autoExpand or the
  *  "Tool calls start expanded" chat setting is on. */
-const CollapsibleToolGroup = memo(function CollapsibleToolGroup({ count, autoExpand, disclosureKey, hasPermission, isRunning, children, permissionMeta, permissionMetas, pendingPermCount, onApprove, onApproveBatch, canTrust, onViewActivity, activityOpen }: CollapsibleToolGroupProps) {
+const CollapsibleToolGroup = memo(function CollapsibleToolGroup({ count, autoExpand, disclosureKey, hasPermission, isRunning, children, permissionMeta, permissionMetas, pendingPermCount, onApprove, onApproveBatch, canTrust, askAgent = true, onViewActivity, activityOpen }: CollapsibleToolGroupProps) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   // The chat setting (#18254) raises the resting state from collapsed to
   // expanded; liveness (autoExpand) can still open a row on top of it.
@@ -162,7 +168,6 @@ const CollapsibleToolGroup = memo(function CollapsibleToolGroup({ count, autoExp
     : needsAttention ? i18nT('pages.chat.collapsibleToolGroup.approval_needed') : isRunning ? i18nT('pages.chat.collapsibleToolGroup.running_tools') : i18nT('pages.chat.collapsibleToolGroup.tool_call', { count: count })
 
   const preview = needsAttention ? sanitizeLlmOutput(extractPreview(permissionMeta)) : ''
-  const truncated = preview.length > 150 ? preview.slice(0, 150) + '…' : preview
   // Heading over the single-call preview; '' when the command is already the
   // clearest statement of the call (nothing to add above the <pre>).
   const heading = needsAttention ? sanitizeLlmOutput(derivedHeading(permissionMeta)) : ''
@@ -261,7 +266,7 @@ const CollapsibleToolGroup = memo(function CollapsibleToolGroup({ count, autoExp
           gating this row on !expanded left the expanded pending group with no
           actionable buttons — a dead end exactly while the agent is parked
           waiting on the user (#5487). */}
-      {needsAttention && (onApprove || onApproveBatch) && (isBatch ? batchPreviews.length > 0 : !!truncated) && (
+      {needsAttention && (onApprove || onApproveBatch) && (isBatch ? batchPreviews.length > 0 : !!preview) && (
         <div className="mt-1 ml-4 pl-3 shadow-[inset_2px_0_0_0_var(--color-amber-400)] forced-colors:border-l-2">
           {isBatch ? (
             <>
@@ -282,7 +287,12 @@ const CollapsibleToolGroup = memo(function CollapsibleToolGroup({ count, autoExp
           ) : (
             <>
               {heading && <div className="text-[12px] leading-5 text-muted mb-1" data-testid="approval-derived-title">{heading}</div>}
-              <pre className="bg-bg-hover rounded-md px-3 py-2 text-[13px] leading-5 font-mono overflow-x-auto whitespace-pre-wrap break-all max-h-[4.5em] overflow-y-auto mb-2"><ToolInputText text={truncated} /></pre>
+              {/* The FULL command, for the same reason the batch rows are full: a
+                  cut preview can hide a destructive suffix behind a benign prefix
+                  at the one point the human vets what will run. The box is
+                  height-bounded and scrolls, so a long call cannot push the
+                  buttons below the fold. */}
+              <pre className="bg-bg-hover rounded-md px-3 py-2 text-[13px] leading-5 font-mono overflow-x-auto whitespace-pre-wrap break-all max-h-[15em] overflow-y-auto mb-2"><ToolInputText text={preview} /></pre>
             </>
           )}
         </div>
@@ -296,11 +306,12 @@ const CollapsibleToolGroup = memo(function CollapsibleToolGroup({ count, autoExp
       )}
 
       {failure !== null && (
-        // Hand-off on. The approval buttons hold no draft of their own, and the
-        // host composer's draft is persisted per slot (ChatPage saves it on slot
-        // switch) while the hand-off opens a FRESH slot rather than navigating
-        // away — so there is nothing here the navigation can destroy.
-        <ErrorNotice variant="inline" className="mt-1 ml-4 pl-3" askAgent message={failure.terminal
+        // Hand-off on by default. The approval buttons hold no draft of their
+        // own, and the main chat's composer draft is persisted per slot (ChatPage
+        // saves it on slot switch) while the hand-off opens a FRESH slot.
+        // No hand-off when the host passes `askAgent={false}`: ChatEmbed's
+        // composer draft is unsaved local state the navigation would drop.
+        <ErrorNotice variant="inline" className="mt-1 ml-4 pl-3" askAgent={askAgent} message={failure.terminal
           ? i18nT('components.approvalCard.approval_no_longer_pending')
           : failure.message
             ? i18nT('components.approvalCard.decision_not_recorded_error', { error: failure.message })

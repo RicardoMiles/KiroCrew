@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from body_stream_helpers import attach_json_body
 
 from kiro_crew import artifacts as art_mod
 from kiro_crew.artifacts import ArtifactStore
@@ -68,7 +69,7 @@ def _request(claims: dict, *, body: dict | None = None, match: dict | None = Non
     req.headers = {}  # no X-Session-Key: not an incognito/guest session
     req.match_info = match or {}
     req.query = {}
-    req.read = AsyncMock(return_value=json.dumps(body or {}).encode())
+    attach_json_body(req, json.dumps(body or {}).encode())
     req.json = AsyncMock(return_value=body or {})
     req.remote = "127.0.0.1"
     state = MagicMock()

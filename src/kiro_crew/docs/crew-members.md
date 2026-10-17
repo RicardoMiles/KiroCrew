@@ -92,7 +92,7 @@ A few situations make Kiro Crew refuse to open a thread rather than guess:
 |---|---|
 | bound to a crew the registry no longer names | The crewmate was renamed or deleted while its thread survived. Restore the name, or delete the thread from Older Sessions in the Sessions list. |
 | this thread's history exists but its binding is gone | The transcript is on disk with nothing claiming it. Handing it to whoever holds the name now would show one crewmate another's conversation. |
-| shares its short name with … | Two crewmates fold to the same short name and therefore the same thread. Renaming changes only the name a crewmate shows, never its short name, so delete one and create it again under a name that folds differently. |
+| shares its short name with … | Two crewmates fold to the same short name and therefore the same thread. Renaming changes only the name a crewmate shows, never its short name, so delete the crewmate that shows this notice, not the one it names, and create it again under a name that folds differently. Deleting the named one leaves its thread bound to a crewmate that is gone, and the other is refused instead. |
 
 ## Creating and editing
 
@@ -111,9 +111,9 @@ with the suggested name and goal already filled in; nothing is created until
 you press **Create**. Creating opens the new crewmate's chat, and the crewmate
 starts it by introducing itself and asking what you would like it to do (or
 confirming the job you wrote); that opening question comes from Kiro Crew, so no
-message appears as if you had typed it. Once the goal is clear, a crewmate whose
-work should run on its own may offer a schedule, and sets one up only after you
-say yes. The name is
+message appears as if you had typed it. Once you tell it the goal (or confirm
+the one you wrote), it puts the goal on a card for you to press, and after the
+goal is saved it suggests its check-ins. The name is
 free-form display text — spaces, punctuation, any script, emoji (`Dr. Eggbot 🥚`
 is a name) — and the dialog only refuses a blank name or one already on the
 roster before the request leaves the browser; the server owns every other rule
@@ -178,6 +178,51 @@ different approval mode for that chat (`set_approval_mode`), or a change to its
 tools, MCP servers and skills (`request_capabilities`); each ask is a change
 card with a button, and nothing changes until you press it. Its workspace,
 memory store and template are not the crewmate's to ask for.
+
+### Goals
+
+A crewmate's **Goals** tab (Profile card) holds what it works toward:
+
+- **Goals.** As many as you like, each one paragraph, numbered and coloured on
+  the tab. Add one with **+**, open one to edit or remove it, or confirm one the
+  crewmate proposes (`set_goal` puts a card in its chat). The crewmate is
+  encouraged to keep the list short and to suggest merging goals that overlap;
+  you decide.
+- **Milestones.** Key results that show how far it is from its goals, one
+  shared set, each showing the numbers of the goals it serves. The crewmate
+  works them out, links each to its goals, and proposes them on one card
+  (`set_key_results`); after you confirm, it records readings itself
+  (`key_result_progress`). A reading is a number or a short note of up to 120
+  characters. A goal that cannot be measured has none. You can edit or remove
+  any of them; a removal can be undone right after, readings included.
+- **Check-ins.** Three switches, each off by default and only available once a
+  goal is set, sharing one time of day: **Daily Goal Reminder** (the crewmate
+  takes fresh readings, then carries on with its next task), **Weekly report** (on
+  a weekday you pick) and **Monthly review** (on a day of the month you pick).
+  These check-ins do not appear on the Schedule page or the crewmate's Schedules
+  tab; the switches are their only control.
+  The weekly report and the monthly review cover the readings and the tasks the
+  crewmate finished in the period, and are saved as reports under
+  `Crewmates/<name>/Reports` in Artifacts, with a notification linking each.
+- **Track something in chat.** Sends "I'd like you to track something for me."
+  to the crewmate's chat as your own message. Tell it what to track there; it
+  keeps that item up to date on its task list, which the Crew board shows. Tracked
+  items do not appear on the Goals tab.
+- **Reports.** The newest weekly reports and monthly reviews, each linking its
+  artifact.
+  When the monthly review finds the goal or its key results no longer fit the
+  work, it puts a card in the chat proposing new ones; nothing changes until you
+  press it.
+
+The goal is stored in the crewmate's goal record,
+`trust/member-goals/<slug>.json` in Kiro Crew's data folder, apart from its
+rules, with the same protection as its rules: the crewmate's file-editing tools
+are refused there, so it changes the goal or its key results only through a card
+you press (a shell command it runs can still reach the folder, as with its
+rules). A crewmate made from chat on a **Create crewmate** card starts with the
+card's goal as its goal; its description stays empty until it or you write one.
+What the crewmate is working on right now is its task list on the Crew board,
+not part of the goal.
 
 Creating a crewmate allocates its memory store for it. That store cannot later
 be pointed somewhere else or shared with another crewmate — `kirocrew agent

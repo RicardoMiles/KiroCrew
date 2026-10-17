@@ -16,7 +16,7 @@ import secrets
 import tempfile
 import threading
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
 from typing import ParamSpec, TypeVar
 
@@ -144,6 +144,11 @@ UNLANDED_SID_FIELD = "unlanded_sid"
 # Stored on the stable bucket entry so repeated /new commands cost one integer,
 # not one immortal map row per empty generation.
 GENERATION_FLOOR_FIELD = "generation_floor"
+
+# A rewind's request that the key's next cold start fork the native session it
+# discarded: ``{"sid": <source sid>, "message_id": <fork point>}``. It stands in
+# for an empty ``sid``, so every write or clear of ``sid`` drops it.
+NATIVE_FORK_FIELD = "native_fork"
 
 # Flags that are durable SETTINGS rather than session-scoped state, and so keep
 # their entry alive through :meth:`SessionMap.prune`. Membership is opt-in
@@ -345,10 +350,14 @@ def _stash_and_clear_sid(entry: dict) -> bool:
     as the key's last store, citing a predecessor two links back and orphaning
     the one between them. Which path emptied the field is not a distinction any
     reader of it can use, so the field cannot be written by only some of them.
+
+    A pending native fork is dropped too, even with no ``sid`` to stash: it
+    would otherwise restore a conversation the caller has just cleared.
     """
+    fork_dropped = entry.pop(NATIVE_FORK_FIELD, None) is not None
     sid = entry.get("sid")
     if not sid:
-        return False
+        return fork_dropped
     entry["discarded_sid"] = sid
     entry["sid"] = ""
     return True
@@ -1321,6 +1330,7 @@ class SessionMap:
             if existing.get(UNLANDED_SID_FIELD) not in (None, sid):
                 existing.pop(UNLANDED_SID_FIELD, None)
             existing["sid"] = sid
+            existing.pop(NATIVE_FORK_FIELD, None)
             if provider:
                 existing["provider"] = provider
             if cwd:
@@ -1984,7 +1994,7 @@ class SessionMap:
         ``TransportCapabilities.supports_session_resume`` makes its conversations
         inbound-committable, and therefore makes this refusal reachable from that
         transport's own in-channel link handler. Translate it there into a
-        followable message, as ``discord/transport_dispatch.py`` does — an uncaught
+        followable message, as ``discord/transport_dispatch_commands.py`` does — an uncaught
         raise inside a channel handler is a dropped task and a silent no-reply.
         """
         key = canonical_key(key)
@@ -2284,6 +2294,40 @@ class SessionMap:
         if binding_token(current, self.mirror_link_nonce(key)) != token:
             return False
         return self.clear_mirror_link(key, reason=reason)
+
+    @_guarded
+    def replace_mirror_link_if(self, key: str, expected: ChannelLink, link: ChannelLink) -> bool:
+        """Store *link* as *key*'s mirror iff the stored row is still exactly *expected*.
+
+        A repair, not a rebind: the compare (whole row, :meth:`ChannelLink.same_row`,
+        on the row stored under the canonical key itself) and the write are one
+        guarded step, so a rebind landing between the caller's read and this write
+        is kept and False is returned. The row's inbound flag and mute are carried
+        over in the same step. Bytes are stored verbatim, as by :meth:`set_mirror_link`.
+        """
+        canon = canonical_key(key)
+        entry = self._data.get(canon)
+        if not entry:
+            return False
+        stored = entry.get("mirror")
+        if not isinstance(stored, dict) or not ChannelLink.from_dict(stored).same_row(expected):
+            return False
+        inbound = entry.get("mirror_accepts_inbound") is True
+        paused = entry.get("mirror_paused") is True
+        try:
+            # On a loop each save is a deferred off-loop flush that sees both
+            # mutations; a batch there would write inline on the loop.
+            asyncio.get_running_loop()
+            batch: AbstractContextManager[None] = nullcontext()
+        except RuntimeError:
+            # Off a loop each save writes inline, so batch the pair into one write.
+            batch = self.batched_save()
+        with batch:
+            self.set_mirror_link(canon, link, accepts_inbound=inbound)
+            if paused:
+                entry["mirror_paused"] = True
+                self._save()
+        return True
 
     @_guarded
     def clear_slack_link_if(self, key: str, channel_type: str, token: str) -> bool:
@@ -2604,3 +2648,35 @@ class SessionMap:
         """Return the per-thread project-dir override for *key*, or None."""
         entry = self._data.get(canonical_key(key))
         return entry.get("project_override") if entry else None
+
+    @_guarded
+    def set_native_fork(self, key: str, source_sid: str, message_id: str) -> None:
+        """Ask *key*'s next cold start to fork *source_sid* at *message_id*."""
+        self._ensure_entry(canonical_key(key))[NATIVE_FORK_FIELD] = {
+            "sid": source_sid,
+            "message_id": message_id,
+        }
+        self._save()
+
+    def get_native_fork(self, key: str) -> tuple[str, str] | None:
+        """The pending ``(source_sid, message_id)`` fork for *key*, or None."""
+        entry = self._data.get(canonical_key(key))
+        fork = entry.get(NATIVE_FORK_FIELD) if entry else None
+        if not isinstance(fork, dict):
+            return None
+        source_sid, message_id = fork.get("sid"), fork.get("message_id")
+        if not (
+            source_sid
+            and isinstance(source_sid, str)
+            and message_id
+            and isinstance(message_id, str)
+        ):
+            return None
+        return source_sid, message_id
+
+    @_guarded
+    def clear_native_fork(self, key: str) -> None:
+        """Drop *key*'s pending native fork, if any."""
+        entry = self._data.get(canonical_key(key))
+        if entry and entry.pop(NATIVE_FORK_FIELD, None) is not None:
+            self._save()

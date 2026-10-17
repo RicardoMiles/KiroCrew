@@ -18,8 +18,8 @@ unreachable in production because the caller's `X-Internal-Secret` is ignored.
 
 | Tool | Route | What it does |
 |------|-------|--------------|
-| `session_create` | `POST /api/session-control/create` | Open a new, empty session in the caller's workspace, optionally filed into a sidebar folder at creation |
-| `session_fork` | `POST /api/session-control/fork` | Open a new session that CARRIES a copy of a source session's transcript — the caller's own by default — the way the dashboard's Fork button does; optionally titled, filed, and cut at a fork point |
+| `session_create` | `POST /api/session-control/create` | Open a new, empty session in the caller's workspace, optionally filed into a sidebar folder at creation and pinned to a `model` / `reasoning_effort`; either omitted inherits the dispatching crewmate's worker pair, else its own pair, else the default. Before any gate, a title is refused with `invalid_title` (400) under `session_rename`'s character rules (control, text-direction and non-allowed format characters, U+2800 anywhere, no visible character), then scrubbed with `_scrub_text` and cut to 200 characters; a cut result that shows nothing is refused the same way, and a blank title is no title |
+| `session_fork` | `POST /api/session-control/fork` | Open a new session that CARRIES a copy of a source session's transcript — the caller's own by default — the way the dashboard's Fork button does; optionally titled, filed, and cut at a fork point. The title meets `session_create`'s title rules before any gate (`invalid_title`, 400; scrubbed, cut to 200 characters, a cut result that shows nothing refused, a blank title is no title) |
 | `session_stop` | `POST /api/session-control/stop` | Stop another session's in-flight turn |
 | `session_end_wait` | `POST /api/session-control/end-wait` | Wake a session the caller CREATED from the `wait` tool early, keeping its turn; any other target is refused `not_creator`, for every caller class |
 | `session_retry` | `POST /api/session-control/retry` | Re-run a failed last turn through `continue_slot_turn`, the Resume button's path, with `require_interrupted=True` (`turn_not_failed` otherwise) and `authorize_target` re-run synchronously under the slot lock before the continuation is queued |
@@ -30,6 +30,7 @@ unreachable in production because the caller's `X-Internal-Secret` is ignored.
 | `session_generate_title` | `POST /api/session-control/generate-title` | Regenerate a session's title through `chat_title.generate_manual_title` and `chat_title.apply_regenerated_title`, the sidebar "Regenerate title" code: one awaited titling-model call; the result replaces the current title (a hand-set one included) and stays auto. After `authorize_target` (no `allow_self`), the target must be one the caller created (`not_creator`, 403) for every caller class. One admitted call per target per `create_rate_limit.WINDOW_SECS` (300 s) through the shared creation limiter keyed by the target slot, stamped before the model call (`title_rate_limited`, 429). After the model answers, the slot identity and closing flag are checked (`target_replaced`, 409) and `authorize_target` runs again synchronously; then every field is assigned before the first await, as `session_rename` does, and the save only makes that change durable. The save passes `still_current` (slot identity), so `_persist_title` refuses the write under the history lock when the slot left its key, and the verb then answers `target_replaced` (409) rather than overwriting a successor's saved title. A rename that landed during the model call wins (`changed: false`). If the history write fails the live slot keeps the title and the verb answers `title_persist_failed` (500). The sidebar push is skipped when the slot left its key during the save |
 | `session_close` | `POST /api/session-control/close` | Close (archive) another session, or the caller itself, as the tab ✕ does — heavier than stop, and recoverable rather than a delete |
 | `session_revive` | `POST /api/session-control/revive` | Bring an archived session back into the live sidebar, as clicking it in the History tab does — the mirror of close, optionally filing it into a folder |
+| `session_history_list` | `GET /api/session-control/history` | List the archived sessions the caller could revive, newest first, optionally narrowed to one folder; every row passes the same containment and ownership fence `session_revive` applies |
 | `session_send` | `POST /api/session-control/send` | Deliver a message that another session runs as its next turn, or cut it into the turn already running (`steer`) |
 | `session_broadcast` | `POST /api/session-control/broadcast` | Deliver ONE message to several sessions — by default every session the caller created — in a required `queue` or `steer` mode, reporting the outcome per target |
 | `session_status` | `GET /api/session-control/status` | List the sessions the caller stood up and what each is doing, with the roster taken from the crew log's session tree so a session that is gone still appears |
@@ -426,7 +427,12 @@ window and replaces it with a narrower one: the steer RPC suspends on
   aimed at it alone -- the same sentence means different things in those two
   cases. This is the
   property the composer's own gate protects by keeping app-authenticated sends
-  off the steer path; here an explicit envelope answers it.
+  off the steer path; here an explicit envelope answers it. A body opener
+  shaped like the envelope (matched after NFKC with every `Cf` char dropped,
+  behind any `Ps` bracket) is rewritten to `[quoted: sent by session`, so only
+  the real envelope opens with the marker
+  (`test_send_body_cannot_forge_a_second_provenance_envelope`,
+  `test_neutralize_send_provenance_folds_invisible_chars_and_any_opening_bracket`).
 
   It reaches one level further down. `directive_user_origin` exempts a queue entry
   from the drain's LINKED drop because "the author typed into the session's own
@@ -540,9 +546,71 @@ member's folder list adds that home folder and its ancestors, the path its own
 
 `session_create` also takes an optional `model` — the model the child starts
 on, pinned as the person's own pick in the model dropdown would be (same
-`_model_rejected_reason` guard, same pick-generation bump). An id the guard
-refuses fails the whole create with `model_rejected`; omitted, the child starts
-on the agent's or the global default.
+`_model_rejected_reason` guard, same pick-generation bump) — and an optional
+`reasoning_effort`, one of the five canonical levels `session_set_model` takes,
+pinned through the slot's effort setter and applied by the first turn's cold
+start exactly as the effort dropdown's value is. An id the guard refuses fails
+the whole create with `model_rejected`; a level outside the five fails it with
+`effort_rejected`; both are checked before anything is allocated, and both ride
+the birth metadata line (`model`, `reasoning_effort`) so an idle newborn keeps
+them across a restart.
+
+**Omitted, each takes the dispatching crewmate's matching explicit pin.** A
+crewmate with a model or effort pin passes that value to a worker it opens unless
+the worker fields say otherwise. An empty crewmate pin leaves that half unpinned,
+so the worker's selected agent or the global default decides. `create_session`
+resolves the caller's member record
+(`_dispatching_crewmate`: the caller's protected execution record when it names
+a `member` — by persisted id, else by selection name — or, for a slot with no
+record, the slot's agent name as `resolve_crew_identity` reads it) and fills
+what the call left unsaid from `worker_session_defaults(record)`: the record's
+`worker_model` / `worker_reasoning_effort` when set, else its own `model` /
+`reasoning_effort`. `worker_model` is read raw, so `"auto"` is a real pin there
+(workers on the backend default while the crewmate stays on a costly model),
+where the crewmate's own `model` folds it to inherit. The crewmate's own effort
+carries over only while the workers run the crewmate's own model: with
+`worker_model` set, or a `model` named on the call, the only effort a worker
+takes is `worker_reasoning_effort`, so a `max` chosen for an opus conductor never
+reaches an `auto`, haiku or explicitly named worker model. With none pinned the
+child's first turn resolves its effort as any session does
+(`resolve_session_effort`: the child's own crew pin when it runs as a crewmate,
+else `agent.reasoning_effort`, else the model default), which is what the profile
+card's "No level set" names. An inherited pin is also dropped when it cannot
+follow the worker onto its harness (`_inherited_pin_foreign_to_child`): the
+crewmate's thread runs on `agent.member_acp_backend` and its own `model` was
+validated there, while the non-member child runs on `agent.acp_backend`, so that
+pin is dropped when the two harnesses disagree on model-id namespace; the
+profile's explicit `worker_model` is validated for the worker's harness
+(`PUT /api/agents/{name}` judges it against `agent.acp_backend`) and crosses
+freely. Either pin is dropped when the child's namespace advertises a list it is
+not on while another harness claims it; `"auto"` always passes. When the
+crewmate's own model is dropped, the crewmate's own effort that rode along for
+it is dropped too; an explicit `worker_reasoning_effort` stays. A caller whose record is a
+template — a dispatched worker running on its crewmate's store — is not a
+crewmate and its own children inherit nothing (an id-less member's worker keeps
+`member` as its selection, so there the template, read against
+`member_template_id`, is what tells it apart); a caller that is not a crewmate,
+or a crewmate with nothing set, leaves the slot on the agent's or the global
+default, exactly as before. Nor does a child that is itself a crewmate inherit:
+an explicit `agent` that selects a member runs that member's own profile through
+the crew-pin tier, and a copied pin would outrank it as a per-session pick. An
+explicit argument always wins. An inherited model runs the same guard an
+explicit one does (`_model_pin_refusal`, the picker's own), but a refusal there
+is DROPPED rather than raised: a profile pin goes stale (delisted, display-only,
+outside the account's entitlement, or an id only the crewmate's own harness serves) without
+anyone looking at it, and a hard failure would stop every worker the crewmate
+opens until someone edited the profile or named a model on every call. The child
+then starts on the default, the reply carries `inherited_model_dropped: true`
+(the tool reply says so in words), and the SEL record names the refused id. An
+explicit model the guard refuses still fails the create with `model_rejected`.
+The reply names which of the two came from the profile (`inherited`), as does the
+create's SEL record. The decision is
+[rfc-worker-model-inheritance](../../request-for-change/rfc-worker-model-inheritance.md).
+
+The pair is set from the crewmate's Profile card (**Worker model** / **Worker
+reasoning effort**, `CrewProfileSettings`), written through
+`PUT /api/agents/{name}` under the crew pin's own validators and shipped on
+`GET /api/members` (not on `GET /api/agents`: the crew editor never shows them).
 
 ### `session_fork`: a created child that carries a transcript
 
@@ -688,12 +756,16 @@ create already in flight. Revoking mid-call yields an untrusted child.
 
 Nothing about trust is persisted at birth. The birth metadata carries
 `tab_id`, `origin`, `created_at`, `workspace`, `agent`, `project`, `title`,
-`memory_mode`, and `folder_id` / `created_by` / `model` when set — no trust field — so a
-restart returns the child to interactive along with its creator.
+`memory_mode`, and `folder_id` / `created_by` / `model` / `reasoning_effort` when
+set — no trust field — so a restart returns the child to interactive along with
+its creator.
 
-The create's SEL record carries `agent`, `folder_id`, `model` (empty when none
-was asked for), and what the child was
-born with: `inherited_trust` and `inherited_trust_reads`, present on both
+The create's SEL record carries `agent`, `folder_id`, `model` and
+`reasoning_effort` (each empty when none was pinned), `inherited` (which of the
+two the dispatching crewmate's profile supplied, `""` when neither),
+`inherited_model_dropped` (the profile model the guard refused and the create
+dropped, redacted, `""` when none), and what the
+child was born with: `inherited_trust` and `inherited_trust_reads`, present on both
 outcomes so `"false"` is positive evidence the posture did not transfer. That is
 what makes an auto-approved tool call in a dispatched session traceable to the
 creator's posture rather than unexplained.
@@ -739,6 +811,7 @@ that is out of bounds is visible after the fact even though nothing happened.
 | Caller is channel-linked (`linked_session_key` set) | 403 | The exfiltration direction: a linked caller's conversation IS a channel thread, so a read would hand a private dashboard transcript to that channel's readers. `CHANNEL_AGENT_BLOCKED_TOOLS` keys on the agent identity; a linked slot is a second route to the same surface. **Two exceptions:** a `cron:<job_id>` link, which names the job's own run transcript and republishes to nobody; and a 1:1 DM whose only human is the configured owner (`owner_dm_refusal` answering `""`) — see "Owner-DM channel callers" below |
 | Caller's own session is no longer open | 403 | Nothing to attribute the operation to |
 | Caller changed workspace while a creation was in flight | 403 | Creation resolves the workspace's project directory off-loop, so it suspends between authorizing the caller and allocating the slot. Both decisions that read the caller's workspace -- the memory boundary the child inherits, and whether the answering agent is bound to that workspace -- are invalidated by a move, and re-deciding the binding here is not available: it needs a config load, which must not run on the event loop |
+| Agent that would answer is bound to another workspace | 403 | `agent_workspace_mismatch`. The child runs in the caller's workspace, so an agent whose own binding names a different one would carry that workspace's memory into it. Checked on whatever answers, an omitted agent included (it resolves to the default template). **One inheritance:** an explicitly named TEMPLATE (`ResolvedBindings.selection_kind == "template"`, a passthrough or the default template, never a `config.agents` row) passes when the caller has an execution record and is the crew member whose own declared workspace (`config.workspaces`) is the caller slot's workspace (`_caller_member_workspace`). A template has no workspace binding -- `resolve_agent_bindings` files every template session under `default_workspace` -- and the template arm already binds the child to the caller's own store, so the child runs on the caller's workspace, project directory and store, under the template persona. Without it every crew member created on its own `member-<slug>` workspace (#19230) was refused `agent_workspace_mismatch` for `agent="kirocrew-worker"`, while members created before #19230 (workspace `default`) were not. Still refused: a crew MEMBER bound elsewhere (its store would cross), a caller with no record (the child would fall to the default store), and any non-member caller, whose template child has no store of its own in that workspace |
 | Named agent does not resolve to a configured one | 403 | The resolver falls back to the default agent, which passes the workspace check because it is the caller's own default -- so no boundary is crossed, but the created session would store and advertise a name that is not what answers. `ResolvedBindings.requested_resolved` states that contract for callers that store the requested name. Refused rather than rewritten to the effective agent: nothing exists yet, so a corrected name costs one retry, whereas an existing slot keeps its stored name verbatim so a momentarily stale resolution cannot permanently rebind it |
 | Caller may not bind a child to the selected member's private store | 403 | `memory_delegation_denied`; one check, on the route every branch of agent resolution has already produced, before slot allocation. Two admissions: the store is the caller's OWN, which requires this process's vouched identity and the caller's durable record to agree, or the caller's delegation lineage is not fenced (`_delegation_lineage_fenced`: an owner-rooted chain is admitted; a cron-, channel- or member-rooted chain, or a broken one, is fenced). Same-store workers remain allowed; unfenced global callers retain member assignment. See "A created worker receives one execution identity" |
 | Caller changes history key, agent or memory store during creation | 400 | `caller_memory_changed`; the live caller must still match the identity checked before awaited preparation |
@@ -1136,7 +1209,7 @@ itself opened. Member sessions also bypass the provider warm pool
 default backend, so a warm hit would skip both the member backend route and
 the mount. The member backend is `agent.member_acp_backend` (default `kas`),
 and requires a wire-capable backend (`ACP_BACKENDS_MEMBER_DISPATCH`: the
-claude seam, KAS, codex, opencode, goose and deepseek); kiro-cli v2 reads its template from disk and
+claude seam, KAS, codex, opencode, goose, deepseek and pi); kiro-cli v2 reads its template from disk and
 exposes no per-session channel, so a member session on it runs as plain chat —
 the tools are simply not mounted, never mounted-and-refused. Codex qualifies
 because `providers/mirrors/codex.py` already gives it a per-session array and
@@ -1501,7 +1574,7 @@ facts, and any it cannot establish answers **false**.
    mirror.
 
    **The origin does not survive a gateway restart, and the exemption goes with
-   it.** `set_origin_link` holds the record in memory by design (`session.py`),
+   it.** `set_origin_link` holds the record in memory by design (`session_parts/links.py`),
    while the slot and its mirror are persisted and the slot is re-surfaced at boot.
    So between a restart and the owner's next channel message this clause is the one
    that fails while the other three hold: a monitor-loop cycle or a turn taken in
@@ -1514,7 +1587,7 @@ facts, and any it cannot establish answers **false**.
    three gates name it (`ORIGIN_NOT_ON_RECORD`) and say what clears it, rather than
    reporting a channel link the caller cannot do anything about. Making the
    exemption survive a restart means giving the origin (or an equivalent durable
-   record of the conversation a session was born in) persistence in `session.py` —
+   record of the conversation a session was born in) persistence in `session_parts/links.py` —
    out of scope here, since that store serves the auto-compact notice, whose own
    reason for being in memory is that a restart takes the live session with it.
 
@@ -1690,7 +1763,7 @@ marker being the runner's own; and that a turn whose only call is `create_sessio
 records its audience at the creator gate; and that a Telegram allow-list entry that
 is not a positive integer (a group id, zero, text) is never attested as a DM peer,
 so a tab mirrored to such a conversation stays refused with the real transport. The crew-log
-opener is pinned in `test/test_discord.py` and `test/test_telegram.py`: a DM turn
+opener is pinned in `test/test_discord_mirroring.py` and `test/test_telegram_link_mirror.py`: a DM turn
 followed by a `work_ledger_record` write against the real writer lands, and the
 resumed-session path opens nothing.
 
@@ -1972,6 +2045,37 @@ caller's model of the sidebar is stale. Member DM threads
 (`member-*`) are refused outright (`member_thread_target`): they are opened only
 through the roster route that re-checks the member binding.
 
+## Listing what can be revived
+
+`session_history_list` answers "what is there to revive?" so an agent does not
+have to guess a title. `list_archived_sessions` runs the caller side exactly as
+`revive_session` does (`refuse_caller_identity`, then `refuse_caller_surface`,
+then the fence verdict) before touching history, so a refused caller learns
+nothing about what is on disk. The catalog walk (`_scan_revivable_history`) runs
+in a worker thread, newest first, and keeps a row only when revive would accept
+it. Revive's target-side refusals live in one predicate, `_archived_target_refusal`
+(metadata plus the store's link and mirror reading, answering a refusal code or
+none), which both `revive_session` and the walk call, so a refusal added to revive
+is hidden from the listing by the same edit. The walk asks it on the metadata
+alone first and probes the session store only for a row that passes. The listing
+adds the `member-` DM prefix guard and the folder filter. The store probes fail closed the
+way revive's do, so a session whose link cannot be read is hidden rather than
+offered and then refused. A fenced caller whose candidates the lineage cannot
+vouch for gets `lineage_unknown: true` beside the rows it could verify, so an empty
+answer during the post-boot unseeded window is not read as "nothing archived".
+The live-slot table is snapshotted on the loop before the walk and re-read after
+it (a session revived during the scan is dropped), and the caller surface and
+workspace are re-asserted after the walk because the rows carry titles, the same
+reason `created_session_status` re-checks. `folder_id` must exist in the tree
+(`folder_not_found` otherwise); `limit` is clamped to 1..100. The walk stops at
+the first eligible row past `limit` and answers `more: true`, so no metadata read
+or store probe is spent beyond the page. It examines at most
+`MAX_HISTORY_SCAN_ENTRIES` (5000) catalog entries, read through
+`newest_session_stems`, which keeps only that many stems and mtimes and reads no
+title or metadata line; when it runs out of them first it answers
+`scan_truncated: true` (and `more: true`), and the scan's memory stays bounded
+however large the archive is.
+
 ## Configuration
 
 `agent.session_control` (bool, default **true**). The grant that decides who may
@@ -2073,6 +2177,48 @@ a config-level ceiling, not an enterprise `SCOPE_CATALOG` scope: `session_contro
 itself is a plain `agent.*` bool with no catalog entry, and a scope would need a
 new governance enforcement seam rather than a data-only append, so it is left to a
 follow-up.
+
+## Module layout
+
+`kiro_crew.dashboard.session_control` stays the only import path and the only patch
+seam for every verb: `src/kiro_crew/dashboard/session_control.py` is a mirrored facade
+(`kiro_crew._facade_mirror`) over the owner package
+`src/kiro_crew/dashboard/session_control_parts/`, one responsibility per module. A patch of
+`session_control.<name>` lands in every owner that binds the name, so a test patches the
+facade, never one owner; `test_facade_mirror_guards.py` holds the family to that contract
+and `test_session_control_parts_contract.py` to the rest of this layout. Every owner logs
+under the logger name `kiro_crew.dashboard.session_control`. New code for a responsibility
+goes to its owner, and the owners import each other lowest layer first, in this order:
+
+- `src/kiro_crew/dashboard/session_control_parts/caller_access.py`: who is calling, the
+  enablement gates, the member, cron and delegation ownership fences, and the audit record
+  every verb writes.
+- `src/kiro_crew/dashboard/session_control_parts/delivery_containment.py`: the
+  channel-mirror probes, the containment stamps a queued entry carries, the drop and
+  discard notices, and the audience-admission record.
+- `src/kiro_crew/dashboard/session_control_parts/target_authorization.py`: the owner-DM
+  judgement, a creator's eligibility, slot resolution, the refusal factories and
+  `authorize_target`.
+- `src/kiro_crew/dashboard/session_control_parts/turn_control.py`: stop, retry, continue,
+  end a wait, reload and close.
+- `src/kiro_crew/dashboard/session_control_parts/model_switch.py`: `session_set_model` and
+  the deferred model pick.
+- `src/kiro_crew/dashboard/session_control_parts/session_titles.py`: title cleaning,
+  `session_rename` and `session_generate_title`.
+- `src/kiro_crew/dashboard/session_control_parts/session_create.py`: `session_create` and
+  the spawn record a created or forked child gets.
+- `src/kiro_crew/dashboard/session_control_parts/session_tree.py`: `session_fork`,
+  `session_adopt` and `session_release`, and the tree-mutation lock and append fence.
+- `src/kiro_crew/dashboard/session_control_parts/session_messaging.py`: `session_send` and
+  `session_broadcast`, the provenance envelope, and the steer deliveries a cancelled
+  sender leaves behind.
+- `src/kiro_crew/dashboard/session_control_parts/session_status.py`: the read verbs: the
+  status roster of the sessions a caller created, a target's transcript tail and its
+  cached summary, and their limits.
+- `src/kiro_crew/dashboard/session_control_parts/session_revive.py`: listing the revivable
+  history and `session_revive`.
+
+The facade itself holds no verb: its docstring, its logger and the mirror.
 
 ## What is deliberately not here
 

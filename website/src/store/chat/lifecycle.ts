@@ -12,6 +12,7 @@ import { resolveDefaultColor } from '../../utils/sessionColors'
 import { isChatPageSurface } from '../../utils/channelOrigin'
 import { mergePreservedPastes } from '../../utils/pasteTokens'
 import { findReport, parseErrorCode } from '../../utils/errorReport'
+import { errMessage } from '../../utils/thunkError'
 import type { HistoryDeleteRefusal } from '../../utils/historyDeleteRefusal'
 import type { ChatState } from './state'
 import { filterMessages, safeKey } from './wire'
@@ -40,7 +41,7 @@ const configuredDefaultMemoryMode = () =>
 
 export const createSlot = createAsyncThunk<
   ChatSlot,
-  { agent?: string; agent_kind?: 'member' | 'template'; model?: string; mode?: string; memory_mode?: string; folder_id?: string | null; title?: string; color_index?: number | null; color_hex?: string | null; project?: string | null; activate?: boolean; sessionFolder?: boolean } | string | undefined,
+  { agent?: string; agent_kind?: 'member' | 'template'; appAgentOwner?: string; model?: string; mode?: string; memory_mode?: string; folder_id?: string | null; title?: string; color_index?: number | null; color_hex?: string | null; project?: string | null; activate?: boolean; sessionFolder?: boolean } | string | undefined,
   { fulfilledMeta: { originActiveSlot: string | null; activate: boolean } }
 >(
   'chat/createSlot',
@@ -49,6 +50,8 @@ export const createSlot = createAsyncThunk<
     // The namespace the agent was picked from; rides with the name so a
     // same-name member and template create different sessions.
     const agentKind = typeof opts === 'string' ? undefined : opts?.agent_kind
+    // The app that contributed the command naming this agent; see api.createChatSlot.
+    const appAgentOwner = typeof opts === 'string' ? undefined : opts?.appAgentOwner
     const model = typeof opts === 'string' ? undefined : opts?.model
     const mode = typeof opts === 'string' ? undefined : opts?.mode
     const requestedMemoryMode = typeof opts === 'string' ? undefined : opts?.memory_mode
@@ -81,7 +84,7 @@ export const createSlot = createAsyncThunk<
     // entry points resolve the persisted preference here, before the first turn
     // can read or write memory.
     const memory_mode = requestedMemoryMode || await configuredDefaultMemoryMode()
-    const slot = await api.createChatSlot(undefined, agent, model, mode, memory_mode, title, undefined, folderId || undefined, agentKind, skipSessionFolder)
+    const slot = await api.createChatSlot(undefined, agent, model, mode, memory_mode, title, undefined, folderId || undefined, agentKind, skipSessionFolder, appAgentOwner)
     const dashState = (getState() as RootState).dashboard
     // An explicit color (e.g. carried from a slot being recreated on a
     // mode switch) wins; otherwise fall back to the default-color policy.
@@ -186,11 +189,29 @@ export const forkSlot = createAsyncThunk(
   'chat/forkSlot',
   async (
     { slot, atIndex, messageId, prompt, mode, direction }: { slot: string; atIndex?: number; messageId?: string; prompt?: string; mode?: string; direction?: 'head' | 'tail' },
-    { dispatch },
+    { dispatch, rejectWithValue },
   ) => {
-    const d = messageId
-      ? await api.forkChatSlot(slot, atIndex, prompt, mode, direction, messageId)
-      : await api.forkChatSlot(slot, atIndex, prompt, mode, direction)
+    let d
+    try {
+      d = messageId
+        ? await api.forkChatSlot(slot, atIndex, prompt, mode, direction, messageId)
+        : await api.forkChatSlot(slot, atIndex, prompt, mode, direction)
+    } catch (e) {
+      // `miniSerializeError` at the thunk boundary drops the backend `code`, so
+      // reject with it as a value. The check is STRUCTURAL (duck-typed on
+      // `status`/`body`), so a mocked transport reads the same as an ApiError.
+      const status = (e as { status?: unknown } | null)?.status
+      const body = (e as { body?: unknown } | null)?.body
+      const raw = typeof body === 'string' ? body : undefined
+      if (typeof status === 'number') {
+        return rejectWithValue({
+          status,
+          message: errMessage(e),
+          code: parseErrorCode(raw),
+        })
+      }
+      throw e
+    }
     if (d.ok) {
       // memory_mode is the parent's, echoed by the server; without it the new
       // tab would read as persistent until the next slots refresh.
@@ -228,6 +249,46 @@ export const deleteHistorySession = createAsyncThunk<
       const refusal: HistoryDeleteRefusal = { key, title, code }
       return rejectWithValue(report ? { ...refusal, report } : refusal)
     }
+  },
+)
+
+/** The Older Sessions "Delete all". It rejects with a value in BOTH failure
+ *  shapes, so the same `undeletableHistory` notice narrates them: a refused
+ *  request (`api.clearSessions` throws on any non-2xx, nothing was deleted),
+ *  and a 200 whose body says `ok: false` because some rows stayed on disk.
+ *  Titles are read from `history` HERE, before the refresh drops the rows
+ *  that did go. */
+export const clearHistorySessions = createAsyncThunk<
+  void,
+  void,
+  { rejectValue: HistoryDeleteRefusal }
+>(
+  'chat/clearHistorySessions',
+  async (_, { getState, rejectWithValue }) => {
+    let body: unknown
+    try {
+      body = await api.clearSessions()
+    } catch (e) {
+      const errBody = (e as { body?: unknown } | null)?.body
+      const code = parseErrorCode(typeof errBody === 'string' ? errBody : undefined) ?? ''
+      const report = findReport(e instanceof Error ? e.message : '')
+      const refusal: HistoryDeleteRefusal = { key: '', title: '', code, bulk: { left: null, cleared: 0, rows: [] } }
+      return rejectWithValue(report ? { ...refusal, report } : refusal)
+    }
+    const outcome = (body ?? {}) as { ok?: unknown; cleared?: unknown; failed?: unknown; undeletable?: unknown }
+    if (outcome.ok !== false) return
+    const history = (getState() as { chat: ChatState }).chat.history
+    const undeletable = Array.isArray(outcome.undeletable) ? outcome.undeletable : []
+    // Every entry counts as left behind; only one with an id can be named.
+    const rows = undeletable.flatMap(row => {
+      const { id, code } = (row ?? {}) as { id?: unknown; code?: unknown }
+      if (typeof id !== 'string' || !id) return []
+      const title = history.find(s => s.key === id)?.title ?? ''
+      return [{ key: id, title, code: typeof code === 'string' ? code : '' }]
+    })
+    const failed = typeof outcome.failed === 'number' && outcome.failed > 0 ? outcome.failed : 0
+    const cleared = typeof outcome.cleared === 'number' && outcome.cleared > 0 ? outcome.cleared : 0
+    return rejectWithValue({ key: '', title: '', code: '', bulk: { left: failed + undeletable.length, cleared, rows } })
   },
 )
 
@@ -430,6 +491,14 @@ export function addLifecycleCases(builder: ActionReducerMapBuilder<ChatState>): 
     .addCase(deleteHistorySession.rejected, (state, action) => {
       // The row is deliberately NOT filtered out: the gateway kept the file,
       // so the sidebar must keep the row. Only the notice changes.
+      if (action.payload) state.undeletableHistory = action.payload
+    })
+    // "Delete all" shares the notice: a new attempt clears the last one, and a
+    // refused or partial clear sets it. The caller refetches history either way.
+    .addCase(clearHistorySessions.pending, (state) => {
+      state.undeletableHistory = null
+    })
+    .addCase(clearHistorySessions.rejected, (state, action) => {
       if (action.payload) state.undeletableHistory = action.payload
     })
 }

@@ -3,13 +3,14 @@ import type { NavigateFunction } from 'react-router-dom'
 
 import { api } from '../../../api/client'
 import { settingsPath } from '../../../components/settingsPath'
+import { useContinuePress } from '../../../hooks/useContinuePress'
 import { SETTINGS_DEFAULT_MODEL_ID, SETTINGS_TURN_TIME_LIMIT_HIGHLIGHT } from '../../../hooks/useSettingHighlight'
 import { useAppSelector } from '../../../store'
 import { selectContinuable, selectTrailingSendUnconfirmed, selectTurnInterrupted } from '../../../store/chatSlice'
 import type { ChatMessage } from '../../../types'
 import { KIRO_SIGN_IN_PATH } from '../../developer/kiroSignInLink'
 import type { FreshSessionState } from '../ErrorCard'
-import { contextOverflowIsNewest, featureRequestRefusalIsNewest, sessionStartRepeatIsNewest } from '../transcriptRenderers'
+import { newestErrorOwnsRecovery } from '../transcriptRenderers'
 
 interface TurnRecoveryOptions {
   activeSlot: string | null
@@ -62,23 +63,19 @@ export function useTurnRecovery({
   // The footer's plain running indicator yields while the newest send is a
   // bubble whose receipt never came (see `selectTrailingSendUnconfirmed`).
   const sendUnconfirmed = useAppSelector(selectTrailingSendUnconfirmed)
-  const [continuing, setContinuing] = useState(false)
+  // The press and its spinner are `useContinuePress`, owned once with the panes.
   // Why the refusal is rendered rather than logged: the server re-checks under
   // the slot lock and can refuse a press the client believed was available
   // (`slot_running`, `slot_subagents_running`, an approval still pending). Left
   // in the console, that refusal reached the user as the button flicking to
   // disabled and straight back — a control that promises recovery and then says
   // nothing at all. `showRefusedPress` is the shared surface for exactly that.
-  useEffect(() => { setContinuing(false) }, [activeSlot])
-  // The turn taking over is the success signal; clear the spinner then.
-  useEffect(() => { if (continuing && slotRunning) setContinuing(false) }, [continuing, slotRunning])
-  // Backstop: a request that neither starts a turn nor rejects must not strand
-  // the button in a disabled state. Mirrors the regenerate safety timeout.
-  useEffect(() => {
-    if (!continuing) return
-    const t = setTimeout(() => { setContinuing(false) }, 30_000)
-    return () => clearTimeout(t)
-  }, [continuing])
+  const { continuing, press: handleContinue } = useContinuePress({
+    slot: activeSlot,
+    turnRunning: slotRunning,
+    continuable,
+    onRefused: (e) => showRefusedPress('continue', e),
+  })
   // Fix affordances on a model-entitlement error row. The picker is the same
   // portal the composer's model chip opens, anchored to that chip so it lands
   // where the user already knows to look; when the chip is not on screen (a
@@ -116,25 +113,15 @@ export function useTurnRecovery({
   const openMemberCapabilities = useCallback((member: string) => {
     navigate(`/capabilities?tab=crews&crew=${encodeURIComponent(member)}&pane=capabilities`)
   }, [navigate])
-  // The non-inference exit for a feature request the plan could not afford
-  // (#13342) is decided per row in the shared row set, from the row alone: the
-  // user row the header's "Request a Feature" action sent carries the flow's
-  // stamp in its `meta`, so the form is offered on that turn's own refusal,
-  // while a usage limit in an ordinary chat, or after the user typed on in
-  // this one, keeps today's card. The card withholds Resume on that refusal
-  // because a retry replays the rejection; the composer must not urge it
-  // beneath the same card, so its Resume and "press Resume" hint yield too
-  // (same rule, same row).
-  const featureRequestRefused = featureRequestRefusalIsNewest(messages)
-  // Same rule for a session start that failed twice in a row: the card has
-  // withheld Resume (a third press re-runs the same start, and the server
-  // refuses it with `session_start_repeat`) and names the remedy, so the
-  // composer must not urge the press beneath it. Typing still works and is
-  // what resets the count.
-  const sessionStartRepeated = sessionStartRepeatIsNewest(messages)
-  // Same rule for a context overflow: Resume would re-send the history that
-  // overflowed, so the composer yields to the card's fresh-session press.
-  const contextOverflowed = contextOverflowIsNewest(messages)
+  // The newest error row can be one whose card has withheld Resume and names a
+  // remedy of its own: the issue form for the seeded feature-request turn the
+  // plan could not afford (#13342), the restart hint for a session start that
+  // failed twice, a fresh session for a conversation too big for the model, a
+  // refused app-owned agent turn. A retry replays the same rejection, so a
+  // composer beneath the card saying "press Resume" would argue with it; its
+  // Resume and hint yield too. Typing still works. One predicate spells the
+  // set (`newestErrorOwnsRecovery`), and the panes read the same one.
+  const cardOwnsRecovery = newestErrorOwnsRecovery(messages)
 
   // The fix on a `context_overflow` row: drop the native conversation so the
   // next message starts a fresh one from a text summary of this chat. One entry
@@ -168,24 +155,13 @@ export function useTurnRecovery({
   // A new turn on the active slot (the user sent again) starts its state over.
   useEffect(() => { if (slotRunning && activeSlot) setSlotFreshSession(activeSlot, 'idle') }, [slotRunning, activeSlot, setSlotFreshSession])
 
-  const handleContinue = useCallback(() => {
-    if (!activeSlot || continuing || !continuable) return
-    setContinuing(true)
-    // No optimistic transcript mutation: the backend appends the continuation as
-    // an `inject` row and the WS `slots` update flips `running`, so the UI
-    // converges from the server. Nothing to roll back on failure.
-    api.continueSlot(activeSlot).catch((e: unknown) => {
-      showRefusedPress('continue', e)
-      setContinuing(false)
-    })
-  }, [activeSlot, continuing, continuable, showRefusedPress])
   // (The newest-error index that gates the Continue button is derived inside
   // the shared row set from the transcript it is handed -- see
   // transcriptRenderers.tsx `lastErrorIndex`.)
   return {
     continuable, interrupted, sendUnconfirmed, continuing, handleContinue,
     openModelPickerFromError, openDefaultModelSetting, openKiroSignIn, openMemberCapabilities, openTurnLimitSetting,
-    featureRequestRefused, sessionStartRepeated, contextOverflowed,
+    cardOwnsRecovery,
     freshSession, handleFreshSession,
   }
 }

@@ -26,6 +26,7 @@ import logging
 import re
 import socket
 import string
+import time
 import uuid
 from collections import Counter
 from collections.abc import Iterator
@@ -583,10 +584,87 @@ def _approved_oauth_authorization_endpoint(host: str, path: str) -> bool:
     key = (host.lower(), path)
     if key in _OAUTH_AUTHORIZATION_ENDPOINTS:
         return True
+    if _discovered_oauth_endpoint_approved(key):
+        return True
     if key in _load_operator_oauth_endpoints():
         _emit_oauth_extension_used_event(*key)
         return True
     return False
+
+
+# ── Discovered OAuth endpoints (verified from an operator-configured MCP server) ──
+# Filled only by ``mcp_oauth_discovery``; trust anchor, bounds and why this does
+# not lower the agent's ceiling: docs/system-specs/modules/security.md,
+# "Discovery-verified consent endpoints".
+_OAUTH_DISCOVERED_TTL_SECONDS = 24 * 60 * 60
+_OAUTH_DISCOVERED_CAP = 64
+# Bound on the server URL copied into the SEL event; nothing else retains it.
+_OAUTH_DISCOVERED_MCP_URL_MAX_LEN = 512
+# (host, path) -> monotonic expiry. Host and path are bounded by the validators.
+_OAUTH_DISCOVERED_ENDPOINTS: dict[tuple[str, str], float] = {}
+
+
+def _discovered_oauth_endpoint_approved(key: tuple[str, str]) -> bool:
+    """Whether *key* was verified by discovery and has not expired."""
+    expiry = _OAUTH_DISCOVERED_ENDPOINTS.get(key)
+    if expiry is None:
+        return False
+    if expiry <= time.monotonic():
+        _OAUTH_DISCOVERED_ENDPOINTS.pop(key, None)
+        return False
+    return True
+
+
+def record_discovered_oauth_endpoint(host: str, path: str, *, mcp_url: str) -> bool:
+    """Approve an authorization endpoint verified by MCP OAuth discovery.
+
+    Called ONLY by ``kiro_crew.mcp_oauth_discovery`` after it matched the
+    endpoint against the metadata advertised for an operator-configured MCP
+    server. Returns False (and records nothing) for a host or path the operator
+    file's validators would refuse. A newly recorded endpoint is SEL-audited
+    with the server URL it was verified from.
+    """
+    host_norm = host.lower()
+    if not _OAUTH_EXTENSION_HOST_RE.fullmatch(host_norm) or not _valid_oauth_extension_path(path):
+        return False
+    key = (host_norm, path)
+    fresh = not _discovered_oauth_endpoint_approved(key)
+    _OAUTH_DISCOVERED_ENDPOINTS.pop(key, None)
+    while len(_OAUTH_DISCOVERED_ENDPOINTS) >= _OAUTH_DISCOVERED_CAP:
+        # A default: a worker thread may expire the same key concurrently.
+        _OAUTH_DISCOVERED_ENDPOINTS.pop(next(iter(_OAUTH_DISCOVERED_ENDPOINTS)), None)
+    _OAUTH_DISCOVERED_ENDPOINTS[key] = time.monotonic() + _OAUTH_DISCOVERED_TTL_SECONDS
+    if fresh:
+        _emit_oauth_discovered_endpoint_event(host_norm, path, mcp_url)
+    return True
+
+
+def _emit_oauth_discovered_endpoint_event(host: str, path: str, mcp_url: str) -> None:
+    """Best-effort SEL record that discovery approved a consent endpoint."""
+    if len(mcp_url) > _OAUTH_DISCOVERED_MCP_URL_MAX_LEN:
+        mcp_url = mcp_url[: _OAUTH_DISCOVERED_MCP_URL_MAX_LEN - 1] + "…"
+    try:
+        SecurityEventLog().log(
+            SecurityEvent(
+                event_id=uuid.uuid4().hex[:16],
+                timestamp=datetime.now(tz=timezone.utc).isoformat(),
+                event_type="oauth_endpoint_discovered",
+                caller_identity="",
+                agent="kirocrew",
+                source="security",
+                operation="oauth_banner_check",
+                outcome="allowed",
+                resources=f"{host}{path}",
+                metadata={
+                    "host": host,
+                    "path": path,
+                    "mcp_url": mcp_url,
+                    "mechanism": "OAUTH_ENDPOINT_DISCOVERY",
+                },
+            )
+        )
+    except Exception:
+        logger.debug("SEL audit failed for oauth_endpoint_discovered (allow stands)", exc_info=True)
 
 
 # S3 presigned URLs contain X-Amz-Signature (a 64-char hex string) that
@@ -802,9 +880,9 @@ def _slack_manifest_payload_re() -> re.Pattern[str] | None:
 
     Derived from ``slack_manifest.stripped_template()`` — the SAME procedure both
     emitters use to build the payload — so the accepted payload cannot drift from
-    the emitted one. Every ``{{ALIAS}}`` after the first must be the same alias
-    (backreference), so a payload that varies them is rejected. Returns None when
-    the template cannot be read, which fails closed (no exemption).
+    the emitted one. Every ``{{ALIAS}}`` after the first is a backreference, and
+    ``{{COMMAND}}`` a group the caller pins to ``slash_command(alias)``, so neither
+    can vary. Returns None when the template cannot be read (fails closed).
     """
     if _slack_manifest_re_slot:
         return _slack_manifest_re_slot[0]
@@ -815,17 +893,16 @@ def _slack_manifest_payload_re() -> re.Pattern[str] | None:
         rendered = slack_manifest.stripped_template()
         placeholder_token = slack_manifest.ALIAS_PLACEHOLDER
         alias_body = slack_manifest.ALIAS_PATTERN
+        command_slot = (re.escape(slack_manifest.COMMAND_PLACEHOLDER), "(?P<command>[a-z0-9_-]+)")
     except Exception:
-        rendered = ""
-        placeholder_token = ""
-        alias_body = ""
+        rendered = placeholder_token = alias_body = ""
     if rendered and placeholder_token in rendered:
         parts = rendered.split(placeholder_token)
-        pattern = re.escape(parts[0])
+        pattern = re.escape(parts[0]).replace(*command_slot)
         for index, part in enumerate(parts[1:]):
             slot = f"(?P<alias>{alias_body})" if index == 0 else "(?P=alias)"
-            pattern += slot + re.escape(part)
-        compiled = re.compile(pattern)
+            pattern += slot + re.escape(part).replace(*command_slot)
+        compiled = re.compile(pattern) if command_slot[1] in pattern else None
     _slack_manifest_re_slot.append(compiled)
     return compiled
 
@@ -869,7 +946,7 @@ def _kirocrew_slack_app_link_alias(
     if pattern is None:
         return None
     match = pattern.fullmatch(payloads[0])
-    if match is None:
+    if match is None or match["command"] != slack_manifest.slash_command(match["alias"]):
         return None
     return match.group("alias")
 

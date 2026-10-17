@@ -25,6 +25,7 @@ from kiro_crew.taskrunner import (
     TaskRunner,
     WorkingMemory,
 )
+from kiro_crew.testing.wait import async_wait_until, await_until
 from kiro_crew.workflows.service import WorkflowService
 from kiro_crew.workflows.store import WorkflowRunStore
 
@@ -327,12 +328,12 @@ class TestWorkflowRunIntegration:
         async with _at_workflow_checkpoint(
             runner, runner.start_background(spec_path), persistence_release
         ) as starting:
-            await asyncio.wait_for(persistence_started.wait(), timeout=1)
+            await await_until(persistence_started)
             starting.cancel()
             persistence_release.set()
 
             with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(asyncio.shield(starting), timeout=10)
+                await await_until(starting)
 
         assert persist_calls == 2
 
@@ -372,11 +373,11 @@ class TestWorkflowRunIntegration:
         async with _at_workflow_checkpoint(
             runner, runner.plan("implement the feature"), publication_release
         ) as planning:
-            await asyncio.wait_for(publication_started.wait(), timeout=1)
+            await await_until(publication_started)
             planning.cancel()
 
             with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(asyncio.shield(planning), timeout=10)
+                await await_until(planning)
 
         assert runner._runs == {}
         assert workflows.list_runs() == []
@@ -491,10 +492,10 @@ class TestWorkflowRunIntegration:
             persist_release,
             checkpoint="_workflow_rebind",
         ) as task:
-            await asyncio.wait_for(persist_started.wait(), timeout=1)
+            await await_until(persist_started)
             task.cancel()
 
-            run = await asyncio.wait_for(asyncio.shield(task), timeout=10)
+            run = await await_until(task)
 
         assert run.status == "cancelled"
         assert runner._runs[run.task_id].status == "cancelled"
@@ -1584,7 +1585,7 @@ class TestResourceManagement:
         runner.cancel("cancel1")
 
         # Wait for the task to fully complete (cancel + finally block)
-        await asyncio.wait_for(task, timeout=5.0)
+        await await_until(task)
 
         # Verify: task is cancelled, sessions were cleaned up
         assert run.status == "cancelled"
@@ -1637,12 +1638,10 @@ class TestResourceManagement:
         await started.wait()
         runner.cancel("cancel2")
         # Allow cancellation to fully propagate — CI machines may be slower
-        for _ in range(20):
-            await asyncio.sleep(0.1)
-            if run.status == "cancelled":
-                break
-        else:
-            pytest.fail(f"Cancellation did not propagate within 2s; status={run.status}")
+        await async_wait_until(
+            lambda: run.status == "cancelled",
+            describe=lambda: f"cancellation did not propagate; status={run.status}",
+        )
 
         assert run.status == "cancelled"
         # All 3 sessions should have been targeted by cleanup
@@ -1707,10 +1706,9 @@ class TestResourceManagement:
         # CPython 3.10 build worker exceeded under parallel xdist load, leaving the
         # state at 'cancelling' when asserted -- a flaky, worker-speed-dependent
         # failure. Polling the observable end-state is order/speed-independent.
-        for _ in range(200):  # up to ~10s
-            if run.status == "cancelled" and len(reset_completed) >= 3:
-                break
-            await asyncio.sleep(0.05)
+        await async_wait_until(
+            lambda: run.status == "cancelled" and len(reset_completed) >= 3,
+        )
 
         assert run.status == "cancelled"
         # Without shield, slow_reset would be interrupted and reset_completed would be empty

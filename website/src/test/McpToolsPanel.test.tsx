@@ -15,6 +15,31 @@ describe('McpToolsPanel', () => {
     expect(screen.getByText('Tool Search · Deferred')).toBeInTheDocument()
   })
 
+  it('labels the header count as enabled servers', () => {
+    render(
+      <McpToolsPanel
+        servers={[
+          { name: 'slack-mcp', enabled: true },
+          { name: 'aws-mcp', enabled: true },
+          { name: 'off-mcp', enabled: false },
+        ]}
+        toolsByServer={{}}
+        loaded={new Set()}
+        toolSearchOn={true}
+        loading={false}
+      />,
+    )
+    expect(screen.getByText('MCP Servers (2/3 enabled)')).toBeInTheDocument()
+  })
+
+  it('shows the bare header with no count while the server list is empty', () => {
+    render(
+      <McpToolsPanel servers={[]} toolsByServer={{}} loaded={new Set()} toolSearchOn={true} loading={true} />,
+    )
+    expect(screen.getByText('MCP Servers')).toBeInTheDocument()
+    expect(screen.queryByText(/enabled\)/)).toBeNull()
+  })
+
   it('shows a per-server loaded/total count and marks each tool loaded / deferred / disabled', () => {
     const loaded = new Set(['slack-mcp::post_message'])
     render(
@@ -46,6 +71,57 @@ describe('McpToolsPanel', () => {
     expect(dot('slack-mcp').className).not.toContain('bg-ok')
     expect(dot('slack-mcp').className).toContain(SESSION_DOT_CLASS.no_report)
     expect(dot('off-mcp').className).toContain('bg-muted')
+  })
+
+  it('names the no-report ring in the dot tooltip, and leaves a disabled dot untitled', () => {
+    render(
+      <McpToolsPanel
+        servers={[{ name: 'slack-mcp', enabled: true }, { name: 'off-mcp', enabled: false }]}
+        toolsByServer={toolsByServer}
+        loaded={new Set()}
+        toolSearchOn={true}
+        loading={false}
+        sessionReport={null}
+      />,
+    )
+    const dot = (name: string) =>
+      screen.getByRole('button', { name: new RegExp(name) }).querySelector('span.rounded-full')!
+    expect(dot('slack-mcp')).toHaveAttribute('title', 'No report from this session yet')
+    // The disabled row's filled dot means "disabled"; a report caption would contradict it.
+    expect(dot('off-mcp')).not.toHaveAttribute('title')
+  })
+
+  it('keys the no-report ring in the legend at the row size, and lists no other session state', () => {
+    render(
+      <McpToolsPanel
+        servers={[{ name: 'slack-mcp', enabled: true }, { name: 'off-mcp', enabled: false }]}
+        toolsByServer={toolsByServer}
+        loaded={new Set()}
+        toolSearchOn={true}
+        loading={false}
+        sessionReport={null}
+      />,
+    )
+    const swatch = screen.getByText('No report from this session yet').querySelector('span.rounded-full')!
+    expect(swatch).toHaveClass('w-1.5', 'h-1.5', ...SESSION_DOT_CLASS.no_report.split(' '))
+    expect(screen.queryByText('Started in this session')).toBeNull()
+    expect(screen.queryByText('Failed to start in this session')).toBeNull()
+    expect(screen.queryByText('Waiting for authorization')).toBeNull()
+  })
+
+  it('draws no session legend when no report exists and every server is disabled', () => {
+    render(
+      <McpToolsPanel
+        servers={[{ name: 'off-mcp', enabled: false }]}
+        toolsByServer={toolsByServer}
+        loaded={new Set()}
+        toolSearchOn={true}
+        loading={false}
+        sessionReport={null}
+      />,
+    )
+    // No row draws the ring here, so a key for it would name a mark that is not on screen.
+    expect(screen.queryByText('No report from this session yet')).toBeNull()
   })
 
   it('marks every non-disabled tool active when tool search is off', () => {

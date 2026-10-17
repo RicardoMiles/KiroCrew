@@ -6,7 +6,7 @@ was later hoisted to a shared constant and added to chat_runner.py's
 queue-drain path, but the primary user-typed turn (chat_handlers.py), the
 cron injection path (handlers/messaging.py), the Slack/dashboard nudge path
 (slack/gateway.py:_handle_nudge), and the cron-script delivery path
-(slack/gateway.py:_deliver_script_result) remained unwrapped — depending on
+(slack/gateway_runtime/cron_exec.py:_deliver_script_result) remained unwrapped — depending on
 the inner ACP _DEFAULT_PROMPT_TIMEOUT (14400s) instead.
 
 This module verifies the cap value is correct AND that all helper-visible
@@ -29,13 +29,31 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+_CHAT_API = Path(__file__).resolve().parent.parent / "src" / "kiro_crew" / "dashboard" / "chat_api"
+_GATEWAY_RUNTIME = (
+    Path(__file__).resolve().parent.parent / "src" / "kiro_crew" / "slack" / "gateway_runtime"
+)
+
 # Source files known to contain ``_run_chat`` dispatches.  When a new
-# dispatch site lands in another file, add it here.
+# dispatch site lands in another file, add it here. The chat handlers and the
+# Slack gateway are scanned whole: each facade and every owner it composes.
 _DISPATCH_FILES = (
     "src/kiro_crew/dashboard/chat_handlers.py",
+    *(f"src/kiro_crew/dashboard/chat_api/{path.name}" for path in sorted(_CHAT_API.glob("*.py"))),
+    *sorted(
+        f"src/kiro_crew/dashboard/chat_turn/{_owner.name}"
+        for _owner in (
+            Path(__file__).resolve().parent.parent / "src/kiro_crew/dashboard/chat_turn"
+        ).glob("*.py")
+        if _owner.name != "__init__.py"
+    ),
     "src/kiro_crew/dashboard/chat_runner.py",
     "src/kiro_crew/dashboard/handlers/messaging.py",
     "src/kiro_crew/slack/gateway.py",
+    *(
+        f"src/kiro_crew/slack/gateway_runtime/{path.name}"
+        for path in sorted(_GATEWAY_RUNTIME.glob("*.py"))
+    ),
 )
 
 
@@ -45,7 +63,7 @@ def _src_root() -> Path:
 
 
 def test_cap_matches_inner_acp_prompt_timeout() -> None:
-    """CHAT_TURN_TIMEOUT must match acp/client.py:_DEFAULT_PROMPT_TIMEOUT.
+    """CHAT_TURN_TIMEOUT must match acp/client_timeouts.py:_DEFAULT_PROMPT_TIMEOUT.
 
     The dashboard layer's outer wall-clock cap should never bound below the
     transport layer's promised "longest legitimate turn" budget, otherwise

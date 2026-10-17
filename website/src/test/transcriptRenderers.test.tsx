@@ -19,12 +19,12 @@
  * own guarantee. Both are pinned below.
  */
 import { describe, it, expect } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import type { ReactElement } from 'react'
 import type { ChatMessage } from '../types'
 import { mergeRenderers, resolveRenderer, type MessageRenderContext } from '../app-sdk/messageRenderers'
-import { contextOverflowIsNewest, createTranscriptRenderers, featureRequestRefusalIsNewest, sessionStartRepeatIsNewest } from '../pages/chat/transcriptRenderers'
+import { appAgentRefusalIsNewest, contextOverflowIsNewest, createTranscriptRenderers, featureRequestRefusalIsNewest, newestErrorOwnsRecovery, sessionStartRepeatIsNewest } from '../pages/chat/transcriptRenderers'
 import { ErrorCard } from '../pages/chat/ErrorCard'
 import NoticeCard from '../pages/chat/NoticeCard'
 import { i18nT } from '../i18n/t'
@@ -447,6 +447,22 @@ describe('a session start that failed twice in a row swaps Resume for the restar
     expect(el.props.onContinue).toBeUndefined()
   })
 
+  it('hands the restart action to the repeat row only (#13791)', () => {
+    const onRestartGateway = () => Promise.resolve()
+    const opts = { ...recoverable, onRestartGateway }
+    const rows = [msg('user', { content: 'hi' }), failed(), resumed(), failed()]
+    const repeat = render(rows[3], opts, { index: 3, messages: rows }) as ReactElement
+    expect(repeat.props.onRestartGateway).toBe(onRestartGateway)
+    // The older row is settled, and a single failure still has Resume: neither
+    // may offer a restart that stops every running chat.
+    const older = render(rows[1], opts, { index: 1, messages: rows }) as ReactElement
+    expect(older.props.onRestartGateway).toBeUndefined()
+    const first = [msg('user', { content: 'hi' }), failed()]
+    const single = render(first[1], opts, { index: 1, messages: first }) as ReactElement
+    expect(single.props.onRestartGateway).toBeUndefined()
+  })
+
+
   describe('sessionStartRepeatIsNewest — the composer stands down with the card', () => {
     it('is true exactly when the newest card withholds Resume', () => {
       expect(sessionStartRepeatIsNewest([msg('user', { content: 'hi' }), failed()])).toBe(false)
@@ -512,6 +528,34 @@ describe('a context overflow swaps Resume for a fresh session', () => {
   })
 })
 
+describe('a refused app-owned agent turn offers no Resume', () => {
+  const REFUSAL = "Release Notes can't run: its agent \"notes-writer\" isn't installed. Re-enable Release Notes in Apps › Library, then run the command again from the command palette."
+  const refused = () => msg('error', { content: REFUSAL, meta: { kind: 'app_agent_refused' } })
+  const recoverable = { slot: 's1', continuable: true, interrupted: true, onContinue: () => undefined }
+
+  it('withholds Resume on the refusal row, from either carrier', () => {
+    for (const row of [refused(), msg('error', { content: REFUSAL, kind: 'app_agent_refused' })]) {
+      const rows = [msg('user', { content: 'hi' }), row]
+      const el = render(rows[1], recoverable, { index: 1, messages: rows }) as ReactElement
+      expect(el.props.onContinue).toBeUndefined()
+    }
+  })
+
+  it('an untagged error row keeps Resume -- the kind decides, not the prose', () => {
+    const rows = [msg('user', { content: 'hi' }), msg('error', { content: REFUSAL })]
+    const el = render(rows[1], recoverable, { index: 1, messages: rows }) as ReactElement
+    expect(el.props.onContinue).toBeTypeOf('function')
+  })
+
+  it('appAgentRefusalIsNewest stands the composer down until a new turn opens', () => {
+    const base = [msg('user', { content: 'hi' }), refused()]
+    expect(appAgentRefusalIsNewest(base)).toBe(true)
+    expect(appAgentRefusalIsNewest([...base, msg('user', { content: 'again' })])).toBe(false)
+    expect(appAgentRefusalIsNewest([...base, msg('assistant', { content: 'ok' })])).toBe(false)
+    expect(appAgentRefusalIsNewest([msg('user', { content: 'hi' }), msg('error', { content: REFUSAL })])).toBe(false)
+  })
+})
+
 describe('a changed member agent file routes to Capabilities, never Resume', () => {
   const row = msg('error', { content: 'materialization_changed: changed', meta: { code: 'materialization_changed', member: 'reviewer' } })
   const recoverable = { slot: 's1', continuable: true, interrupted: true, onContinue: () => undefined }
@@ -571,10 +615,17 @@ describe('the single-chat surface renders from THIS row set', () => {
   // a row added here reaches the page and every pane at once, and a page-only
   // row is an explicit entry AFTER the spread. What can still drift is the
   // spread itself -- so pin that, not the roles.
-  const chatPageSrc = readFileSync(join(__dirname, '..', 'pages', 'ChatPage.tsx'), 'utf8')
+  // The page composes owners under pages/chat/page/ (and its useChatPage* siblings), so the pins read the page and those owners.
+  const PAGES = join(__dirname, '..', 'pages')
+  const OWNERS = join(PAGES, 'chat', 'page')
+  const chatPageSrc = [
+    readFileSync(join(PAGES, 'ChatPage.tsx'), 'utf8'),
+    ...readdirSync(OWNERS).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort().map(f => readFileSync(join(OWNERS, f), 'utf8')),
+    ...readdirSync(PAGES).filter(f => /^useChatPage.*\.ts$/.test(f) && !/\.test\./.test(f)).sort().map(f => readFileSync(join(PAGES, f), 'utf8')),
+  ].join('\n')
 
   it('ChatPage spreads createTranscriptRenderers into its host list, ahead of its page-only rows', () => {
-    expect(chatPageSrc).toMatch(/import \{ createTranscriptRenderers \} from '\.\/chat\/transcriptRenderers'/)
+    expect(chatPageSrc).toMatch(/import \{ createTranscriptRenderers \} from '\.\.\/transcriptRenderers'/)
     const list = chatPageSrc.indexOf('const renderers = mergeRenderers([')
     const spread = chatPageSrc.indexOf('...shared,', list)
     const bubble = chatPageSrc.indexOf('\n      bubble,\n    ])', list)
@@ -658,5 +709,31 @@ describe('a turn that hit its time limit links to the setting', () => {
     const other = msg('error', { content: '⏱️ This turn hit the 4-hour limit.' })
     const el = render(other, opts, { index: 0, messages: [other] }) as ReactElement
     expect(el.props.onOpenTurnLimit).toBeUndefined()
+  })
+})
+
+describe('newestErrorOwnsRecovery -- one rule for the composer beneath the four remedy cards', () => {
+  const user = () => msg('user', { content: 'hi' })
+  const failed = () => msg('error', { content: 'Request session/new timed out after 90s', meta: { kind: 'session_start_failed' } })
+  const resumed = () => msg('inject', { content: '[Continue -- requested by the user]', meta: { injectKind: 'recovery' } })
+  const owners: Array<[string, ChatMessage[]]> = [
+    ['a refused feature request', [
+      msg('user', { content: 'I would like to request a feature!', meta: { sendId: 's-fr-seed', [FEATURE_REQUEST_ROW_META_KEY]: true } }),
+      msg('error', { content: 'The monthly usage limit has been reached.', meta: { kind: 'usage_limit' } }),
+    ]],
+    ['a session start that failed twice', [user(), failed(), resumed(), failed()]],
+    ['a context overflow', [user(), msg('error', { content: 'Input is too long.', meta: { kind: 'context_overflow' } })]],
+    ['a refused app agent', [user(), msg('error', { content: 'Release Notes cannot run.', meta: { kind: 'app_agent_refused' } })]],
+  ]
+
+  it.each(owners)('holds under %s, and lets go once a later turn opens', (_label, rows) => {
+    expect(newestErrorOwnsRecovery(rows)).toBe(true)
+    expect(newestErrorOwnsRecovery([...rows, msg('user', { content: 'again' })])).toBe(false)
+  })
+
+  it('does not hold for an error with no remedy of its own, such as a throttle, nor for no error', () => {
+    expect(newestErrorOwnsRecovery([user(), msg('error', { content: 'Bedrock is throttling requests.' })])).toBe(false)
+    expect(newestErrorOwnsRecovery([user(), failed()])).toBe(false)
+    expect(newestErrorOwnsRecovery([user(), msg('assistant', { content: 'ok' })])).toBe(false)
   })
 })

@@ -140,7 +140,14 @@ class ProcessSession(Protocol):
     _opencode_native_mounts: frozenset[str]
     _session_mcp_cache: list[dict[str, Any]] | None
     _pi_gate_nonce: str
+    _pi_mcp_handoff: tuple[str, bytes]
+    _pi_mcp_server_names: tuple[str, ...]
     _deepseek_gate_nonce: str
+    _deepseek_read_only_issue: str
+
+    def _agent_env_for_spawn(self) -> dict[str, str]:
+        """``agent.env`` for the spawn in progress, read at most once per spawn: a
+        tool-gate read-back and the launch tail see the same values."""
 
     def _scrub_observed(self, value: object) -> object:
         """*value*, a string the harness reported back, with credentials and exfil URLs
@@ -152,8 +159,17 @@ class ProcessSession(Protocol):
     def _resolve_session_mcp_servers(self) -> list[dict[str, Any]]:
         """Translate the agent spec into this session's ``mcpServers`` array (blocking)."""
 
+    def _session_mcp_servers(self) -> list[dict[str, Any]]:
+        """The warmed array, in memory: empty for a harness outside the array set."""
+
+    def _pooled_mcp_servers(self) -> list[dict[str, Any]]:
+        """The pooled broker stubs the session/new array appends (blocking)."""
+
     async def _seed_session_settings(self) -> None:
         """Seed the session's own settings file, best-effort."""
+
+    async def _prepare_claude_side_read_denies(self) -> None:
+        """Build a Side Chat session's sensitive-path deny rules off the loop, fail closed."""
 
 
 @dataclass(frozen=True)

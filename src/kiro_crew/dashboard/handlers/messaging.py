@@ -24,8 +24,8 @@ from typing import Any, Callable, cast  # noqa: F401
 from aiohttp import web
 
 from kiro_crew import platform_compat
+from kiro_crew._facade_compose import compose as _facade_compose
 from kiro_crew.agent_sdk.drivers.acp_vocab import NATIVE_CHILD_NOT_RESUMABLE  # noqa: F401
-from kiro_crew.atomic_write import atomic_write
 from kiro_crew.browser.command_bus import (
     DEFAULT_COMMAND_TIMEOUT_MS,
     DEFAULT_DRAIN_WAIT_MS,
@@ -49,7 +49,6 @@ from kiro_crew.config.loader import (  # noqa: F401
 )
 from kiro_crew.constants import CHANNEL_SEND_NAMESPACES, SUBAGENT_COMPLETION_META_KEY  # noqa: F401
 from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable  # noqa: F401
-from kiro_crew.dashboard import messaging_api as _messaging_api
 from kiro_crew.dashboard.channel_folders import (  # noqa: F401
     CHANNEL_CONFIG_SECTIONS,
     channel_restart_required,
@@ -248,6 +247,7 @@ from kiro_crew.dashboard.ws_event_scope import (  # noqa: F401
     persisted_snapshot_denial_reason,
     slot_owner_snapshot,
 )
+from kiro_crew.hidden_leaf_staging import EnvStagingRefused, publish_env
 from kiro_crew.members import attributable_session_key, member_identity_for_session
 from kiro_crew.messaging.display_safety import redact_for_display
 from kiro_crew.messaging.link import SLACK_NAMESPACE, ChannelLink  # noqa: F401
@@ -291,7 +291,7 @@ from kiro_crew.subagent import (  # noqa: F401
     effort_applied_note,
     effort_drop_reason,
     effort_pending_note,
-    parent_spawn_allowlists,
+    parent_template_allowlists,
 )
 from kiro_crew.subagent_manager.admission.types import (  # noqa: F401
     QueuedReadUnavailable,
@@ -2237,8 +2237,10 @@ async def _write_env_off_loop(updates: dict[str, str | None]) -> None:
 
     A ``.env`` saved as UTF-16 or UTF-32 is refused before anything is written
     (:func:`_write_env_updates_locked` never overwrites a file it cannot
-    parse). That refusal is raised here as a 409 carrying the fix, so every
-    channel save answers it the same way instead of with an opaque 500. Every
+    parse), and so is one whose masked staging directory cannot be used
+    (:class:`~kiro_crew.hidden_leaf_staging.EnvStagingRefused`). Each refusal is
+    raised here as a 409 carrying the fix, so every channel save answers it the
+    same way instead of with an opaque 500. Every
     saver (Slack, Teams, Webex, WeCom, Feishu, Discord and Telegram) reaches
     this through :func:`_write_env_or_roll_back`, which rolls the config write
     back on any failure, so on every channel the 409 means nothing was saved.
@@ -2251,6 +2253,11 @@ async def _write_env_off_loop(updates: dict[str, str | None]) -> None:
         raise
     except _loader.EnvFileWideEncodingError as exc:
         raise _wide_env_refusal(exc) from exc
+    except EnvStagingRefused as exc:
+        raise web.HTTPConflict(
+            text=json.dumps({"error": str(exc)}),
+            content_type="application/json",
+        ) from exc
 
 
 async def _write_env_or_roll_back(
@@ -2318,15 +2325,14 @@ def _write_env_updates(updates: dict[str, str | None]) -> None:
     secret (:data:`~kiro_crew.config.loader.VAULT_CHANNEL_CREDENTIAL_KEYS`) is
     stored in the vault and its line written as the ``secret://KEY`` reference
     (:class:`~kiro_crew.secrets.migrate.ChannelSecretStore`). The write goes
-    through :func:`kiro_crew.atomic_write.atomic_write` with
-    ``restrict_to_owner=True``, which locks the unique temp file down to its
-    owner BEFORE any content byte is written: POSIX mode bits protect nothing
-    on Windows (``fchmod_safe`` is a documented no-op there), so a lockdown
-    applied after the write would leave the tokens readable under the
-    directory-inherited DACL for the whole write — and indefinitely if the
-    lockdown fails. ``restrict_on_error="warn"`` keeps this writer's contract:
-    a host where the lockdown cannot be applied must not abort a token save
-    that already succeeded.
+    through :func:`kiro_crew.hidden_leaf_staging.publish_env`, which stages
+    the temp inside the masked staging directory (never beside ``.env``, at a
+    name no sandbox mask covers) and locks it down to its owner BEFORE any
+    content byte is written: POSIX mode bits protect nothing on Windows
+    (``fchmod_safe`` is a documented no-op there), so a lockdown applied after
+    the write would leave the tokens readable under the directory-inherited
+    DACL for the whole write. A refused lockdown warns rather than aborting a
+    token save that already succeeded.
 
     CALLER CONTRACT: blocking, and every caller is an async request handler
     holding ``_get_config_lock()``, so each one must reach this through
@@ -2404,12 +2410,7 @@ def _write_env_updates_locked(ep: "Path", updates: dict[str, str | None]) -> Non
         if k not in seen and new_val:
             out.append(f"{k}={new_val}")
     content = "\n".join(out) + ("\n" if out else "")
-    atomic_write(
-        ep,
-        _loader.env_bom_prefix(ep) + content,
-        restrict_to_owner=True,
-        restrict_on_error="warn",
-    )
+    publish_env(ep, _loader.env_bom_prefix(ep) + content)
 
 
 async def api_slack_manifest(request: web.Request) -> web.Response:
@@ -2418,13 +2419,18 @@ async def api_slack_manifest(request: web.Request) -> web.Response:
     Mirrors ``kirocrew manifest --url`` so the settings UI can offer one-click
     Slack app creation without the CLI: the bundled template gets the user's
     alias substituted, and the comment-stripped YAML is URL-encoded into
-    Slack's new-app deep link. Serves only the public template — no secrets.
+    Slack's new-app deep link. ``command`` is the slash command that manifest
+    registers. The gateway answers only ``/{slack.command}`` and this endpoint
+    writes no config, so a caller that passes ``?alias=`` gets the value its
+    ``kirocrew config set slack.command`` step needs. Settings → Slack passes no
+    alias, so its link registers the default ``/kirocrew``. Serves only the
+    public template — no secrets.
     """
     from kiro_crew import slack_manifest
 
     # Default to a non-identifying alias: $USER is a host account name and
     # should not be volunteered to every authenticated client.
-    alias = request.query.get("alias", "").strip() or "kirocrew"
+    alias = request.query.get("alias", "").strip() or slack_manifest.DEFAULT_ALIAS
     if not slack_manifest.valid_alias(alias):
         return web.json_response({"error": "invalid alias"}, status=400)
     try:
@@ -2437,6 +2443,7 @@ async def api_slack_manifest(request: web.Request) -> web.Response:
             "alias": alias,
             "manifest": rendered,
             "create_url": create_url,
+            "command": slack_manifest.slash_command(alias),
         }
     )
 
@@ -2731,7 +2738,7 @@ _CHANNEL_SDK_EXTRA: dict[str, tuple[str, str]] = {
 # ``kiro_crew.dashboard.handlers.messaging.<name>`` reaches it wherever it lives;
 # see ``kiro_crew.dashboard.messaging_api``. Run once, after this body has bound
 # every name and before the owner-surface guard below wraps the spawn routes.
-_messaging_api.compose(
+_facade_compose(
     globals(),
     (
         _owner_spawn,

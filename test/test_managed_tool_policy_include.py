@@ -220,6 +220,8 @@ class _Loop:
         monkeypatch.setattr(sys, "stdin", self._stdin)
         monkeypatch.setattr(mcp_shared, "respond", self._record)
         monkeypatch.setattr(mcp_shared, "_resolve_tool_policy", lambda *a, **k: policy)
+        # ``call_tool`` below stands in for a managed server's own handler.
+        monkeypatch.setattr(mcp_shared, "serves_managed_tools", lambda _fn: True)
         self.sel_mock = MagicMock()
         monkeypatch.setattr(mcp_shared, "sel", lambda: self.sel_mock)
 

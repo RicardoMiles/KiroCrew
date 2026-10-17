@@ -1,7 +1,7 @@
 /**
  * The class recipes a conversation-list panel is made of, shared by the
  * Sessions sidebar (`pages/ChatSidebar.tsx`) and the Crew Members roster
- * (`pages/members/MembersPage.tsx`) so the two lists read as one surface:
+ * (`pages/members/MembersPageRoster.tsx`) so the two lists read as one surface:
  * same card, same header line, same row box, same type scale.
  *
  * They live here as whole class strings rather than as values copied between

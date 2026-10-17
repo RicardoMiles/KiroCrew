@@ -28,6 +28,7 @@ from kiro_crew.taskq.dependency import (
 from kiro_crew.taskq.reconcile import reconcile_on_boot
 from kiro_crew.taskq.store import TaskStore, TaskStoreUnavailable
 from kiro_crew.taskq.waits import WaitLedger, WaitRecord
+from kiro_crew.testing.wait import async_wait_until, await_until
 
 _RUNNER_LOGGER = "kiro_crew.taskq.adapters.runner"
 
@@ -674,13 +675,9 @@ async def test_a_step_granted_after_a_lane_wait_rechecks_memory_pressure(
     b = adm.accept(kind=m.KIND_TASKRUNNER_STEP, task_id="taskrunner:r:task2")
     ha = await adm.admit(a.id)
     waiter = asyncio.create_task(adm.admit(b.id))
-    for _ in range(500):  # b's store reads hop off the loop before it parks
-        if adm.lane.waiting == 1:
-            break
-        await asyncio.sleep(0.01)
-    assert adm.lane.waiting == 1
+    await async_wait_until(lambda: adm.lane.waiting == 1)
     ha.done()  # the grant reaches b while memory is critical
-    hb = await asyncio.wait_for(waiter, 5)
+    hb = await await_until(waiter)
     assert hb.state == m.STARTING
     kinds = [k for k, _ in _events(store, b.id)]
     assert kinds[:3] == ["accepted", "deferred", "claimed"]
@@ -726,13 +723,9 @@ async def test_a_step_refused_at_its_grant_gives_the_slot_back_before_deferring(
     b = adm.accept(kind=m.KIND_TASKRUNNER_STEP, task_id="taskrunner:r:task2")
     ha = await adm.admit(a.id)
     waiter = asyncio.create_task(adm.admit(b.id))
-    for _ in range(500):  # b's store reads hop off the loop before it parks
-        if lane.waiting == 1:
-            break
-        await asyncio.sleep(0.01)
-    assert lane.waiting == 1
+    await async_wait_until(lambda: lane.waiting == 1)
     ha.done()  # the grant reaches b while memory is critical
-    hb = await asyncio.wait_for(waiter, 5)
+    hb = await await_until(waiter)
     assert sleeps.calls == [5.0]
     assert inside_sleep == [(0, False)]
     assert adm.deferred_count == 1
@@ -1385,7 +1378,7 @@ async def test_an_operator_action_from_a_worker_thread_releases_the_parked_run(
             )
             is True
         )
-        assert await asyncio.wait_for(parked, 10) is None
+        assert await await_until(parked) is None
         assert store.state_of(first.id) == m.CANCELLED
         # The answer arm of the same route, from the same kind of worker.
         second = adm.accept(kind=m.KIND_TASKRUNNER_STEP, task_id="taskrunner:r:task2")
@@ -1397,7 +1390,7 @@ async def test_an_operator_action_from_a_worker_thread_releases_the_parked_run(
             await asyncio.to_thread(adm.answer_input, second.id, "yes", generation=h2.generation)
             is True
         )
-        assert await asyncio.wait_for(waiting, 10) == "yes"
+        assert await await_until(waiting) == "yes"
         assert h2.done() is True
     finally:
         loop.set_debug(was_debug)
@@ -2406,7 +2399,7 @@ async def test_waiting_input_falls_back_to_the_persisted_answer(
         rec.id, reason="input answered", detail={"answer": "yes"}
     )
     adm.on_wake(rec.id)
-    assert await asyncio.wait_for(wait, 2) == "yes"
+    assert await await_until(wait) == "yes"
 
 
 @pytest.mark.asyncio

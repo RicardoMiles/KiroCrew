@@ -1,3 +1,5 @@
+import TabCloseMenu, { batchCloseConfirm, openTabCloseMenu } from '../../components/TabCloseMenu'
+import { useConfirm } from '../../components/ConfirmDialog'
 import { useState, useRef, useEffect, useCallback, useMemo, Fragment, Suspense, lazy, forwardRef, type ComponentPropsWithoutRef, type ElementRef, type ReactNode } from 'react'
 import { useIsMobile } from '../../hooks/useIsMobile'
 import { useRailWidth } from '../../hooks/useRailWidth'
@@ -40,6 +42,8 @@ import {
 } from '../../components/ui/dropdown-menu'
 import { ContentSkeleton } from '../../components/ui'
 import ErrorNotice from '../../components/ErrorNotice'
+import { SettingsLink } from '../../components/SettingsLink'
+import type { ExternalTerminalFallbackNote } from '../../lib/externalTerminal'
 import ErrorBoundary from '../../components/ErrorBoundary'
 import { fetchFileRead, fileReadQueryKey, FILE_READ_STALE_MS, isPartialRead } from '../../utils/fileReadQuery'
 import { errMessage } from '../../utils/thunkError'
@@ -355,7 +359,7 @@ interface SidePanelProps {
   onSelectIssue?: (url: string) => void
   onReconcileIssue?: (url: string) => void
   onAddSourceToChat?: (text: string) => void
-  onSubmitComments?: (message: string) => void | boolean | Promise<void | boolean>
+  onSubmitComments?: (message: string, count?: number) => void | boolean | Promise<void | boolean>
   /** Gateway connection flag — forwarded to document tab bodies to gate
    *  their submit-comments-to-chat affordances while offline. */
   connected?: boolean
@@ -680,6 +684,10 @@ export default function SidePanel({
   // points cannot drift on WHERE the shell starts — that cwd is the whole point
   // of the affordance.
   const openProjectTerminal = useCallback(() => { openTerminal({ cwd: projectDir }) }, [openTerminal, projectDir])
+  // The note an "Open in <app>" fallback leaves (see the banner below the tab
+  // bodies). Held here rather than in the Files tab, which that fallback takes
+  // out of view.
+  const [externalTerminalNote, setExternalTerminalNote] = useState<ExternalTerminalFallbackNote | null>(null)
   const openMenuItem = useCallback((kind: ViewKind | 'terminal') => {
     const run = () => {
       if (kind === 'terminal') openProjectTerminal()
@@ -709,6 +717,65 @@ export default function SidePanel({
     }
     closeTab(id)
   }, [tabs, closeTab, deleteTerminalSession])
+  const { confirm, confirmDialog, confirmOpen } = useConfirm()
+  const currentSlotRef = useRef(slot)
+  currentSlotRef.current = slot
+  // The live tab list, read AFTER the disk preflight's await so a buffer the
+  // user edited during that round trip is re-evaluated, not closed from a stale
+  // snapshot.
+  const tabsRef = useRef(tabs)
+  tabsRef.current = tabs
+  const handleCloseTabs = async (targets: PanelTab[]) => {
+    if (confirmOpen || targets.length === 0) return
+    const shells = targets.filter(tab => tab.kind === 'terminal' && tab.sessionId).map(tab => tab.title)
+    // A clean file tab whose on-disk copy is gone (or cannot be read) holds the
+    // only remaining copy of its contents. The single × runs through
+    // MarkdownPanel's last-copy guard, but a batch calls handleCloseTab
+    // directly and would skip it, so the batch re-checks the disk for each
+    // clean, non-empty file target and asks before discarding one whose copy it
+    // cannot confirm. A partial (truncated) buffer is still the only surviving
+    // prefix once its disk copy is gone, so it is preflighted too — only binary
+    // buffers, which are an envelope rather than the file, are excluded. A
+    // working-tree diff tab carries the file's full text too, and its single ×
+    // runs the same guard, so it is preflighted alongside file tabs. Dirty
+    // tabs are named separately below.
+    const cleanFiles = targets.filter(tab =>
+      (tab.kind === 'file' || tab.kind === 'wtdiff') && tab.content === tab.savedContent
+      && !tab.binary && (tab.content ?? '') !== '' && !!tab.path)
+    const lastCopy: PanelTab[] = []
+    const unread: PanelTab[] = []
+    await Promise.all(cleanFiles.map(async tab => {
+      try {
+        const r = await fetchFileRead(tab.path!)
+        // 404 = gone from disk; any other non-ok (or a transport throw) is a
+        // failed read that could not verify the copy. Either way the buffer may
+        // be the only copy left, but only the first is a missing file.
+        if (r.status === 404) lastCopy.push(tab)
+        else if (!r.ok) unread.push(tab)
+      } catch { unread.push(tab) }
+    }))
+    if (currentSlotRef.current !== slot) return
+    // Re-resolve each target from the LIVE tab state after the await: a tab the
+    // user edited during the disk read is now dirty and must be named, not
+    // closed on the pre-read snapshot. A target that vanished mid-read drops out.
+    const live = new Map(tabsRef.current.map(t => [t.id, t]))
+    const liveTargets = targets.map(t => live.get(t.id)).filter((t): t is PanelTab => !!t)
+    const dirty = liveTargets.filter(tab => tab.kind === 'file' && tab.content !== tab.savedContent)
+    // A file that turned dirty during the read is no longer a silent last-copy
+    // close — it is named under the unsaved-edits list instead.
+    const dirtyIds = new Set(dirty.map(t => t.id))
+    const lastCopyLive = lastCopy.filter(t => !dirtyIds.has(t.id))
+    const unreadLive = unread.filter(t => !dirtyIds.has(t.id))
+    const ask = batchCloseConfirm(
+      dirty.map(tab => ({ name: tab.title, path: tab.path })),
+      shells,
+      lastCopyLive.map(tab => ({ name: tab.title, path: tab.path })),
+      unreadLive.map(tab => ({ name: tab.title, path: tab.path })),
+    )
+    if (ask && !await confirm(ask)) return
+    if (currentSlotRef.current !== slot) return
+    liveTargets.forEach(tab => handleCloseTab(tab.id))
+  }
   // Move a terminal tab OUT of this chat into the app-wide bottom panel. Unlike
   // handleCloseTab this must NOT dispose the session — the PTY + xterm live in
   // Diff view preferences — persisted; 'mc-diff-split' is shared with the
@@ -1019,6 +1086,7 @@ export default function SidePanel({
       ) : null}
       {/* Tab strip — the row scrolls by touch/wheel; a chip is reordered by
           dragging it (press and hold first on touch, see useLongPressReorder).
+          Lifting that hold without moving opens the close menu.
           Browser-tab construction: the strip is an elevated band whose chips
           BOTTOM-ALIGN (items-end, pb-0) so the active chip's background runs
           straight into the panel body below — the strip/body seam is what the
@@ -1141,7 +1209,13 @@ export default function SidePanel({
               separator={i > 0 && t.id !== activeId && dynamicTabs[i - 1].id !== activeId}
               instantLayout={resizing || slotSwitched || dimAnimating}
               onSelect={() => { void requestActive(t.id, activeId) }}
-              onClose={() => handleCloseTab(t.id)}
+              onClose={() => handleCloseTabs([t])}
+              onCloseDirect={() => handleCloseTab(t.id)}
+              closeOthersDisabled={dynamicTabs.length === 1}
+              closeRightDisabled={i === dynamicTabs.length - 1}
+              onCloseOthers={() => handleCloseTabs(dynamicTabs.filter(tab => tab.id !== t.id))}
+              onCloseRight={() => handleCloseTabs(dynamicTabs.slice(i + 1))}
+              onCloseAll={() => handleCloseTabs(dynamicTabs)}
             />
           ))}
         </Reorder.Group>
@@ -1272,8 +1346,39 @@ export default function SidePanel({
       {/* Body — render every doc/terminal tab mounted (hidden when inactive) so
           xterm sessions and editor scroll state survive tab switches; category
           views mount only when active (cheap + query-driven). */}
+      {/* The Files tab's "Open in <app>" fell back to the integrated terminal,
+          which this panel has just brought to the front; the note lives here so
+          it outlives the Files tab going out of view. In flow above the bodies,
+          not layered over them, so it never covers a shell's first lines. The
+          launch failed, so it is an ErrorNotice (errors-use-error-notice) even
+          though a terminal did open. The notes that send the user to the picker
+          link straight to it, inside the notice as its footer so the link reads
+          as part of it. No hand-off: the adjacent chat composer can hold
+          unsent text. */}
+      {externalTerminalNote && (
+        <div className="shrink-0 px-3 pt-3">
+          <ErrorNotice
+            className="w-full"
+            message={externalTerminalNote.message}
+            onDismiss={() => setExternalTerminalNote(null)}
+            testId="side-panel-external-terminal-fallback"
+            footer={externalTerminalNote.offerSettings ? (
+              <SettingsLink
+                tab="display"
+                sub="terminal"
+                highlight="display.external-terminal-app"
+                className="text-[12px] text-accent hover:underline"
+                data-testid="side-panel-external-terminal-settings"
+              >
+                {i18nT('pages.chat.sidePanel.external_terminal_open_settings')}
+              </SettingsLink>
+            ) : undefined}
+          />
+        </div>
+      )}
       {/* Content area: left + top border (square corner) so the border wraps
           only the content, NOT the tab strip above (which stays borderless). */}
+      {confirmDialog}
       <div className="flex-1 min-h-0 relative">
         {/* Query-only leading views mount while active. A host can retain a
             visited dashboard so tab switches preserve its drafts and iframe. */}
@@ -1397,6 +1502,8 @@ export default function SidePanel({
                   // per-project shortcut, or the button promises a shell this
                   // panel will not open.
                   onOpenTerminal={terminalEnabled && !isWithheld('terminal') ? openProjectTerminal : undefined}
+                  onOpenFolder={p => openFolder(p, t.slot ?? null)}
+                  onExternalTerminalFailed={setExternalTerminalNote}
                 />
               </div>
             )
@@ -1620,7 +1727,7 @@ function FileTabBody({ tab, active, projectDir, scrollMemoryKey, onContentChange
   /** Right-click "Add to context" on a rail row. */
   onAddToContext?: (absPath: string, kind: 'file' | 'dir') => void
   onClose: () => void
-  onSubmitComments?: (m: string) => void | boolean | Promise<void | boolean>
+  onSubmitComments?: (m: string, count?: number) => void | boolean | Promise<void | boolean>
   connected?: boolean
   onRevealConsumed: () => void
 }) {
@@ -1659,6 +1766,7 @@ function FileTabBody({ tab, active, projectDir, scrollMemoryKey, onContentChange
         <FileBrowserRail
           projectDir={projectDir}
           onAddToContext={onAddToContext}
+          onOpenFolder={onFolderOpen}
           selectedPath={tab.path || null}
           // In-place navigation: a tree click RE-TARGETS this tab (replaceId)
           // rather than spawning a sibling — only the pinned Files tab fans
@@ -1784,7 +1892,7 @@ function TabBody({ tab, active, slot, projectDir, onClose, onContentChange, onDi
   onFolderOpen?: (p: string) => void
   /** Right-click "Add to context" on a file-browser rail row. */
   onAddToContext?: (absPath: string, kind: 'file' | 'dir') => void
-  onSubmitComments?: (m: string) => void | boolean | Promise<void | boolean>
+  onSubmitComments?: (m: string, count?: number) => void | boolean | Promise<void | boolean>
   connected?: boolean
   onTerminalSendToChat?: (text: string) => void
   diffLineNumbers: boolean; setDiffLineNumbers: (fn: (v: boolean) => boolean) => void
@@ -1911,16 +2019,32 @@ function TerminalTabTitle({ sessionId, fallback }: { sessionId: string; fallback
  *
  *  A component rather than inline JSX inside the map: each chip owns its own
  *  long-press drag state, and a hook cannot be called from a loop. */
-function DraggableTabItem({ tab, active, separator, instantLayout, onSelect, onClose}: {
+function DraggableTabItem({ tab, active, separator, instantLayout, onSelect, onClose, onCloseDirect, closeOthersDisabled, closeRightDisabled, onCloseOthers, onCloseRight, onCloseAll }: {
   tab: PanelTab
   active: boolean
   separator: boolean
   /** Skip the layout spring while the panel is being resized — see the caller. */
   instantLayout: boolean
   onSelect: () => void
-  onClose: () => void}) {
-  const { itemProps, dragging } = useLongPressReorder()
+  /** The close-menu's "Close" item: shares the batch path with the other menu
+   *  items so a last-copy/unsaved file is still confirmed. */
+  onClose: () => void
+  /** The chip's × (and middle-click): closes this one tab directly, exactly as
+   *  on main — the single-× control's behaviour is unchanged by this feature. */
+  onCloseDirect: () => void
+  closeOthersDisabled: boolean
+  closeRightDisabled: boolean
+  onCloseOthers: () => void
+  onCloseRight: () => void
+  onCloseAll: () => void
+}) {
+  // Same hold as the terminal strip: move to reorder, lift in place for the menu.
+  const { itemProps, dragging } = useLongPressReorder({ onHoldRelease: openTabCloseMenu })
   return (
+    <TabCloseMenu closeOthersDisabled={closeOthersDisabled} closeRightDisabled={closeRightDisabled}
+      onClose={onClose} onCloseOthers={onCloseOthers} onCloseRight={onCloseRight} onCloseAll={onCloseAll}
+      // Batches act on dynamic tabs only; the note says the fixed views stay.
+      keepNote={i18nT('components.tabCloseMenu.fixed_views_stay_open')}>
     <Reorder.Item
       value={tab}
       {...itemProps}
@@ -1938,8 +2062,9 @@ function DraggableTabItem({ tab, active, separator, instantLayout, onSelect, onC
         // Centered in the group's gap-2.
         <span aria-hidden="true" className="absolute -left-[4.5px] top-1/2 -translate-y-1/2 w-px h-4 bg-border" />
       )}
-      <TabChip tab={tab} active={active} onSelect={onSelect} onClose={onClose} />
+      <TabChip tab={tab} active={active} onSelect={onSelect} onClose={onCloseDirect} />
     </Reorder.Item>
+    </TabCloseMenu>
   )
 }
 

@@ -322,6 +322,9 @@ _OWNED_NAMES: dict[str, tuple[str, ...]] = {
         "_resolve_jira_token_from_vault",
         "SecretVault",
     ),
+    # Holds no name callers reach through this module; listed so the handler
+    # loads it, which installs the Bitbucket Server provider into the seam.
+    "bitbucket_server": (),
     "chip_status": (
         "_check_cache",
         "_CHECK_CACHE_MAX",
@@ -456,6 +459,7 @@ _OWNED_NAMES: dict[str, tuple[str, ...]] = {
         "enable_pull_request_auto_merge",
         "_GITHUB_AUTO_MERGE_MUTATION",
         "_GITHUB_MERGE_METHODS",
+        "_GITHUB_MERGE_MUTATION",
         "_GITHUB_NODE_ID_RE",
         "_github_pull_request_node",
         "_GITHUB_PULL_REQUEST_NODE_QUERY",

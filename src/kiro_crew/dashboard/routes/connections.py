@@ -15,9 +15,11 @@ from kiro_crew.dashboard import (
     handlers,
     handlers_channel,
     handlers_cloud,
+    handlers_crew_turn,
     handlers_instances,
     handlers_project,
 )
+from kiro_crew.dashboard.handlers import external_terminal
 from kiro_crew.dashboard.handlers.auth_mobile import api_auth_mobile_link
 from kiro_crew.dashboard.handlers.auth_refresh import (
     api_auth_logout,
@@ -49,6 +51,12 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/terminal/redact", handlers.api_terminal_redact)
     app.router.add_post("/api/terminal/complete", handlers.api_terminal_complete)
     app.router.add_delete("/api/terminal/sessions/{session_id}", handlers.api_terminal_delete)
+    # External terminal app: the owner's approval, then the desktop shell's
+    # machine-only redemption (see handlers/external_terminal.py).
+    app.router.add_post("/api/terminal/external", external_terminal.api_terminal_external)
+    app.router.add_post(
+        "/api/terminal/external-grant", external_terminal.api_terminal_external_grant
+    )
     app.router.add_get("/api/taskrunner/refine", handlers.api_taskrunner_refine_status)
     app.router.add_post("/api/taskrunner/refine", handlers.api_taskrunner_refine)
     app.router.add_post("/api/taskrunner/refine/cancel", handlers.api_taskrunner_refine_cancel)
@@ -137,6 +145,13 @@ def register(app: web.Application) -> None:
     app.router.add_post(
         "/api/instances/{id}/send-session", handlers_instances.api_instances_send_session
     )
+    # One turn against a HEADLESS remote crew (Fargate or MicroVM), which has no
+    # dashboard to embed and serves only a turn route. The gateway is the client
+    # because the crew's control secret must not reach the browser. Registered
+    # BEFORE the catch-all proxy route so `{path:.*}` cannot swallow it, and NOT
+    # through that proxy: it is fenced to the `api/chat` prefixes and a widening
+    # that reached the turn route would reach the crew's control surface too.
+    app.router.add_post("/api/instances/{id}/crew-turn", handlers_crew_turn.api_crew_turn)
     # Peer capability read — the per-instance counterpart to the local
     # /api/agents, /api/models, /api/effort-levels and /api/workspaces, for a
     # session whose turns run on that peer. Registered BEFORE the catch-all

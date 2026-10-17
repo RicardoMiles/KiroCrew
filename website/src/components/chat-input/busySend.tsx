@@ -1,5 +1,4 @@
 import { useCallback } from 'react'
-import { motion } from 'framer-motion'
 import { ArrowUp, ArrowUpFromLine, Loader2, Square } from 'lucide-react'
 import BusySendButton, { readBusySendMode, useBusySendMode, type BusySendMode } from '../BusySendButton'
 import type { RootState } from '../../store'
@@ -10,7 +9,7 @@ import type { PasteBlock } from '../../utils/pasteTokens'
 import { offlineProps } from '../../utils/offline'
 import type { SendMode } from '../../pages/chat/ChatSettings'
 import { i18nT } from '../../i18n/t'
-import { uiLocation } from '../../uiLocations/uiLocation'
+import { StopControls } from './StopControls'
 import type { ComposerBusyMode } from './props'
 
 /* The composer's send path: `fireComposer` is every Enter and Send, idle or
@@ -43,7 +42,7 @@ export function decideBusySend({ busyMode = 'split', mode, isRunning, stopState,
   // not consulted: a slot that once picked Queue in the main chat must not
   // silently queue from a surface that never shows that choice.
   const steerOnly = busyMode === 'steer-only'
-  const busyChoiceAvailable = isRunning && (!stopState || stopState === 'idle') && canSteer
+  const busyChoiceAvailable = busyMode !== 'responsive' && isRunning && (!stopState || stopState === 'idle') && canSteer
   // A stored `auto` from a session where the seam WAS available resolves back to
   // the shipped default while it is not: consent can be withdrawn and a fleet can
   // pin the seam off, and a mode kept on screen after that would send a flag the
@@ -221,45 +220,8 @@ export function BusySendControls({ stopState, killingEscaped, stopWithTap, isQue
       ? i18nT('components.chatInput.auto_jev')
       : i18nT('components.chatInput.steer')
   return (
-    stopState === 'killing' ? (
-      killingEscaped ? (
-        <div className={`flex items-center gap-1.5${terminalActive ? ' min-w-0 [&>button]:shrink-0' : ''}`}>
-          <button
-            className="w-8 h-8 rounded-lg bg-danger text-danger-fg border-none flex items-center justify-center cursor-pointer hover:bg-danger/80 transition-all"
-            onClick={stopWithTap}
-            title={i18nT('components.chatInput.force_reset_taking_longer_than_expected')}
-            aria-label={i18nT('components.chatInput.force_reset_session_taking_longer_than_expected')}
-            data-testid="stop-button-escape-hatch"
-          >
-            <Square size={18} fill="currentColor" />
-          </button>
-          <span className={`text-xs text-muted${terminalActive ? ' min-w-0 whitespace-normal [overflow-wrap:anywhere]' : ' whitespace-nowrap'}`} data-testid="stop-escape-hint">{i18nT('components.chatInput.taking_longer_than_expected')}</span>
-        </div>
-      ) : (
-        <button className="w-8 h-8 rounded-lg bg-danger text-danger-fg border-none flex items-center justify-center cursor-not-allowed transition-all" disabled title={i18nT('components.chatInput.killing')} aria-label={i18nT('components.chatInput.killing_session')} data-testid="stop-button-killing">
-          <Loader2 size={18} className="animate-spin" />
-        </button>
-      )
-    ) : stopState === 'soft_pending' ? (
-      <div className={`flex items-center gap-1.5${terminalActive ? ' min-w-0 [&>button]:shrink-0' : ''}`}>
-        {/* Pulse floor 0.8 with a faint danger fill: at 0.6 on a
-            transparent background the light-theme button bottomed
-            out near white-on-white mid-pulse, and this is the only
-            force-stop path while a cancel hangs (#9548 UX review). */}
-        <motion.button
-          className="w-8 h-8 rounded-lg bg-danger/10 border-none text-danger hover:bg-danger/20 flex items-center justify-center cursor-pointer transition-all"
-          onClick={stopWithTap}
-          title={i18nT('components.chatInput.force_kill_discards_in_progress_work_and_queued')}
-          aria-label={i18nT('components.chatInput.force_kill_session_discards_in_progress_work_and')}
-          animate={{ opacity: [0.8, 1, 0.8] }}
-          transition={{ duration: 1.2, repeat: Infinity }}
-          data-testid="stop-button-pulsing"
-        >
-          <Square size={18} fill="currentColor" />
-        </motion.button>
-        {terminalActive && <span aria-hidden="true" className="text-xs text-muted min-w-0 [overflow-wrap:anywhere] @min-[400px]/composer:hidden">{i18nT('components.chatInput.terminal_force_stop')}</span>}
-        <span className={`text-xs text-muted whitespace-nowrap${terminalActive ? ' sr-only @min-[400px]/composer:not-sr-only @min-[400px]/composer:whitespace-normal' : ''}`} data-testid="stop-force-hint">{i18nT('components.chatInput.click_again_to_force_stop')}</span>
-      </div>
+    stopState === 'killing' || stopState === 'soft_pending' ? (
+      <StopControls stopState={stopState} killingEscaped={killingEscaped} stopWithTap={stopWithTap} terminalActive={terminalActive} />
     ) : isQueued ? (
       <button className="w-8 h-8 rounded-full bg-warn text-warn-fg border-none flex items-center justify-center cursor-pointer hover:bg-warn/80 transition-all" onClick={stopWithTap} title={i18nT('components.chatInput.stopping')} aria-label={i18nT('components.chatInput.stopping_2')}>
         <Loader2 size={18} className="animate-spin" />
@@ -287,7 +249,7 @@ export function BusySendControls({ stopState, killingEscaped, stopWithTap, isQue
             title={holdSend ? `${i18nT('components.chatInput.send')} — ${holdSendReason}` : undefined}
             aria-label={i18nT('components.chatInput.send')}
             data-testid="steer-only-send"
-            {...offlineProps(connected, 'send', i18nT('components.chatInput.send'))}
+            {...offlineProps(connected, i18nT('utils.offline.send'), i18nT('components.chatInput.send'))}
           >
             <ArrowUp size={18} />
           </button>
@@ -314,15 +276,13 @@ export function BusySendControls({ stopState, killingEscaped, stopWithTap, isQue
       // the user finds out by pressing. min-w-0 + wrap: a long localized hint
       // shrinks beside the fixed control instead of overflowing a narrow composer.
       <div className="flex items-center gap-1.5 min-w-0">
-        <button className="w-8 h-8 shrink-0 rounded-lg bg-transparent border-none text-danger hover:bg-danger/10 flex items-center justify-center cursor-pointer transition-all" onClick={stopWithTap} title={i18nT('components.chatInput.force_kill_discards_in_progress_work_and_queued')} aria-label={i18nT('components.chatInput.force_kill_session_discards_in_progress_work_and')} data-testid="stop-button-armed">
+        <button className="w-8 h-8 shrink-0 rounded-lg bg-transparent border-none text-danger hover:text-danger-text hover:bg-danger/10 flex items-center justify-center cursor-pointer transition-all" onClick={stopWithTap} title={i18nT('components.chatInput.force_kill_discards_in_progress_work_and_queued')} aria-label={i18nT('components.chatInput.force_kill_session_discards_in_progress_work_and')} data-testid="stop-button-armed">
           <Square size={18} fill="currentColor" />
         </button>
         <span className="text-[13px] leading-4 text-muted min-w-0 break-words" data-testid="stop-declined-hint">{i18nT('components.chatInput.click_again_to_force_stop_resets_session')}</span>
       </div>
     ) : onStop ? (
-      <button className="w-8 h-8 rounded-lg bg-transparent border-none text-danger hover:bg-danger/10 flex items-center justify-center cursor-pointer transition-all" onClick={stopWithTap} title={i18nT('components.chatInput.stop_generation')} aria-label={i18nT('components.chatInput.stop_generation')} data-testid="stop-button-armed" {...uiLocation('composer.stop')}>
-        <Square size={18} fill="currentColor" />
-      </button>
+      <StopControls stopState="idle" killingEscaped={false} stopWithTap={stopWithTap} />
     ) : steerOnly ? (
       // Same shape-stability rule as the split case below, with the
       // surface's own (plain) send button.

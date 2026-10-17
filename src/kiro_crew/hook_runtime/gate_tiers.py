@@ -36,14 +36,18 @@ if TYPE_CHECKING:
         _cu_read_only_auto_approve,
         _governance_denial,
         _is_declared_builtin_mcp_server,
+        _is_deepseek_read_only_builtin,
         _is_first_party_app,
+        _is_harness_read_only_builtin,
         _is_host_read_only_builtin,
         _normalize_tool_name,
         _note_title_only_grant_pattern,
         _search_deny_target,
         _tool_matches,
         audit_bash_exfiltration,
+        command_invokes_git,
         current_context,
+        deepseek_policy_alias,
         edit_target_candidates,
         is_edit_call,
         is_read_only_bash,
@@ -341,6 +345,17 @@ class GateFacts:
             )
             if alias and alias not in targets:
                 targets.append(alias)
+            # claude states no _meta.kiro identity, so this is the only form in
+            # which a rule written as ``web_fetch`` meets claude's WebFetch.
+            if call.harness_builtin_tool and call.harness_builtin_tool not in targets:
+                targets.append(call.harness_builtin_tool)
+            # A deepseek call's own name and its kiro-cli policy name, on the
+            # READ_ONLY turn that may approve it: its permission frame carries no
+            # title, so a rule on ``read`` or ``fs_read`` meets dsh's ``read`` here.
+            deepseek = call.deepseek_tool_name if self.classifier_only else ""
+            for name in (deepseek, deepseek_policy_alias(deepseek)):
+                if name and name not in targets:
+                    targets.append(name)
             if call.command and call.command not in targets:
                 targets.append(call.command)
             for raw_command in self.raw_shell_commands:
@@ -837,7 +852,23 @@ def _tier_governance(facts: GateFacts, tier: GateTier) -> ToolHookResult | None:
             identity = (call.mcp_tool,)
     else:
         alias = "" if call.mcp_server else _HOST_READ_ONLY_BUILTIN_ALIASES.get(call.mcp_tool, "")
-        identity = tuple(name for name in (call.mcp_tool, alias) if name and name != call.title)
+        # claude states no _meta.kiro identity: its read built-in is named by
+        # harness_builtin_tool, so a ceiling's deny on web_search binds it too.
+        identity = tuple(
+            name
+            for name in dict.fromkeys((call.mcp_tool, alias, call.harness_builtin_tool))
+            if name and name != call.title
+        )
+        # A deepseek call on the READ_ONLY turn that may approve it: its own name,
+        # and for a read built-in the kiro-cli name beside it as ONE identity, so a
+        # ceiling on either ``read`` or ``fs_read`` binds dsh's ``read`` there.
+        deepseek = call.deepseek_tool_name if facts.classifier_only else ""
+        if deepseek and not call.mcp_server:
+            deepseek_alias = deepseek_policy_alias(deepseek)
+            if deepseek_alias:
+                alias_groups = ((deepseek, deepseek_alias),)
+            elif deepseek != call.title:
+                identity = (*identity, deepseek)
     gov_reason = _governance_denial(
         facts.ctx,
         call.title,
@@ -1072,7 +1103,10 @@ def _tier_read_only(facts: GateFacts, tier: GateTier) -> ToolHookResult | None:
     carrying ``identity_trusted``, the provenance flag saying that pair came from
     the ``_meta.kiro`` parse this client made of the tool_call frame
     (``AcpEvent.mcp_identity_trusted``) rather than from an inline payload or a
-    hand-built event -- without it a host-known name is unproven and refused. The
+    hand-built event -- without it a host-known name is unproven and refused. On
+    claude, which stamps no ``_meta.kiro``, the same built-in is named by
+    ``harness_builtin_tool``, mapped from the tool name claude-agent-acp stamped on
+    the tool_call frame (``_is_harness_read_only_builtin``). The
     agent-influenced inputs -- the ACP ``kind`` and the title -- may NARROW (a
     non-read kind refuses) but never prove, so a mutating tool labelled
     ``kind="read"`` or titled ``Read …`` is not auto-approved; an MCP-served tool,
@@ -1080,6 +1114,13 @@ def _tier_read_only(facts: GateFacts, tier: GateTier) -> ToolHookResult | None:
     flag the interactive path keeps its ACP-kind allow-list and title fallback.
     """
     call = facts.call
+    # A session whose own approver must judge every read (heartbeat: no human behind
+    # it, and the ACP ``kind``, the title and ``is_shell`` are all agent-influenced)
+    # gets no verdict from this tier at all. Every deny tier above has already run,
+    # so nothing a tier blocked is re-admitted; the call simply reaches the caller's
+    # ``on_tool_approval``, which decides on the event's trusted identity.
+    if facts.config.defer_reads_to_approver:
+        return None
     # An operator's confirm list asks for what it names whatever the call says
     # about itself, so a confirm-listed MCP call gets no verdict from any branch
     # below. That includes the shell branch: kiro-cli can classify an MCP-served
@@ -1094,7 +1135,13 @@ def _tier_read_only(facts: GateFacts, tier: GateTier) -> ToolHookResult | None:
         # classifier (rejects redirects/substitution/backgrounding). A command that
         # could not be recovered was already denied by the first tier; a present
         # command that is not read-only falls through to interactive approval.
-        if call.command and is_read_only_bash(call.command):
+        # A command that runs git anywhere is never read-only here: git reads
+        # ``.git/config`` on every invocation and ``core.fsmonitor`` /
+        # ``core.hooksPath`` name a program there that no text classifier sees.
+        # This tier serves cron, subagent and app sessions, where nobody may be
+        # watching, so git falls through to the surface's own approval instead.
+        command = call.command
+        if command and not command_invokes_git(command) and is_read_only_bash(command):
             return ToolHookResult.auto_approve(read_only=True)
         return None
     from kiro_crew.slack.gateway import _is_read_only_tool
@@ -1121,11 +1168,17 @@ def _tier_read_only(facts: GateFacts, tier: GateTier) -> ToolHookResult | None:
         # which under READ_ONLY refuses.
         if kind and kind not in _READ_ONLY_TOOL_KINDS:
             return ToolHookResult.allow()
-        if _is_host_read_only_builtin(
-            call.mcp_tool,
-            call.mcp_server,
-            mcp_identity_trusted=call.identity_trusted,
-            kas_builtin_ids=call.kas_builtin_ids,
+        if (
+            _is_host_read_only_builtin(
+                call.mcp_tool,
+                call.mcp_server,
+                mcp_identity_trusted=call.identity_trusted,
+                kas_builtin_ids=call.kas_builtin_ids,
+            )
+            or _is_harness_read_only_builtin(call.harness_builtin_tool, call.mcp_server)
+            or _is_deepseek_read_only_builtin(
+                call.deepseek_tool_name, call.mcp_server, call.raw_params
+            )
         ):
             return ToolHookResult.auto_approve(read_only=True)
         return ToolHookResult.allow()

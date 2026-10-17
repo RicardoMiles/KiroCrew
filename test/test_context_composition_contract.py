@@ -48,6 +48,7 @@ from kiro_crew.learn import Lesson, LessonStore
 from kiro_crew.memory import MemoryStore
 from kiro_crew.skills import SkillsLoader
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
+from kiro_crew.testing.wait import default_timeout
 
 pytestmark = [
     pytest.mark.xdist_group("context_composition_contract"),
@@ -261,8 +262,8 @@ _STABLE_TEXT_SHA256 = {
     "critical_rules": "06ea61438802e0538dbf1f107e2e6b07cf2416348734f330e0cf0ec3ef52e899",
     "critical_rules_channel": "7e0dc53a1e4db382d51bb8ead062cd94ed5752dbb30b40149b6d9728ba734742",
     "docs_section": "971b6008afbd9ff048c498c06cffecc6dafc7a58b0df75ff9db0b15cf9e26c09",
-    "member_how_you_work": "c4cdfc2891778328791158168622c8e6a45463f4097b76439a5b05882753e68b",
-    "member_how_you_work_unavailable": "0e9d9dbd64cbd5bf1e0b61ca8feff5f2b8fddf91a51c711480a0cc6eeb8e3679",
+    "member_how_you_work": "aecaa26113f1d8909cc3188cece6f3455c02354fefe72b4ed5f6fa9d2db68f14",
+    "member_how_you_work_unavailable": "d7e0fda68e64a84f1bc17dc3a8b2fa0fbbeec42a352dc0ea06d0808eadb04f3d",
     "reply_answer_only": "f0bd694165ff81cdbe123048042070588b846bd43a224b31adc79d9f8768bfce",
     "reply_concise": "5d3e25d89e682469332237e46373f0e9aac8516eefd63047134d1ec0575aac2a",
     "response_preferences_frame": "08ee149ae459c828213d47643f1cdbd6661d8a77a2223b8be5d0aa6fbb6cdc18",
@@ -882,11 +883,11 @@ _GOLDEN: dict[str, tuple[str, list[tuple[str, int]]]] = {
         ],
     ),
     "session_context_member_mode": (
-        "1099a191224921d6a2e8f6b3a9706881b1204304fa756cfa4fd18db7dbbecf54",
+        "5a3c37279e5405f2d2ad02dc35608a1015f961df3a777e1197c03dc159facd90",
         [
             ("unclassified", 64),
             ("agent_identity", 25),
-            ("surface", 1018),
+            ("surface", 1189),
             ("workspace_identity", 371),
             ("docs_pointer", 235),
             ("memory_tools", 425),
@@ -1571,7 +1572,8 @@ FACADE_LOGGER = "kiro_crew.context"
 #: The owners the facade composes. A module added or removed changes the
 #: composition, so the set is spelled out rather than globbed.
 OWNER_MODULES = frozenset(
-    {"budget", "inclusion", "markers", "member", "replay", "sections", "store_admission", "turn"}
+    """agent_spec budget delivery_records inclusion markers member member_gates
+    output_contract replay sections session_start store_admission turn turn_message""".split()
 )
 
 
@@ -1749,7 +1751,12 @@ class TestEagerOwners:
         assert imported == OWNER_MODULES
 
     def test_every_owner_is_loaded_by_a_fresh_import_of_the_facade(self, tmp_path: Path) -> None:
+        bound = default_timeout()
+        # A hang writes nothing on its own, so the child dumps its stack shortly
+        # before the bound and the assertion below can name the import it stopped in.
+        dump_after = bound - min(5.0, bound / 4)
         probe = (
+            f"import faulthandler; faulthandler.dump_traceback_later({dump_after!r}, exit=False)\n"
             "import json, sys\n"
             "import kiro_crew.context\n"
             f"print(json.dumps(sorted(m for m in sys.modules if m.startswith({OWNER_PACKAGE + '.'!r}))))\n"
@@ -1757,15 +1764,25 @@ class TestEagerOwners:
         env = dict(os.environ)
         src = str(Path(kiro_crew.__file__).resolve().parents[1])
         env["PYTHONPATH"] = src + os.pathsep + env.get("PYTHONPATH", "")
-        out = subprocess.run(
-            [sys.executable, "-c", probe],
-            capture_output=True,
-            check=True,
-            env=env,
-            cwd=tmp_path,
-            timeout=60,
-            **UTF8_TEXT,
-        )
+        try:
+            out = subprocess.run(
+                [sys.executable, "-c", probe],
+                capture_output=True,
+                check=True,
+                env=env,
+                cwd=tmp_path,
+                timeout=bound,
+                **UTF8_TEXT,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # On POSIX the re-raised TimeoutExpired carries undecoded bytes even with text=True.
+            stderr = exc.stderr
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode("utf-8", "replace")
+            raise AssertionError(
+                f"a fresh import of kiro_crew.context did not finish within {exc.timeout:g} s; "
+                f"stderr so far:\n{stderr}"
+            ) from None
         loaded = json.loads(out.stdout.splitlines()[-1])
         assert loaded == sorted(f"{OWNER_PACKAGE}.{stem}" for stem in OWNER_MODULES), out.stderr
 

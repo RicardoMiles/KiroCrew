@@ -1,6 +1,6 @@
 import React from 'react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { screen, fireEvent, waitFor } from '@testing-library/react'
+import { act, screen, fireEvent, waitFor } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
 import { releaseComposerForKeyboardSwitch } from '../pages/chat/composerFocus'
 import { safeSetItem } from '../utils/safeStorage'
@@ -63,6 +63,14 @@ describe('ChatInput', () => {
     it('shows Stopping placeholder when disabled', () => {
       renderWithProviders(<ChatInput {...defaultProps} disabled />)
       expect(screen.getByPlaceholderText('Stopping…')).toBeInTheDocument()
+    })
+
+    it('keeps Stopping over a caller placeholder, and shows lockedPlaceholder instead when given', () => {
+      const { unmount } = renderWithProviders(<ChatInput {...defaultProps} disabled placeholder="Type here…" />)
+      expect(screen.getByPlaceholderText('Stopping…')).toBeInTheDocument()
+      unmount()
+      renderWithProviders(<ChatInput {...defaultProps} disabled placeholder="Type here…" lockedPlaceholder="Locked for now" />)
+      expect(screen.getByPlaceholderText('Locked for now')).toBeInTheDocument()
     })
 
     it('shows offline placeholder when connected=false', () => {
@@ -153,13 +161,16 @@ describe('ChatInput', () => {
 
     it('disables Optimize button when connected=false even with text', () => {
       renderWithProviders(<ChatInput {...defaultProps} value="hello" connected={false} />)
-      const btn = screen.getByRole('button', { name: /Optimize disabled/ })
+      // "Optimize prompt", not "Optimize": the offline name now reuses this
+      // control's own online accessible name instead of a second raw literal, so
+      // the two agree. It was the only offline name here that disagreed.
+      const btn = screen.getByRole('button', { name: /Optimize prompt disabled/ })
       expect(btn).toBeDisabled()
     })
 
     it('exposes offline-aware aria-label and tooltip on Optimize button', () => {
       renderWithProviders(<ChatInput {...defaultProps} value="hi" connected={false} />)
-      const btn = screen.getByLabelText('Optimize disabled — gateway offline')
+      const btn = screen.getByLabelText('Optimize prompt disabled — gateway offline')
       expect(btn).toHaveAttribute('title', 'Gateway offline — reconnect to optimize')
     })
 
@@ -432,6 +443,22 @@ describe('ChatInput', () => {
       renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} onCancelUpload={onCancelUpload} uploading />)
       fireEvent.click(screen.getByRole('button', { name: 'Cancel upload' }))
       expect(onCancelUpload).toHaveBeenCalledTimes(1)
+    })
+
+    /* #13071: one press aborts every upload in flight, so with two or more the
+     * label says how many stop rather than claiming a single one. */
+    it('names the count on the cancel control only when more than one upload is live', () => {
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} onCancelUpload={vi.fn()} uploading uploadCount={1} />)
+      const single = screen.getByRole('button', { name: 'Cancel upload' })
+      expect(single).toHaveAttribute('title', 'Cancel upload')
+
+      rerender(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} onCancelUpload={vi.fn()} uploading uploadCount={2} />)
+      const counted = screen.getByRole('button', { name: 'Cancel 2 uploads' })
+      expect(counted).toHaveAttribute('title', 'Cancel 2 uploads')
+      expect(screen.queryByRole('button', { name: 'Cancel upload' })).not.toBeInTheDocument()
+
+      rerender(<ChatInput {...defaultProps} onUploadFiles={vi.fn()} onCancelUpload={vi.fn()} uploading uploadCount={1} />)
+      expect(screen.getByRole('button', { name: 'Cancel upload' })).toBeInTheDocument()
     })
 
     /* A send fired mid-upload left without the file, and the file then landed
@@ -914,6 +941,36 @@ describe('ChatInput', () => {
       expect(onChange).not.toHaveBeenCalled()
     })
 
+    it('ignores an auto-repeat ArrowUp that reaches the start of a typed draft', () => {
+      const onChange = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="my long draft" />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      ta.setSelectionRange(0, 0)
+      fireEvent.keyDown(ta, { key: 'ArrowUp', repeat: true })
+      expect(onChange).not.toHaveBeenCalled()
+      // Letting go and pressing again is a deliberate recall.
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      expect(onChange).toHaveBeenLastCalledWith('third')
+    })
+
+    it('keeps walking history on auto-repeat once a prompt is recalled', () => {
+      const onChange = vi.fn()
+      const { rerender } = renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="" />)
+      const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+      fireEvent.keyDown(ta, { key: 'ArrowUp' })
+      rerender(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="third" />)
+      ta.setSelectionRange(0, 0)
+      fireEvent.keyDown(ta, { key: 'ArrowUp', repeat: true })
+      expect(onChange).toHaveBeenLastCalledWith('second')
+    })
+
+    it('recalls on an auto-repeat ArrowUp from an empty composer', () => {
+      const onChange = vi.fn()
+      renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} value="" />)
+      fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'ArrowUp', repeat: true })
+      expect(onChange).toHaveBeenLastCalledWith('third')
+    })
+
     it('ArrowDown is ignored when not in history mode', () => {
       const onChange = vi.fn()
       renderWithProviders(<ChatInput {...defaultProps} onChange={onChange} sentMessages={sent} />)
@@ -1222,6 +1279,37 @@ describe('ChatInput', () => {
           <ChatInput {...defaultProps} {...props} />
         </SlotProvider>,
       )
+
+    it('starts no optimize while the composer is locked, from the button or the chord', async () => {
+      // A memory-mode switch locks the composer (disabled) while it moves the
+      // draft; an optimize started then would write into the deleted slot.
+      const fetchSpy = vi.spyOn(global, 'fetch').mockImplementation(() => new Promise<Response>(() => {}))
+      const optimizeCalls = () => fetchSpy.mock.calls.filter(c => String(c[0]).includes('optimize'))
+      // The same settle step for both halves: the unlocked half proves an
+      // optimize reaches fetch within it, so the locked half's empty list is
+      // an absence and not a request that had not got there yet.
+      const settle = async () => { for (let i = 0; i < 5; i++) await act(async () => { await Promise.resolve() }) }
+      const chord = () => fireEvent.keyDown(screen.getByLabelText('Message input'), { key: 'Enter', metaKey: true, shiftKey: true })
+      try {
+        const onChange = vi.fn()
+        const { rerender } = renderInSlot('slot-A', { value: 'fix bug', onChange, disabled: true })
+        const btn = screen.getByRole('button', { name: 'Optimize prompt' })
+        expect(btn).toBeDisabled()
+        await act(async () => {
+          fireEvent.click(btn)
+          chord()
+        })
+        await settle()
+        expect(optimizeCalls()).toEqual([])
+
+        rerenderInSlot(rerender, 'slot-A', { value: 'fix bug', onChange, disabled: false })
+        await act(async () => { chord() })
+        await settle()
+        expect(optimizeCalls()).toHaveLength(1)
+      } finally {
+        fetchSpy.mockRestore()
+      }
+    })
 
     it('routes optimize result to the originating session when the user switched away', async () => {
       // The originating session (slot A) starts an optimize, then the user

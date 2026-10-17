@@ -1,6 +1,6 @@
 {
   "name": "kirocrew-desktop",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "Kiro Crew \u2014 AI agent desktop app",
   "homepage": "https://github.com/kirodotdev/KiroCrew",
   "desktopName": "kirocrew-desktop.desktop",
@@ -158,6 +158,7 @@
       "singleton-lock.js",
       "context-menu.js",
       "find-bin.js",
+      "external-terminal.js",
       "gateway-env.js",
       "mac-env.js",
       "bundle-integrity.js",
@@ -190,6 +191,7 @@
       "gateway-liveness.js",
       "gateway-recovery.js",
       "renderer-recovery.js",
+      "renderer-exhausted-notice.js",
       "hang-recovery.js",
       "native-logging.js",
       "crash-collector.js",

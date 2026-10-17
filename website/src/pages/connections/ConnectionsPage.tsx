@@ -612,7 +612,7 @@ function PrerequisiteTip({ label, heading, text }: { label: string; heading: str
         onMouseLeave={releaseHover}
         onFocus={holdHover}
         onBlur={releaseHover}
-        className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-warn transition-colors hover:bg-warn-subtle"
+        className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-warn transition-colors hover:text-warn-text hover:bg-warn-subtle"
       >
         <AlertTriangle className="h-4 w-4" aria-hidden="true" />
       </button>
@@ -903,12 +903,12 @@ function ConnectionCard({
     'waiting-for-approval': {
       label: t('pages.connectionsPage.waiting_for_approval'),
       icon: <CircleDashed className="w-3.5 h-3.5 animate-spin motion-reduce:animate-none" aria-hidden="true" />,
-      tone: 'bg-warn-subtle text-warn',
+      tone: 'bg-warn-subtle text-warn-text',
     },
     connected: {
       label: t('pages.connectionsPage.connected'),
       icon: <CheckCircle2 className="w-3.5 h-3.5" aria-hidden="true" />,
-      tone: 'bg-ok-subtle text-ok',
+      tone: 'bg-ok-subtle text-ok-text',
     },
     // Warn tone, not the error tone: an unverifiable state is not a failure. The
     // icon is static on purpose — a spinner would claim a grant is in flight
@@ -916,12 +916,12 @@ function ConnectionCard({
     'not-verified': {
       label: t('pages.connectionsPage.not_verified'),
       icon: <KeyRound className="w-3.5 h-3.5" aria-hidden="true" />,
-      tone: 'bg-warn-subtle text-warn',
+      tone: 'bg-warn-subtle text-warn-text',
     },
     'needs-attention': {
       label: t('pages.connectionsPage.needs_attention'),
       icon: <AlertTriangle className="w-3.5 h-3.5" aria-hidden="true" />,
-      tone: 'bg-danger-subtle text-danger',
+      tone: 'bg-danger-subtle text-danger-text',
     },
     // Muted, not warn: nothing is wrong with the provider, a step is missing on
     // OUR side. The lock says "this needs a key" without alarming a user who
@@ -1944,10 +1944,9 @@ export default function ConnectionsPage({ servicesEnabled = false }: { servicesE
             <Badge variant="muted">{t('pages.connectionsPage.services_available', { value: filteredProviders.length })}</Badge>
           </div>}
 
+          {/* No hand-off: a card waiting for approval can hold an unsaved return address while this status re-polls. */}
           {isError && (
-            <div role="alert" className="mb-3 rounded-md border border-danger/30 bg-danger-subtle px-3 py-2 text-[12px] text-danger">
-              {t('pages.connectionsPage.could_not_load_status')}
-            </div>
+            <ErrorNotice message={t('pages.connectionsPage.could_not_load_status')} className="mb-3" />
           )}
 
           {isLoading ? (

@@ -41,7 +41,7 @@ function themeConsentSha(colorTheme?: string): string | null {
   return stored
 }
 
-export function createChatEndpoints({ post, put, del, patch, j, jfetch: fetch, sessionKeyHeader: _sk, sendResponseAuthRecovery }: ClientTransport) {
+export function createChatEndpoints({ post, put, del, patch, j, jAccepted, jfetch: fetch, sessionKeyHeader: _sk, sendResponseAuthRecovery }: ClientTransport) {
   const summaries = {
     /** Intent summary for the chat summary panel.
      *
@@ -110,7 +110,7 @@ export function createChatEndpoints({ post, put, del, patch, j, jfetch: fetch, s
     },
     /** Create a chat slot on this machine. A session on a connected crew is
      *  created on that crew and opened through its window, never here. */
-    createChatSlot: async (name?: string, agent?: string, model?: string, mode?: string, memory_mode?: string, title?: string, artifact?: string, folder_id?: string, agent_kind?: 'member' | 'template', no_session_folder?: boolean) => {
+    createChatSlot: async (name?: string, agent?: string, model?: string, mode?: string, memory_mode?: string, title?: string, artifact?: string, folder_id?: string, agent_kind?: 'member' | 'template', no_session_folder?: boolean, app_agent_owner?: string) => {
       const resolvedMemoryMode = memory_mode ?? await resolveDefaultMemoryMode(
         () => fetch('/api/dashboard/config').then(j),
       )
@@ -119,6 +119,9 @@ export function createChatEndpoints({ post, put, del, patch, j, jfetch: fetch, s
         ...(agent ? { agent } : {}),
         // Only beside an agent: a namespace without a name selects nothing.
         ...(agent && agent_kind ? { agent_kind } : {}),
+        // The app whose OWN agent a palette command named. The backend refuses
+        // every turn on which that bare name would resolve to any other spec.
+        ...(agent && agent_kind === 'template' && app_agent_owner ? { app_agent_owner } : {}),
         ...(model ? { model } : {}),
         ...(mode ? { mode } : {}),
         ...(resolvedMemoryMode ? { memory_mode: resolvedMemoryMode } : {}),
@@ -150,8 +153,9 @@ export function createChatEndpoints({ post, put, del, patch, j, jfetch: fetch, s
     approveChatSlot: (slot: string, action: string, extra?: Record<string, string | number>) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/approve', { action, ...extra }).then(j),
     resumeChatSlot: (key: string, title?: string) => post('/api/chat/slots/' + encodeURIComponent(key) + '/resume', { name: key, key, title: title || key }).then(j),
     forkChatSlot: (slot: string, atIndex?: number, prompt?: string, mode?: string, direction?: string, messageId?: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/fork', { ...(atIndex !== undefined ? { at_message_index: atIndex } : {}), ...(messageId ? { at_message_id: messageId } : {}), ...(prompt ? { prompt } : {}), ...(mode ? { mode } : {}), ...(direction ? { direction } : {}) }).then(j),
+    sideTools: () => fetch('/api/chat/side/tools').then(j) as Promise<{ read_only_tools: boolean; claude_adapter_outdated: boolean; config_unavailable: boolean }>,
     sideOpen: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/side/open', {}).then(j) as Promise<{ ok: boolean; open: boolean; messages: number; last_run_id: string; created_at: string }>,
-    sideTurn: (slot: string, question: string, opts?: { steer?: boolean }) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/side/turn', { question, ...(opts?.steer ? { steer: true } : {}) }).then(j) as Promise<{ ok: boolean; run_id?: string; messages?: number; steered?: boolean; pending?: boolean; queued?: boolean; demoted?: boolean; queue_id?: string; still_queued?: boolean; depth?: number; steer_id?: string }>,
+    sideTurn: (slot: string, question: string, opts?: { steer?: boolean }) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/side/turn', { question, ...(opts?.steer ? { steer: true } : {}) }).then(jAccepted) as Promise<{ ok: boolean; run_id?: string; messages?: number; steered?: boolean; pending?: boolean; queued?: boolean; demoted?: boolean; queue_id?: string; still_queued?: boolean; depth?: number; steer_id?: string }>,
     sideQueueCancel: (slot: string, queueId: string) => del('/api/chat/slots/' + encodeURIComponent(slot) + '/side/queue/' + encodeURIComponent(queueId), { client: TAB_ID }).then(j) as Promise<{ ok: boolean; content: string; depth: number }>,
     sideQueueEdit: (slot: string, queueId: string, content: string) => patch('/api/chat/slots/' + encodeURIComponent(slot) + '/side/queue/' + encodeURIComponent(queueId), { content }).then(j) as Promise<{ ok: boolean; depth: number }>,
     sideClose: (slot: string) => post('/api/chat/slots/' + encodeURIComponent(slot) + '/side/close', {}).then(j) as Promise<{ ok: boolean; was_open: boolean }>,
@@ -196,7 +200,7 @@ export function createChatEndpoints({ post, put, del, patch, j, jfetch: fetch, s
   }
 
   const send = {
-    sendChat: (message: string, slot?: string, colorTheme?: string, signal?: AbortSignal, meta?: Record<string, unknown>, steer?: boolean | 'auto') => {
+    sendChat: (message: string, slot?: string, colorTheme?: string, signal?: AbortSignal, meta?: Record<string, unknown>, steer?: boolean | 'auto', responsive?: boolean) => {
       // theme_consent_sha is the WIRE TOKEN (two-tier consent). The client just
       // TRANSMITS the raw stored grant (see themeConsentSha) — the server verifies
       // content-binding, injecting the persona only when this token equals sha256
@@ -235,7 +239,7 @@ export function createChatEndpoints({ post, put, del, patch, j, jfetch: fetch, s
       // guide observation before Start asks this tab and no other. `X-UI-Lang`
       // is the language this tab renders, so the agent quotes dashboard labels
       // as this screen spells them (the gateway keeps only a shipped tag).
-      return fetch('/api/chat?ws=1', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Guide-Tab': TAB_ID, 'X-UI-Lang': activeLocale(), ..._sk }, body: JSON.stringify({ message, slot, ...(colorTheme ? { color_theme: colorTheme } : {}), ...(themeConsent ? { theme_consent_sha: themeConsent } : {}), ...(meta ? { meta } : {}), ...(steer ? { steer: steer === 'auto' ? 'auto' : true } : {}) }), signal }).then(sendResponseAuthRecovery)
+      return fetch('/api/chat?ws=1', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Guide-Tab': TAB_ID, 'X-UI-Lang': activeLocale(), ..._sk }, body: JSON.stringify({ message, slot, ...(colorTheme ? { color_theme: colorTheme } : {}), ...(themeConsent ? { theme_consent_sha: themeConsent } : {}), ...(meta ? { meta } : {}), ...(steer ? { steer: steer === 'auto' ? 'auto' : true } : {}), ...(responsive ? { responsive: true } : {}) }), signal }).then(sendResponseAuthRecovery)
     },
   }
 

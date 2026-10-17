@@ -768,7 +768,8 @@ over every version under such a key, because every version is billed. It is
 reported even when the sweep aborts on an untrustworthy listing, which is the case
 most likely to carry a large one.
 
-`test_aws_control_backup_retention.py` pins the keep-newest rule, the default-off
+The retention suite (`test_aws_control_backup_retention*.py`) pins the keep-newest
+rule, the default-off
 switch including an unconfigured install deleting nothing, every unusable stored
 value reading as off, the refusal to infer the count from `nightly` in either
 direction, a garbled count beside intact upload records still deleting nothing, the

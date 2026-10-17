@@ -272,8 +272,9 @@ on another port with `KIROCREW_PORT`.
 Kiro Crew auto-compacts at `session.autocompact_pct` context usage (70% by
 default for a new install — an existing `config.json` keeps whatever value it
 already stores, which for installs created before this default changed is
-`90.0`; check with `kirocrew config get session.autocompact_pct`). If
-compaction fires often:
+`90.0`; check with `kirocrew config get session.autocompact_pct`). The KAS
+backend is the exception: it decides when to compact on its own, and this
+setting does not change that. If compaction fires often:
 
 - Reduce always-on skills, which consume context in every session
 - Check memory size: large preferences and project files eat into the budget
@@ -406,6 +407,18 @@ temp files and its `$KIROCREW_SCRATCH` work products (clones, build logs,
 screenshots). A directory is reclaimed automatically once every process
 recorded in its `.owner` file has exited and nothing in it has been touched for
 an hour, so short-lived sessions clean up on their own.
+
+A directory that holds a git repository (a clone, a workspace of checkouts, a
+bare repository) is never deleted this way, because nothing outside the agent
+can prove the work in it is saved. It is moved into the `.quarantine`
+directory beside the others instead, named `<UTC time of the move>-<its own
+name>`, and deleted from there 14 days after the move (later, if something was
+written into it in the last hour). The gateway log names every move in one
+INFO line: `agent-scratch: moved <name> to <path in .quarantine> instead of
+deleting it`, with the date it will be deleted. To keep the work, move the
+directory out of `.quarantine` before that date (copying files out of it does
+not delay the delete), or commit and push it from there; to restore it for its
+session, move it back beside the others under its original name.
 
 One directory does not: the background runtime's tree is shared by every
 dashboard session and is handed on from one runtime to its replacement, so it

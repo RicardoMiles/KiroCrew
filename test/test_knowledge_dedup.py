@@ -1396,6 +1396,111 @@ class TestSweepIsNotQuadratic:
             f"{calls['ratio']} ratio() calls for {n} single-sig docs (dense pairs = "
             f"{dense_pairs}) -- the expensive comparison is not being pruned")
 
+    def test_scheduled_cap_skips_near_match_pass_for_oversized_single_sig_bucket(self):
+        """A pathological single-signature bucket larger than ``max_fuzzy_bucket``
+        has its O(d^2) near-filename-match pass SKIPPED on a scheduled sweep.
+
+        The real property (not a Counter-call metric): above the cap the bucket's
+        near-stem adjacency is empty, so the expensive adjacency build does not run;
+        exact-content and identical-stem matches are unaffected; and
+        ``max_fuzzy_bucket=None`` (the CLI/MCP backfill) never caps.
+        """
+        import kiro_crew.knowledge.dedup as dd
+
+        # A single embedding_sig bucket of distinct cross-source near-named stems that
+        # WOULD build a large near-stem adjacency if the pass ran.
+        n = 60
+        docs = []
+        for k in range(n):
+            d = self._doc(
+                k, f"quarterly report alpha {k:03d}.md", embedding_sig="ONESIG",
+                source_id=f"src{k}")
+            d.embedding = [1.0, 0.0, 0.0]
+            docs.append(d)
+
+        # Uncapped (CLI/MCP backfill, max_fuzzy_bucket=None): the near-stem adjacency
+        # is built and holds links for this near-named series.
+        uncapped = dd._CandidateIndex(docs)
+        uncapped_links = sum(
+            len(v) for m in uncapped._sig_adjacency.values() for v in m.values())
+        assert uncapped_links > 0, (
+            "the near-named series must produce near-stem adjacency links when uncapped"
+            " -- otherwise this test cannot prove the cap skips anything")
+
+        # Scheduled, bucket (n distinct stems) above the cap: the near-match pass is
+        # skipped, so NO near-stem adjacency links are built for the bucket.
+        capped = dd._CandidateIndex(docs, max_fuzzy_bucket=n - 1)
+        capped_links = sum(
+            len(v) for m in capped._sig_adjacency.values() for v in m.values())
+        assert capped_links == 0, (
+            f"{capped_links} near-stem links built despite the bucket ({n} stems) "
+            f"being above the cap ({n - 1}); the near-match pass must be skipped")
+
+    def test_scheduled_cap_preserves_exact_and_equal_stem_matches(self):
+        """Skipping the near-match pass for an oversized bucket must NOT drop the
+        cheap tiers: exact-content duplicates and identical-stem fuzzy matches in that
+        same bucket still collapse."""
+        import kiro_crew.knowledge.dedup as dd
+
+        docs = []
+        # Padding so the bucket exceeds a small cap, all distinct non-matching names.
+        for k in range(6):
+            d = self._doc(k, f"padding note {k:03d}.md", embedding_sig="ONESIG",
+                          source_id=f"pad{k}")
+            d.embedding = [1.0, 0.0, 0.0]
+            docs.append(d)
+        # An exact-content pair across two sources (collapses via the hash tier).
+        for k, src in enumerate(("exA", "exB"), start=100):
+            d = self._doc(k, "contract.md", content_hash="SAMEHASH",
+                          embedding_sig="ONESIG", source_id=src)
+            d.embedding = [1.0, 0.0, 0.0]
+            docs.append(d)
+        # An identical-STEM fuzzy pair across two sources (collapses via the stem
+        # bucket, which does not depend on the near-stem adjacency).
+        for k, src in enumerate(("eqA", "eqB"), start=200):
+            d = self._doc(k, "weekly status.md", embedding_sig="ONESIG",
+                          source_id=src)
+            d.embedding = [1.0, 0.0, 0.0]
+            docs.append(d)
+
+        # Cap below the bucket size so the near-match pass is skipped.
+        got = dd.find_duplicates(object(), list(docs), 0.95, max_fuzzy_bucket=5)
+        reasons = sorted(a.reason for a in got)
+        assert any(r == "exact" for r in reasons), (
+            "the exact-content duplicate must still collapse under the cap")
+        assert any(r.startswith("fuzzy:") for r in reasons), (
+            "the identical-stem fuzzy duplicate must still collapse under the cap")
+
+    def test_cap_at_or_below_bucket_boundary_is_identical_to_uncapped(self):
+        """At the boundary: a bucket of exactly ``max_fuzzy_bucket`` distinct stems is
+        NOT skipped, so the result equals the uncapped (dense) output; one more stem
+        trips the skip. This pins the cap's comparison as strictly ``>``."""
+        import kiro_crew.knowledge.dedup as dd
+
+        def corpus(n):
+            out = []
+            for k in range(n):
+                d = self._doc(k, f"budget plan beta {k:03d}.md",
+                              embedding_sig="ONESIG", source_id=f"src{k}")
+                d.embedding = [1.0, 0.0, 0.0]
+                out.append(d)
+            return out
+
+        n = 20
+        at_cap = dd._CandidateIndex(corpus(n), max_fuzzy_bucket=n)
+        over_cap = dd._CandidateIndex(corpus(n), max_fuzzy_bucket=n - 1)
+        at_cap_links = sum(
+            len(v) for m in at_cap._sig_adjacency.values() for v in m.values())
+        over_cap_links = sum(
+            len(v) for m in over_cap._sig_adjacency.values() for v in m.values())
+        # At exactly the cap the pass runs (links built); one over the cap it skips.
+        assert at_cap_links > 0, "a bucket AT the cap must not be skipped"
+        assert over_cap_links == 0, "a bucket OVER the cap must be skipped"
+        # And at the cap the output equals the dense reference.
+        got = dd.find_duplicates(object(), corpus(n), 0.95, max_fuzzy_bucket=n)
+        assert _action_tuples(got) == _action_tuples(
+            _find_duplicates_reference(object(), corpus(n), 0.95))
+
     def test_same_source_series_runs_no_ratio_calls(self):
         """A watched folder of similarly named files in ONE source -- dated meeting
         notes, numbered exports, all one embedding_sig -- is the regression case:

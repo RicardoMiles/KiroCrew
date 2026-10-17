@@ -8,6 +8,16 @@
 2. Error strings at CLI boundaries (never expose tracebacks to users)
 3. Graceful degradation — partial output returned on timeout
 
+## Sage automatic posting confirmation
+
+When automatic posting carries a driver-accepted review snapshot, the driver
+restores that snapshot to the durable result after adopting delivery metadata
+and before confirming the draft. A failed confirmation preserves the accepted
+findings for manual retry and does not advance the posted-key ledger. A failed
+restoration write returns a per-item posting failure with a redacted error; the
+batch continues and generates its report from accepted snapshots. It does not
+claim that the durable record is safe for retry.
+
 ## Exception Hierarchy
 
 Two independent families. `AcpError` covers protocol and prompt-level failures;
@@ -33,6 +43,11 @@ AcpError (base, acp/transport_errors.py) — carries `transient`, the retry verd
 ├── AcpToolGateUnroutable  — tool calls would bypass the PreToolUse gate;
 │                            non-retryable, wraps acp_tool_gate.ToolGateUnroutable
 ├── PiGateExtensionTampered — a shipped gate extension (Pi or DeepSeek) failed its digest check
+├── AcpConversationBindingMismatch — preserved thinking is bound to a different
+│                            conversation prefix; non-transient, so retrying the
+│                            same native conversation is forbidden and the
+│                            dashboard may perform its bounded discard-and-replay
+│                            recovery
 ├── AcpModelUnavailable    — requested model not entitled; non-retryable
 └── AcpPromptBusy          — a prompt is already in flight on this session
 
@@ -172,6 +187,16 @@ never drift. Notable terminal (non-retryable) classes:
   already resolved suppresses it; the drain and consume seams veto it on a later
   Stop, a queued follow-up or steer, or a rebind (with a cancel notice), refunding
   the one-shot. A second loss on the same turn ends with the give-up text.
+- **Preserved-thinking binding mismatch**: `AcpConversationBindingMismatch`
+  (non-transient) means the stored native conversation carries thinking bound to
+  another conversation prefix. A dashboard outer turn with no reply, thought or
+  tool call yet, no attached sub-agent and no Stop, steer, queued follow-up or
+  rebind discards the native resume SID once and queues ONE
+  `SYNTHETIC_RECOVERY_KIND` replay of the turn, armed as
+  `ReplayFamily.THINKING_BINDING`. The one-shot is the poisoned-conversation one
+  shared with the image-history recovery; the ledger's drain and consume seams
+  veto the replay (refunding it) exactly as they do that family's. A refused
+  rebuild falls through to the terminal error.
 - **Unsupported image history**: Kiro's `IMAGE_FORMAT_UNSUPPORTED` /
   `ImageValidationError` is terminal and structural. The exception also carries
   the narrower `image_format_unsupported` tag. A current attachment is left in
@@ -333,7 +358,7 @@ did not say — never guessed.
 - **claude-agent-acp, codex-acp** — only Anthropic's bare `stopReason: "refusal"`
   reaches the client; `terminal_refusal` passes it through with no payload, and
   the dashboard's refusal branch (keyed on the stop reason) renders the bare card.
-- **Dashboard** — `chat_runner.refusal_card_text` renders one card from
+- **Dashboard** — `chat_turn.recovery.refusal_card_text` renders one card from
   `RefusalInfo`: the lead line, then one line per non-empty field. Because the
   Kiro explanation streams as text, the card is emitted from BOTH the answered
   and the text-less branch of the turn epilogue.

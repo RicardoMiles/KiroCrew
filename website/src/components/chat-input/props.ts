@@ -7,13 +7,14 @@ import type { PasteBlock } from '../../utils/pasteTokens'
 import type { FileKind } from '../FilePickerMenu'
 import type { PromptHistoryItem } from '../composerPromptHistory'
 import type { ApprovalModeRemote } from '../ApprovalModePicker'
+import type { MemorySource } from '../../lib/agentMemorySource'
 
 /* The composer's public prop contract. `components/ChatInput.tsx` takes it
    and re-exports `ComposerBusyMode`; the owners under this directory take the
    props they need as their own parameters, a few by indexed access
    (`ChatInputProps['onFileSelect']`). */
 /** Busy-composer send affordance — see `ChatInputProps.busyMode`. */
-export type ComposerBusyMode = 'split' | 'steer-only'
+export type ComposerBusyMode = 'split' | 'steer-only' | 'responsive'
 
 /** The modifier state a Backspace/Delete keydown carries into `onMentionKey`,
  *  so the host can tell a plain or Shift-held delete (treated alike) from a
@@ -76,10 +77,15 @@ export interface ChatInputProps {
    * a person has no "wait until they finish, then they'll listen" step, so
    * offering one would present a console control inside a chat. Needs
    * `canSteer` + `onSteer` exactly like the split button; without a steer
-   * path the busy send still falls back to the queue button. */
+   * path the busy send still falls back to the queue button.
+   * 'responsive' keeps ordinary Send at every runtime state and calls onSend;
+   * the host asks the gateway to prioritize the message, never stops locally. */
   busyMode?: ComposerBusyMode
   disabled?: boolean
   placeholder?: string
+  /** Shown instead of the default "Stopping…" while `disabled` is set, naming
+   *  why the composer is locked. */
+  lockedPlaceholder?: string
   prefillHint?: boolean
   onDismissHint?: () => void
   /** macOS-only screenshot */
@@ -95,6 +101,9 @@ export interface ChatInputProps {
   holdSend?: boolean
   /** Abort the upload in flight; turns the upload spinner into a cancel control */
   onCancelUpload?: () => void
+  /** How many uploads `onCancelUpload` aborts. Above one, the cancel control's
+   *  label names the count, since pressing it stops every one of them. */
+  uploadCount?: number
   /** Pending file paths (images + non-images) for preview strip */
   pendingFiles?: string[]
   /** Pending folder references for the preview strip: RELATIVE paths with trailing slash, derived from `@rel/` composer tokens (a path reference handed to the agent, not an upload) */
@@ -159,6 +168,11 @@ export interface ChatInputProps {
    * marker alone reads as opaque (#8770 UX review). Only the inherited case
    * gets it; a pinned chip has nothing to explain. */
   agentIsInheritedDefault?: boolean
+  /**
+   * The memory the session's agent runs on, set only when a crewmate and a
+   * custom agent share its name (`sessionMemoryTag`, #19472). The chip then
+   * marks its label and spoken name with it. Null or unset: no mark. */
+  agentMemory?: MemorySource | null
   agentSource?: string
   modelName?: string
   /**
@@ -244,6 +258,10 @@ export interface ChatInputProps {
   /** Show used/window token counts in the inline context readout. */
   showContextTokens?: boolean
   isRunning?: boolean
+  /** Lock the project chip: the composer is busy only because sub-agents are
+   *  attached. A pick there cannot land at the next turn, because the deferred
+   *  session reset stays armed while children share the runtime. */
+  projectLocked?: boolean
   onStop?: () => void
   /**
    * True when an EMPTY composer can hand the thread back to the agent, so the
@@ -321,9 +339,10 @@ export interface ChatInputProps {
   onMentionKey?: (text: string, selStart: number, selEnd: number, key: string, mods: MentionKeyMods) => { value: string; caret: number } | null
   /** The host's file-mention guard for "Optimize prompt", taken with the
    *  draft when the optimize starts. The check it returns says whether a
-   *  rewrite leaves the draft's attachments unchanged; a rewrite it refuses
-   *  is discarded like one the optimizer did not change. Absent: no mention
-   *  is protected. */
+   *  rewrite leaves the draft's file attachments unchanged; a rewrite it
+   *  refuses is discarded like one the optimizer did not change. Absent: no
+   *  file mention is protected. Folder mentions need no host guard: their
+   *  chips derive from the text, so the optimizer checks them itself. */
   optimizerMentionGuard?: (draft: string) => (rewrite: string) => boolean
   onFileOpen?: (path: string) => void
   project?: string
@@ -493,4 +512,9 @@ export interface ChatInputProps {
    *  never silently lost. When the originating session is still on screen,
    *  ChatInput writes the result itself (undoable) and does NOT call this. */
   onOptimizeResult?: (slotId: string | null, optimized: string) => void
+  /** Told whether an optimize started on the session shown here is still in
+   *  flight. The host uses it to hold back a memory-mode switch, which would
+   *  otherwise carry the pre-optimize text and send the rewrite to the
+   *  session it then deletes. */
+  onOptimizingChange?: (optimizing: boolean) => void
 }

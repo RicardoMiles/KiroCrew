@@ -1440,6 +1440,7 @@ log rather than a record beside it; the routes still read that cache.
 | `created_at` | string | optional | The item's committed creation stamp, carried by `create`. | |
 | `last_report_at` | string | optional | The item's committed last-report stamp, carried by `report`. | |
 | `closed_at` | string | optional | The item's committed close stamp, carried by `close`. | |
+| `pending_since` | string | optional | When the item's run of `pending` verdicts began, carried by a `pending` `verdict`. Any other verdict, or an `accept`, clears it. | |
 | `board_round` | int | optional | The board's committed round, carried by a baseline entry. | |
 | `board_created_at` | string | optional | The board's committed creation stamp, carried by a baseline entry. | |
 | `goal_version` | int | optional | The header's goal-write count after this write, set by `goal`. | |

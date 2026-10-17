@@ -700,6 +700,34 @@ class TestReadConfig:
         assert len(kas_records) == 1, "kas fallback warned more than once"
         assert "acp_client_spawnable" in kas_records[0].getMessage()
 
+    @pytest.mark.parametrize("agent", [{}, {"acp_backend": ""}])
+    def test_undeclared_backend_falls_back_to_kiro_without_warning(self, caplog, agent):
+        """No declared ``agent.acp_backend`` resolves to the KAS default, which
+        is not ``acp_client_spawnable``. The pool still uses Kiro, but the user
+        chose nothing, so no WARNING names a backend they never configured; a
+        later declared ``kas`` still warns once."""
+        from kiro_crew.knowledge import llm_pool as llm_pool_mod
+
+        llm_pool_mod._WARNED_UNSAFE_BACKENDS.clear()
+        with caplog.at_level("WARNING", logger="kiro_crew.knowledge.llm_pool"):
+            assert _get_acp_backend({"agent": agent}) == ACP_BACKEND_KIRO
+            assert _get_acp_backend({}) == ACP_BACKEND_KIRO
+        assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+
+        with caplog.at_level("WARNING", logger="kiro_crew.knowledge.llm_pool"):
+            assert _get_acp_backend({"agent": {"acp_backend": ACP_BACKEND_KAS}}) == (
+                ACP_BACKEND_KIRO
+            )
+            assert _get_acp_backend({"agent": {"acp_backend": ACP_BACKEND_KAS}}) == (
+                ACP_BACKEND_KIRO
+            )
+        kas_warnings = [
+            r
+            for r in caplog.records
+            if r.levelname == "WARNING" and ACP_BACKEND_KAS in r.getMessage()
+        ]
+        assert len(kas_warnings) == 1
+
     @pytest.mark.asyncio
     async def test_start_defaults_backend_to_kiro(self, tmp_path):
         mock_client = _zero_tool_client()
@@ -1442,13 +1470,13 @@ class TestAcpWorkerEffort:
         assert "unsupported" in caplog.text
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("backend", [ACP_BACKEND_OPENCODE])
+    @pytest.mark.parametrize("backend", ["some-harness-nobody-registered"])
     async def test_backend_with_no_effort_channel_sends_nothing_and_warns(
         self, backend, tmp_path, caplog
     ):
-        """opencode implements neither ``session/set_config_option`` for effort nor
-        the kiro-native ``/effort`` command, so the pool says the provider default
-        applies instead of sending a command that cannot land."""
+        """A harness with neither ``session/set_config_option`` for effort nor the
+        kiro-native ``/effort`` command gets nothing sent: the pool says the
+        provider default applies instead of sending a command that cannot land."""
         client = _mock_effort_client(["low", "medium", "high"], backend=backend)
         client.spec_zero_tools = True
         with (
@@ -1467,6 +1495,34 @@ class TestAcpWorkerEffort:
             and "using provider default" in r.getMessage()
             for r in caplog.records
         )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("supports", "written"), [(True, "medium"), (False, None)], ids=["variants", "none"]
+    )
+    async def test_opencode_writes_effort_only_on_a_model_with_variants(
+        self, supports, written, tmp_path
+    ):
+        """opencode serves an ``effort`` select only on a model with variants: there
+        the highest offered level at or below the request is written, and on a model
+        without one nothing is sent."""
+        client = _mock_effort_client(
+            ["low", "medium"], supports=supports, backend=ACP_BACKEND_OPENCODE
+        )
+        client.spec_zero_tools = True
+        with (
+            patch("pathlib.Path.home", return_value=tmp_path),
+            patch("kiro_crew.knowledge.llm_pool.AcpClient", return_value=client),
+        ):
+            worker = AcpWorker(effort="high", acp_backend=ACP_BACKEND_OPENCODE)
+            await worker.start()
+
+        client.send_command.assert_not_awaited()
+        if written is None:
+            client.set_config_option.assert_not_awaited()
+        else:
+            client.set_config_option.assert_awaited_once_with("effort", written)
+        assert worker._effective_effort == written
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

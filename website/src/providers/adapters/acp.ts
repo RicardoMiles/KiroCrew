@@ -11,6 +11,7 @@ import type {
   NormalizedUsage,
   TokenEstimate,
   NormalizedProviderHook,
+  NormalizedUnsentHook,
   NormalizedPlugin,
   ModelInfo,
   PermissionMode,
@@ -180,6 +181,17 @@ interface RawHookEntry {
   source?: string
 }
 
+/** Raw `unsent` entry from /api/kiro-hooks: a validated `agent.kiro_hooks`
+ *  document left out of the kiro-cli spec. */
+interface RawUnsentHook {
+  name?: string
+  trigger?: string
+  matcher?: string
+  action_type?: string
+  command?: string
+  reason?: string
+}
+
 /** Raw plugin (agent/skill/mcp) entry from /api/capability/*. */
 interface RawPlugin {
   name: string
@@ -259,7 +271,7 @@ export class AcpAdapter implements ProviderAdapter {
     return agent.kiro_agent || agent.name
   }
 
-  async resolveModel(agentName: string): Promise<string> {
+  async resolveModel(agentName: string, app?: string): Promise<string> {
     // Ask the backend which model a new session on this agent would run on, so
     // the composer shows the real value before a session exists to report one.
     //
@@ -273,9 +285,10 @@ export class AcpAdapter implements ProviderAdapter {
     //
     // `agentName` is a KiroCrew agent name (a "crew"), not a kiro agent
     // template — the per-agent default is stored per crew, and several crews can
-    // share one template.
+    // share one template. `app` names the app that owns the session, so the
+    // answer includes that app's own model setting as the session start does.
     try {
-      const d = await api.agentResolvedModel(agentName)
+      const d = await (app ? api.agentResolvedModel(agentName, app) : api.agentResolvedModel(agentName))
       return d?.model || ''
     } catch {
       return ''
@@ -373,6 +386,20 @@ export class AcpAdapter implements ProviderAdapter {
       }))
     }
     return result
+  }
+
+  async fetchUnsentProviderHooks(): Promise<NormalizedUnsentHook[]> {
+    const data = await api.kiroHooks()
+    // An older gateway sends no `unsent`; that reads as nothing left out.
+    const unsent: RawUnsentHook[] = Array.isArray(data.unsent) ? data.unsent : []
+    return unsent.map(u => ({
+      name: u.name || '',
+      trigger: u.trigger || '',
+      matcher: u.matcher || '',
+      actionType: u.action_type || '',
+      command: u.command || '',
+      reason: u.reason || '',
+    }))
   }
 
   async listPlugins(): Promise<NormalizedPlugin[]> {

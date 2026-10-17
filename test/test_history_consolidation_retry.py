@@ -45,7 +45,7 @@ KEY = "dashboard:chat-retry"
 @pytest.mark.parametrize("mode", ["persistent", "incognito", "temporary"])
 async def test_consolidation_captures_execution_off_loop(tmp_path, monkeypatch, mode):
     from kiro_crew import execution_context
-    from kiro_crew.history_consolidation import _CONSOLIDATION_REFUSED
+    from kiro_crew.history_consolidation import _CONSOLIDATION_BUSY, _CONSOLIDATION_REFUSED
 
     captured = execution_context.ExecutionContext(
         None, execution_context.MemoryStoreRef("default"), "template", "kirocrew", mode
@@ -61,7 +61,9 @@ async def test_consolidation_captures_execution_off_loop(tmp_path, monkeypatch, 
     consolidator = _make_consolidator(_seed_log(tmp_path, count=0))
     consolidator._call_llm = AsyncMock()
     result = await asyncio.wait_for(consolidator._consolidate(KEY), 10)
-    assert result is (None if mode == "persistent" else _CONSOLIDATION_REFUSED)
+    # count=0 leaves no transcript on disk, so the lease (which requires an
+    # existing session) is refused before any snapshot.
+    assert result is (_CONSOLIDATION_BUSY if mode == "persistent" else _CONSOLIDATION_REFUSED)
     consolidator._call_llm.assert_not_awaited()
     assert len(reads) == 1
     assert reads[0][0] != loop_thread
@@ -227,20 +229,22 @@ class TestTheLineIsValidatedWithTheRows:
         c._call_llm = AsyncMock(return_value={"history_entry": "leaked"})
         # Unreadable only from the snapshot's own lock hold onward, so the
         # pre-checks (which read the line too) pass and the snapshot is the gate.
-        real_locked_stems = type(log).locked_stems
+        # Hooked on the snapshot itself: the lease check takes the same lock
+        # first and must still read the line.
+        real_snapshot = type(log).snapshot_for_consolidation
         real_status = type(log)._read_metadata_status
         inside = {"lock": False}
 
-        def _locked_then_unreadable(self, stems):
+        def _snapshot_then_unreadable(self, key, **kwargs):
             inside["lock"] = True
-            return real_locked_stems(self, stems)
+            return real_snapshot(self, key, **kwargs)
 
         def _status(self, key):
             if inside["lock"] and key == KEY:
                 return {}, False
             return real_status(self, key)
 
-        monkeypatch.setattr(type(log), "locked_stems", _locked_then_unreadable)
+        monkeypatch.setattr(type(log), "snapshot_for_consolidation", _snapshot_then_unreadable)
         monkeypatch.setattr(type(log), "_read_metadata_status", _status)
 
         outcome = await asyncio.wait_for(c._consolidate(KEY, include_history=True), 10)
@@ -702,10 +706,20 @@ async def test_consolidate_refuses_a_channel_thread_whose_map_entry_was_pruned(
         privacy_mode.reset()  # the fresh gateway's trackers start empty
         c = _make_consolidator(log, sessions=None)  # no map: the header must answer
         c._call_llm = AsyncMock(return_value={"history_entry": "x"})
+        real_consolidate = c._consolidate
+        outcomes: list[object] = []
+
+        async def _recording(*args, **kwargs):
+            outcomes.append(await real_consolidate(*args, **kwargs))
+            return outcomes[-1]
+
+        c._consolidate = _recording
         c.consolidate_session(live_key)
         tasks = list(c._tasks)
         assert len(tasks) == 1, "premise: the session-end hook scheduled one pass"
-        result = await asyncio.wait_for(tasks[0], 10)
+        await asyncio.wait_for(tasks[0], 10)
+        assert len(outcomes) == 1, "premise: the session-end hook ran one pass"
+        result = outcomes[0]
     finally:
         privacy_mode.reset()
 
@@ -2444,21 +2458,22 @@ class TestTheCapDoesNotOutliveTheSpanItMeasured:
         c = _make_consolidator(log)
         self._plant_capped(log)
 
-        c.consolidate_session(KEY)
-        assert not c._tasks, "a capped span with no growth still fired a turn"
+        with patch.object(c, "_call_llm", AsyncMock(return_value={"history_entry": "x"})) as spy:
+            c.consolidate_session(KEY)
+            await asyncio.gather(*list(c._tasks), return_exceptions=True)
+        assert spy.await_count == 0, "a capped span with no growth still fired a turn"
 
         with history_mod.allow_on_loop_persist():
             log.append(KEY, "user", "arrived after the cap")
 
         with patch.object(c, "_call_llm", AsyncMock(return_value={"history_entry": "recovered"})):
             c.consolidate_session(KEY)
-            assert c._tasks, (
-                "one failed abandon write left the session permanently unable to "
-                "consolidate anything it writes from now on"
-            )
             await asyncio.gather(*list(c._tasks), return_exceptions=True)
 
-        assert log.unconsolidated_count(KEY) == 0
+        assert log.unconsolidated_count(KEY) == 0, (
+            "one failed abandon write left the session permanently unable to "
+            "consolidate anything it writes from now on"
+        )
         assert "consolidation_attempts" not in log.get_metadata(KEY)
 
 

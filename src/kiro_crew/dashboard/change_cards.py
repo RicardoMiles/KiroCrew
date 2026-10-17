@@ -95,7 +95,6 @@ FINISHED_STATUSES = frozenset(
 )
 #: Outcomes the proposing agent hears about on its next turn.
 REPORTED_STATUSES = FINISHED_STATUSES
-_CLOSED_STATUSES = frozenset({STATUS_CANCELLED, STATUS_EXPIRED, STATUS_UNDONE})
 _ALL_STATUSES = FINISHED_STATUSES | {STATUS_PENDING, STATUS_APPLYING}
 #: Statuses whose ``undo_unavailable_reason`` is still the preview's own.
 _PRE_APPLY_STATUSES = frozenset(
@@ -278,9 +277,21 @@ def rebuild_record(rec: dict[str, Any]) -> dict[str, Any] | None:
     if not _same(list(catalog.KINDS[kind].editable), rec.get("editable")):
         return None
     plan = rec.get("plan")
-    if not isinstance(plan, dict) or not _same(preview["apply"], plan.get("apply")):
+    if not isinstance(plan, dict):
         return None
     status = rec["status"]
+    apply_plan = preview["apply"]
+    if not _same(apply_plan, plan.get("apply")):
+        # A crewmate.create card stored before goal records: the same card with
+        # the goal in description. Still unrun, it runs the current plan; once
+        # applied, its steps and evidence keep the shape they ran with.
+        if kind != catalog.KIND_CREWMATE_CREATE or not any(
+            _same(catalog.legacy_create_apply(params, first_greeting=g), plan.get("apply"))
+            for g in (True, False)
+        ):
+            return None
+        if status == STATUS_APPLYING or status not in _PRE_APPLY_STATUSES:
+            apply_plan = plan["apply"]
     if status in _PRE_APPLY_STATUSES and not _same(
         preview.get("undo_unavailable_reason"), rec.get("undo_unavailable_reason")
     ):
@@ -299,7 +310,7 @@ def rebuild_record(rec: dict[str, Any]) -> dict[str, Any] | None:
                 params,
                 before,
                 evidence,
-                catalog.applied_write_count(preview["apply"], len(evidence)),
+                catalog.applied_write_count(apply_plan, len(evidence)),
                 {"rule_id": after.get("id")},
             )
         except Exception:
@@ -307,7 +318,7 @@ def rebuild_record(rec: dict[str, Any]) -> dict[str, Any] | None:
         if rebuilt_undo is None or not _same(rebuilt_undo, undo):
             return None
         undo = rebuilt_undo
-    return {**rec, "params": params, **fields, "plan": {"apply": preview["apply"], "undo": undo}}
+    return {**rec, "params": params, **fields, "plan": {"apply": apply_plan, "undo": undo}}
 
 
 def _store_unavailable() -> "CardError":
@@ -591,8 +602,15 @@ class CardStore:
         rec["finished_at"] = self._clock()
         rec["inflight"] = None
         rec["progress"] = None
+        error = rec.get("error") or {}
         rec["result"] = {
-            "summary": catalog.result_summary(rec["kind"], rec["params"], status, rec["title"]),
+            "summary": catalog.result_summary(
+                rec["kind"],
+                rec["params"],
+                status,
+                rec["title"],
+                failed_step=error.get("step") if error.get("op") == catalog.OP_APPLY else None,
+            ),
         }
         self._dirty()
 
@@ -1167,7 +1185,7 @@ _SENSITIVE_SEGMENTS = frozenset(
 
 @functools.lru_cache(maxsize=1)
 def settings_registry() -> tuple[dict[str, Any], ...]:
-    """The packaged Settings registry (id, label, tab, description, configKey)."""
+    """The packaged Settings registry (id, label, tab, description, hint, configKey)."""
     try:
         data = json.loads(_REGISTRY_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -1175,6 +1193,15 @@ def settings_registry() -> tuple[dict[str, Any], ...]:
         return ()
     entries = data.get("settings") if isinstance(data, dict) else None
     return tuple(e for e in entries or () if isinstance(e, dict) and isinstance(e.get("id"), str))
+
+
+def _help_text(entry: dict[str, Any]) -> str:
+    """All of a registry row's help, tip first: its ``hint`` (shown only behind
+    the row's info tip) then its ``description`` (shown on the row). Settings
+    search matches on both; every answer keeps them apart so a reader that
+    quotes on-row copy can take ``description`` alone."""
+    parts = (entry.get("hint"), entry.get("description"))
+    return " ".join(str(p) for p in parts if isinstance(p, str) and p)
 
 
 def _registry_entry(setting_id: str) -> dict[str, Any] | None:
@@ -1348,7 +1375,7 @@ def find_settings(query: str) -> list[dict[str, Any]]:
     hays = []
     for entry in entries:
         title = f"{entry['id']} {entry.get('label', '')}".lower()
-        hay = f"{title} {entry.get('description', '')} {entry.get('configKey', '')}".lower()
+        hay = f"{title} {_help_text(entry)} {entry.get('configKey', '')}".lower()
         hays.append((title, hay))
     # How many entries each word reaches: a tie goes to the entry whose words are
     # rarer, so "verbosity" outranks a "reply" that a dozen channel settings share.
@@ -1366,7 +1393,9 @@ def find_settings(query: str) -> list[dict[str, Any]]:
         row: dict[str, Any] = {
             "setting_id": entry["id"],
             "label": entry.get("label", ""),
-            "description": str(entry.get("description", ""))[:400],
+            # On-row text and tip text stay apart, as the registry keeps them:
+            # `description` is what the row shows, `hint` sits behind its tip.
+            "description": str(entry.get("description") or "")[:400],
             "tab": entry.get("tab", ""),
             "writable": False,
             "current_value": None,
@@ -1375,6 +1404,8 @@ def find_settings(query: str) -> list[dict[str, Any]]:
             target: dict[str, Any] | None = resolve_setting({"setting_id": entry["id"]})
         except catalog.CardCatalogError:
             target = None
+        if isinstance(entry.get("hint"), str) and entry["hint"]:
+            row["hint"] = entry["hint"][:400]
         if target is not None:
             row["writable"] = True
             if target.get("store") == catalog.STORE_KIROCREW and requires_restart(
@@ -1619,7 +1650,7 @@ def _token_hits(tokens: list[str], *texts: Any) -> int:
 
 def _row_hits(tokens: list[str], row: dict[str, Any]) -> int:
     entry = _registry_entry(row["setting_id"]) if row.get("setting_id") else None
-    extra = (entry.get("description"), entry.get("tab")) if entry else ()
+    extra = (_help_text(entry), entry.get("tab")) if entry else ()
     return _token_hits(tokens, row["key"], row.get("setting_id"), row.get("label"), *extra)
 
 
@@ -2005,6 +2036,55 @@ def after_shows_the_write(
         if not isinstance(created, str) or not created:
             return False
         return bool(after.get("exists")) and after.get("member_id") == created
+    if kind == catalog.KIND_CREWMATE_CHECK_INS:
+        sched = after.get("schedules")
+        return isinstance(sched, dict) and all(
+            sched.get(k) == v for k, v in p.items() if k != "member"
+        )
+    if kind in (catalog.KIND_CREWMATE_GOAL, catalog.KIND_CREWMATE_KEY_RESULTS):
+        # A card can carry the scrubbed form of text the record keeps raw
+        # (``member_goals.keep_unscrubbed``), so the write reads back in its
+        # scrubbed form: compare both sides scrubbed.
+        from kiro_crew import member_goals
+
+        if kind == catalog.KIND_CREWMATE_GOAL:
+            gid = p.get("goal_id") or (ev[0].get("goal_id") if ev else None)
+            got = next(
+                (
+                    g.get("text")
+                    for g in after.get("goals") or []
+                    if isinstance(g, dict) and g.get("id") == gid
+                ),
+                None,
+            )
+            want = p.get("long_term")
+            if not isinstance(got, str):
+                return False
+            return got == want or member_goals.scrub_text(got) == member_goals.scrub_text(want)
+        got_items, want_items = after.get("key_results"), p.get("items")
+        records = after.get(KR_RECORDS_KEY)
+        if isinstance(records, list) and isinstance(want_items, list):
+            # A key result the card linked to goals must read back with those links.
+            for rec_item, want_item in zip(records, want_items):
+                if (
+                    isinstance(want_item, dict)
+                    and "goal_ids" in want_item
+                    and (
+                        not isinstance(rec_item, dict)
+                        or rec_item.get("goal_ids") != want_item["goal_ids"]
+                    )
+                ):
+                    return False
+        if member_goals.key_result_shape(got_items) == member_goals.key_result_shape(want_items):
+            return True
+
+        def scrubbed(items: Any) -> list[dict[str, str]]:
+            return [
+                {k: member_goals.scrub_text(v) for k, v in i.items()}
+                for i in member_goals.key_result_shape(items)
+            ]
+
+        return isinstance(got_items, list) and scrubbed(got_items) == scrubbed(want_items)
     if kind == catalog.KIND_CREWMATE_CAPABILITIES:
         # The write landed at the revision the PUT returned (step 1's evidence);
         # Undo inverts that revision. If the post-apply read is at a different
@@ -2025,6 +2105,29 @@ def after_shows_the_write(
     return True
 
 
+#: Where a ``crewmate.key_results`` snapshot keeps the full records its Undo restores.
+KR_RECORDS_KEY = "key_results_records"
+
+
+def comparable_state(kind: str, state: Any) -> Any:
+    """*state* as the conflict checks compare it.
+
+    A ``crewmate.key_results`` snapshot is compared on the ``{text, target}``
+    shape, ids and goal links of its records (:data:`KR_RECORDS_KEY`), never
+    their readings: a fresh reading between preview, apply and Undo is not a
+    conflict, but new ids or changed goal links are.
+    """
+    if kind == catalog.KIND_CREWMATE_KEY_RESULTS and isinstance(state, dict):
+        out = {k: v for k, v in state.items() if k != KR_RECORDS_KEY}
+        records = state.get(KR_RECORDS_KEY)
+        if isinstance(records, list):
+            out["ids"] = [r.get("id") for r in records if isinstance(r, dict)]
+            # Which goals each one serves is part of what a card changes.
+            out["links"] = [sorted(r.get("goal_ids") or []) for r in records if isinstance(r, dict)]
+        return out
+    return state
+
+
 def undo_snapshot_changed(kind: str, current: Any, after: Any) -> bool:
     """Whether the state an Undo is about to reverse differs from what the card made.
 
@@ -2034,7 +2137,9 @@ def undo_snapshot_changed(kind: str, current: Any, after: Any) -> bool:
     newly added scope is a change.
     """
     if kind not in (catalog.KIND_MCP_INSTALL, catalog.KIND_MCP_ADD_CUSTOM):
-        return canonical(current) != canonical(after)
+        return canonical(comparable_state(kind, current)) != canonical(
+            comparable_state(kind, after)
+        )
     cur, then = current or {}, after or {}
 
     def changed(now: dict[str, str], was: dict[str, str]) -> bool:
@@ -2114,6 +2219,55 @@ def _template_state_with_skills(params: dict[str, Any], state: Any) -> dict[str,
     }
 
 
+def _goal_state(member: str, kind: str) -> dict[str, Any]:
+    """The crewmate's slug and the part of its goal a goal card replaces.
+
+    A ``crewmate.goal`` card compares the goals (ids and raw text); a
+    ``crewmate.key_results`` card the ``{text, target}`` of each key result (a
+    fresh reading between preview and apply is not a conflict).
+
+    The member id is part of the compared snapshot: a crewmate deleted and made
+    again under the same name between preview and apply reads as a change.
+    """
+    from kiro_crew import member_goals
+    from kiro_crew import members as members_mod
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    cfg = KiroCrewConfig.load()
+    agent = cfg.agents.get(member)
+    if agent is None:
+        return {"exists": False}
+    slug = members_mod.member_slug(member, cfg)
+    try:
+        rec = member_goals.read_goals(slug, member)
+    except member_goals.GoalsUnreadable:
+        raise catalog.CardCatalogError(
+            "goals_unreadable", "this crewmate's goal record cannot be read"
+        ) from None
+    out: dict[str, Any] = {
+        "exists": True,
+        "slug": slug,
+        "member_id": getattr(agent, "member_id", "") or "",
+    }
+    if kind == catalog.KIND_CREWMATE_GOAL:
+        # Raw: a card Undo restores this text (REQ_CARD_RAW_RESTORE); the plan
+        # and the change line carry it scrubbed.
+        out["goals"] = [{"id": g["id"], "text": g["text"]} for g in rec["goals"]]
+    elif kind == catalog.KIND_CREWMATE_CHECK_INS:
+        out["has_goal"] = member_goals.has_goal(rec)
+        out["schedules"] = {k: rec["schedules"].get(k) for k in catalog.CHECK_IN_FIELDS}
+    else:
+        out["has_goal"] = member_goals.has_goal(rec)
+        # Only the ids: which goals exist and their numbers. A goal's wording
+        # changing between preview and apply is not this card's conflict.
+        out["goals"] = [{"id": g["id"]} for g in rec["goals"]]
+        out["key_results"] = member_goals.key_result_shape(rec["key_results"])
+        # The whole records, ids and readings included, for the card's Undo to
+        # put back; only their ids are compared (:func:`comparable_state`).
+        out[KR_RECORDS_KEY] = [dict(k) for k in rec["key_results"]]
+    return out
+
+
 def _sync_read_state(
     kind: str, params: dict[str, Any], evidence: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -2160,6 +2314,12 @@ def _sync_read_state(
             "member_id": getattr(agent, "member_id", "") or "",
             "fields": {k: _jsonable(getattr(agent, k, None)) for k in p["fields"]},
         }
+    if kind in (
+        catalog.KIND_CREWMATE_GOAL,
+        catalog.KIND_CREWMATE_KEY_RESULTS,
+        catalog.KIND_CREWMATE_CHECK_INS,
+    ):
+        return _goal_state(p["member"], kind)
     if kind == catalog.KIND_TEMPLATE_UPDATE:
         from kiro_crew.dashboard.handlers.agents import _agent_detail_candidates
 
@@ -2430,9 +2590,12 @@ async def read_state(
         return {"exists": True, "steering_dirs": catalog.string_items(folder.get("steering_dirs"))}
     if kind == catalog.KIND_TEMPLATE_UPDATE and "skills" in (params.get("fields") or {}):
         return await asyncio.to_thread(_template_state_with_skills, params, state)
-    if kind == catalog.KIND_CREWMATE_CREATE and len(evidence) > 1:
+    # A legacy-shaped create card made its schedule at step 1, the current one at
+    # step 2: the evidence says which (the same index its Undo deletes).
+    schedule_step = catalog._create_schedule_index(evidence)
+    if kind == catalog.KIND_CREWMATE_CREATE and len(evidence) > schedule_step:
         base = await asyncio.to_thread(_sync_read_state, kind, params, evidence[:1])
-        job = await state.crons.get_job_async(str(evidence[1].get("id")))
+        job = await state.crons.get_job_async(str(evidence[schedule_step].get("id")))
         schedule = _cron_job_revision(job) if job is not None else None
         return {**base, "schedule_exists": job is not None, "schedule": schedule}
     return await asyncio.to_thread(_sync_read_state, kind, params, evidence)
@@ -2502,6 +2665,12 @@ async def read_context(
     p = params
     if kind == catalog.KIND_CREWMATE_UPDATE:
         return {"label": await asyncio.to_thread(_crewmate_label, p["name"])}
+    if kind in (
+        catalog.KIND_CREWMATE_GOAL,
+        catalog.KIND_CREWMATE_KEY_RESULTS,
+        catalog.KIND_CREWMATE_CHECK_INS,
+    ):
+        return {"label": await asyncio.to_thread(_crewmate_label, p["member"])}
     if kind == catalog.KIND_SETTING_CHANGE:
         target = await asyncio.to_thread(resolve_setting, p)
         check_target_params(target, p)

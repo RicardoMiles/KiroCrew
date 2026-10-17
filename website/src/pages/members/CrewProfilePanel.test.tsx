@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { unregisteredMarkers } from '../../test/guideTargets'
-import { render, screen, fireEvent, within, act, waitFor } from '@testing-library/react'
+import { cleanup, render, screen, fireEvent, within, act, waitFor } from '@testing-library/react'
 import type { MemberRosterRow } from '../../api/client'
+import type { LegacyGoalLoop, StructuredMonitor } from '../../monitoring/automation'
 import type { CronJob } from '../../types'
 
 /* The crewmate's profile card (crewmate-panel IA), in isolation from the page
@@ -18,11 +19,15 @@ import type { CronJob } from '../../types'
  *   - Escape pops a pushed page first and closes the card second.
  */
 
-vi.mock('../../components/CrewStateAvatar', () => ({
-  default: ({ seed }: { seed: string }) => <span data-testid="avatar-stub">{seed}</span>,
+vi.mock('../../components/crew/CrewMonitoredAvatar', () => ({
+  default: ({ seed, automation }: { seed: string; automation?: unknown }) => (
+    <span data-testid="avatar-stub" data-monitor-active={automation ? 'true' : 'false'}>{seed}</span>
+  ),
 }))
 
-import CrewProfilePanel, { PROFILE_TABS } from './CrewProfilePanel'
+import { useContext } from 'react'
+import { createPortal } from 'react-dom'
+import CrewProfilePanel, { PROFILE_TABS, ProfilePagePushContext } from './CrewProfilePanel'
 
 const member = (overrides: Partial<MemberRosterRow> = {}): MemberRosterRow => ({
   name: 'oncall', slug: 'oncall', bound: true, slot_key: 'member-oncall', running: false,
@@ -36,6 +41,24 @@ const JOBS: CronJob[] = [
   { id: 'j1', name: 'triage new issues', message: 'go', enabled: true, schedule: '0 9 * * *', last_status: 'ok', next_run_ts: NOW + 600 } as CronJob,
   { id: 'j2', name: 'weekly digest', message: 'go', enabled: false, schedule: 'every 7d', last_status: '' } as CronJob,
 ]
+
+const ACTIVE_MONITOR: StructuredMonitor = {
+  kind: 'structured_monitor', id: 'monitor-1', slotKey: 'member-oncall', active: true,
+  actionable: true, version: 1, monitorKind: 'github_pull_request', objective: 'review_ready',
+  target: 'https://github.com/kirodotdev/KiroCrew/pull/42', createdAt: NOW - 3600,
+  cadenceSecs: 300, nextProbeAt: NOW + 300, wakeInstructions: '',
+  budgets: { maxRuntimeSecs: 14_400, maxAgentTurns: 8, maxTokens: 250_000, maxProviderErrors: 3 },
+  latest: { classification: 'pending', reasonCode: 'checks_pending', observedAt: NOW - 30, decision: 'no_change' },
+  usage: { probes: 5, wakes: 1, agentTurns: 1, inputTokens: 120, outputTokens: 20, providerErrors: 0, tokenUsageKnown: true },
+  action: { wakeInFlight: false, wakeDelivery: '' }, terminal: null,
+}
+
+const WORK_LEDGER_MONITOR: LegacyGoalLoop = {
+  kind: 'legacy_goal_loop', id: 'ledger-1', slotKey: 'member-oncall', message: '',
+  createdAt: NOW - 1200, idleSecs: 600, maxCycles: 300, cycleCount: 9,
+  active: true, lastFireAt: NOW - 600, nextDueAt: NOW + 600,
+  maxRuntimeSecs: 86_400, stoppedReason: '', monitorOutcome: '', monitorKind: 'work-ledger',
+}
 
 type Handlers = {
   onClose: ReturnType<typeof vi.fn>
@@ -56,6 +79,8 @@ function setup(overrides: Partial<Parameters<typeof CrewProfilePanel>[0]> = {}):
     <CrewProfilePanel
       member={member()}
       running={false}
+      automation={null}
+      monitorReadState="ready"
       description="Watches the on-call queue and files what it finds. Escalates only when a page has gone unanswered."
       memoryLabel="Private to this crewmate"
       schedules={JOBS}
@@ -64,6 +89,7 @@ function setup(overrides: Partial<Parameters<typeof CrewProfilePanel>[0]> = {}):
       newScheduleBody={<div data-testid="host-create-form">host form</div>}
       sessionsBody={<div data-testid="host-sessions">host sessions</div>}
       notesBody={<div data-testid="host-notes">host notes</div>}
+      goalsBody={<div data-testid="host-goals">host goals</div>}
       // Most cases read the Profile tab's body; the card's own default is the
       // strip's first tab (Sessions), which the rail cases assert explicitly.
       initialTab="profile"
@@ -127,6 +153,145 @@ describe('CrewProfilePanel rail (Tablist labels="active")', () => {
 })
 
 describe('CrewProfilePanel Profile tab', () => {
+  it('shows exact active monitor details and no controls', () => {
+    setup({ automation: ACTIVE_MONITOR })
+    const details = screen.getByTestId('crew-profile-monitor')
+    expect(details).toHaveAttribute('data-monitor-active', 'true')
+    expect(details).toHaveTextContent('Active')
+    expect(details).toHaveTextContent('Pull request')
+    expect(details).toHaveTextContent('https://github.com/kirodotdev/KiroCrew/pull/42')
+    expect(details).toHaveTextContent('5m')
+    expect(details).toHaveTextContent('5 / No limit')
+    expect(details).toHaveTextContent('1h / 4h')
+    expect(within(details).queryByRole('button')).toBeNull()
+    expect(within(details).queryByRole('textbox')).toBeNull()
+    expect(within(details).queryByRole('link')).toBeNull()
+    expect(screen.getByTestId('avatar-stub')).toHaveAttribute('data-monitor-active', 'true')
+  })
+
+  it('shows exact work-ledger cycle and budget values', () => {
+    setup({ automation: WORK_LEDGER_MONITOR })
+    const details = screen.getByTestId('crew-profile-monitor')
+    expect(details).toHaveAttribute('data-monitor-active', 'true')
+    expect(details).toHaveTextContent('Task list')
+    expect(details).toHaveTextContent('10m')
+    expect(details).toHaveTextContent('9 / 300')
+    expect(details).toHaveTextContent('20m / 24h')
+  })
+
+  it('keeps a stopped legacy loop readable without an active avatar', () => {
+    setup({ automation: { ...WORK_LEDGER_MONITOR, active: false, cycleCount: 300, stoppedReason: 'cycle_cap' } })
+    const details = screen.getByTestId('crew-profile-monitor')
+    expect(details).toHaveAttribute('data-monitor-active', 'false')
+    expect(details).toHaveTextContent('Stopped')
+    expect(details).toHaveTextContent('300 / 300')
+    expect(details).toHaveTextContent('Unknown / 24h')
+    expect(details).toHaveTextContent('Check limit reached')
+  })
+
+  it('shows no monitor as one explicit state without inventing details', () => {
+    setup({ automation: null, monitorReadState: 'ready' })
+    const details = screen.getByTestId('crew-profile-monitor')
+    expect(details).toHaveTextContent('Not watching anything')
+    expect(within(details).queryByText('Type')).toBeNull()
+    expect(details).not.toHaveTextContent('—')
+    expect(within(details).queryByRole('alert')).toBeNull()
+  })
+
+  it('shows loading as a check, not as an error', () => {
+    setup({ automation: null, monitorReadState: 'loading' })
+    const details = screen.getByTestId('crew-profile-monitor')
+    expect(details).toHaveTextContent('Checking monitor status…')
+    expect(within(details).queryByText('Type')).toBeNull()
+    expect(within(details).queryByRole('alert')).toBeNull()
+  })
+
+  it('shows a stopped runtime budget as fully used', () => {
+    setup({ automation: { ...WORK_LEDGER_MONITOR, active: false, stoppedReason: 'runtime_budget' } })
+    expect(screen.getByTestId('crew-profile-monitor')).toHaveTextContent('24h / 24h')
+  })
+
+  it('uses a generic label for an unknown stop reason', () => {
+    setup({ automation: { ...WORK_LEDGER_MONITOR, active: false, stoppedReason: 'future_reason' } })
+    const details = screen.getByTestId('crew-profile-monitor')
+    expect(details).toHaveTextContent('Stopped')
+    expect(details).not.toHaveTextContent('future_reason')
+  })
+
+  it('fails closed when monitor state cannot be read', () => {
+    setup({ automation: ACTIVE_MONITOR, monitorReadState: 'error' })
+    const details = screen.getByTestId('crew-profile-monitor')
+    expect(details).toHaveAttribute('data-monitor-active', 'false')
+    expect(within(details).getByRole('alert')).toHaveTextContent('Monitor status unavailable')
+    expect(details).not.toHaveTextContent('Tries again')
+    expect(within(details).queryByText('Type')).toBeNull()
+  })
+
+  it('does not promise reconnect recovery for an unsupported monitor', () => {
+    setup({ automation: { ...ACTIVE_MONITOR, actionable: false }, monitorReadState: 'ready' })
+    const details = screen.getByTestId('crew-profile-monitor')
+    expect(details).toHaveTextContent('Monitor status unavailable')
+    expect(details).not.toHaveTextContent('Tries again when reconnected')
+  })
+
+  it.each([
+    ['session_start_failures', 'The session could not start'],
+    ['session_unavailable', 'The session could not start'],
+    ['structural_terminal', 'The last cycle failed'],
+    ['model_refused', 'The last cycle failed'],
+    ['interrupted_cycle', 'The last cycle failed'],
+    ['sentinel_dropped', 'The monitor could not continue'],
+    ['consecutive_failures', 'The last cycle failed'],
+  ])('shows failure stop %s through the error notice', (stoppedReason, message) => {
+    setup({ automation: { ...WORK_LEDGER_MONITOR, active: false, stoppedReason } })
+    const details = screen.getByTestId('crew-profile-monitor')
+    expect(within(details).getByRole('alert')).toHaveTextContent(message)
+  })
+
+  it.each([
+    ['user_stop', 'user_stop', 'You stopped it', false],
+    ['success', '', 'The watch finished', false],
+    ['budget', 'agent_turn_budget', 'Budget reached', false],
+    ['session_close', 'session_close', 'Session closed', false],
+    ['target_unavailable', 'not_found', 'Target unavailable', true],
+    ['blocked', 'future_block_reason', 'The monitor could not continue', true],
+    ['blocked', 'completion_evidence_unavailable', 'The monitor could not continue', true],
+  ])('keeps structured %s terminal evidence readable', (outcome, reason, message, failed) => {
+    setup({
+      automation: {
+        ...ACTIVE_MONITOR,
+        active: false,
+        terminal: { outcome, reason, stoppedAt: NOW },
+      },
+    })
+    const details = screen.getByTestId('crew-profile-monitor')
+    const rendered = failed ? within(details).getByRole('alert') : details
+    expect(rendered).toHaveTextContent(message)
+  })
+
+  it('never renders the prompt, wake text, banner, sentinel path or session key', () => {
+    setup({
+      automation: { ...ACTIVE_MONITOR, slotKey: 'member-SESSION-MARKER', wakeInstructions: 'WAKE-MARKER' },
+    })
+    const leaks = ['WAKE-MARKER', 'PROMPT-MARKER', 'BANNER-MARKER', 'SENTINEL-MARKER', 'SESSION-MARKER']
+    const structured = screen.getByTestId('crew-profile-monitor').textContent ?? ''
+    cleanup()
+    setup({
+      automation: {
+        ...WORK_LEDGER_MONITOR,
+        slotKey: 'member-SESSION-MARKER',
+        message: 'PROMPT-MARKER',
+        stopSentinelPath: '/tmp/SENTINEL-MARKER',
+        judge: { wake_when: 'WAKE-MARKER BANNER-MARKER' },
+      },
+    })
+    const legacy = screen.getByTestId('crew-profile-monitor').textContent ?? ''
+    for (const marker of leaks) {
+      expect(structured).not.toContain(marker)
+      expect(legacy).not.toContain(marker)
+    }
+  })
+
   it('is a summary with doors: description, memory, workspace folder, notes', () => {
     const h = setup()
     expect(screen.getByTestId('crew-profile-name')).toHaveTextContent('oncall')
@@ -186,6 +351,28 @@ describe('CrewProfilePanel Profile tab', () => {
     setup({ description: '' })
     expect(screen.getByTestId('crew-profile-about')).toHaveTextContent(/No description yet/)
     expect(screen.queryByTestId('crew-profile-read-more')).toBeNull()
+  })
+
+  it('shows the long-term goal under About when there is no description', () => {
+    setup({ description: '', goal: 'Keep the release notes current' })
+    const about = screen.getByTestId('crew-profile-about')
+    expect(screen.getByTestId('crew-profile-goal-fallback')).toHaveTextContent('Keep the release notes current')
+    expect(about).toHaveTextContent('From the goal')
+    expect(about).not.toHaveTextContent(/No description yet/)
+  })
+
+  it('says the goal could not be loaded instead of claiming there is no description', () => {
+    setup({ description: '', goal: '', goalError: true })
+    const notice = screen.getByTestId('crew-profile-goal-error')
+    expect(notice).toHaveAttribute('role', 'alert')
+    expect(notice).toHaveTextContent("Couldn't load the goals.")
+    expect(screen.queryByText('No description yet')).toBeNull()
+  })
+
+  it('prefers the description over the goal when both exist', () => {
+    setup({ description: 'Watches the on-call queue', goal: 'Keep the release notes current' })
+    expect(screen.getByTestId('crew-profile-description')).toHaveTextContent('Watches the on-call queue')
+    expect(screen.queryByTestId('crew-profile-goal-fallback')).toBeNull()
   })
 
   it('shows the shared actionable error when the initial description read fails', () => {
@@ -264,13 +451,13 @@ describe('CrewProfilePanel Schedules tab', () => {
 })
 
 describe('CrewProfilePanel other tabs', () => {
-  it('Sessions shows the host\'s driving list; Goals is coming soon; there is no Computer tab', () => {
+  it('Sessions shows the host\'s driving list; Goals shows the host\'s goals; there is no Computer tab', () => {
     setup()
     fireEvent.click(tab('Sessions'))
     expect(screen.getByTestId('host-sessions')).toBeInTheDocument()
     fireEvent.click(tab('Goals'))
-    expect(screen.getByTestId('crew-profile-goals-soon')).toHaveTextContent(/coming soon/i)
-    expect(screen.queryByRole('textbox')).toBeNull()
+    expect(screen.getByTestId('host-goals')).toBeInTheDocument()
+    expect(screen.queryByTestId('crew-profile-goals-soon')).toBeNull()
     expect(screen.queryByRole('tab', { name: 'Computer' })).toBeNull()
   })
 })
@@ -342,5 +529,30 @@ describe('CrewProfilePanel closing', () => {
     act(() => { proceed() })
     await waitFor(() => expect(screen.queryByTestId('crew-profile-page-new-schedule')).toBeNull())
     expect(screen.getByTestId('crew-profile-pane-schedule')).toBeInTheDocument()
+  })
+})
+
+describe('CrewProfilePanel tab pages', () => {
+  function GoalsStub({ onPop }: { onPop: () => void }) {
+    const push = useContext(ProfilePagePushContext)
+    return (
+      <>
+        <button type="button" onClick={() => push?.open('Milestone A', onPop)}>open page</button>
+        {push?.host ? createPortal(<div data-testid="stub-page">page body</div>, push.host) : null}
+      </>
+    )
+  }
+
+  it('pushes a tab page over the card with its title, and back hands it back to the tab', async () => {
+    const onPop = vi.fn()
+    const h = setup({ initialTab: 'goals', goalsBody: <GoalsStub onPop={onPop} /> })
+    fireEvent.click(screen.getByRole('button', { name: 'open page' }))
+    expect(await screen.findByTestId('stub-page')).toBeInTheDocument()
+    expect(screen.getByTestId('crew-profile-pushed-title')).toHaveTextContent('Milestone A')
+    expect(screen.getByTestId('crew-profile-back')).toHaveTextContent('oncall')
+    fireEvent.click(screen.getByTestId('crew-profile-back'))
+    expect(h.onRequestBack).toHaveBeenCalledTimes(1)
+    expect(onPop).toHaveBeenCalledTimes(1)
+    await waitFor(() => expect(screen.queryByTestId('crew-profile-pushed-title')).toBeNull())
   })
 })

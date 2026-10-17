@@ -41,6 +41,7 @@ from kiro_crew.instances.constants import DEFAULT_SSM_MINT_TIMEOUT_SECS
 from kiro_crew.instances.token_mint import (
     _OUTPUT_TAIL_CHARS,
     TokenMintError,
+    _mint_timeout_advice,
     _redacted_output_tail,
     _token_subcommand,
     _validate_port,
@@ -182,7 +183,12 @@ async def mint_remote_token_ssm(
     try:
         result = await _send_over_ssm(target, remote_command, profile, region, run_as, timeout_secs)
     except asyncio.TimeoutError as e:
-        raise TokenMintError(f"timed out minting token on {target} over SSM") from e
+        raise TokenMintError(
+            f"timed out minting token on {target} over SSM (polling budget {timeout_secs}s); "
+            f"the send-command invocation had not finished when the budget ran out. "
+            f"SSM command dispatch may be slow, or the target may not be answering "
+            f"(check that its SSM agent is online). {_mint_timeout_advice(timeout_secs)}"
+        ) from e
     except SsmValidationError as e:
         raise TokenMintError(f"invalid SSM settings for {target}: {e}") from e
     except Exception as e:  # AWSError etc. from the aws chokepoint

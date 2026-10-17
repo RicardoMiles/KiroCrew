@@ -210,10 +210,14 @@ def test_every_turn_open_site_is_gated_on_the_shutdown_state() -> None:
             continue
         tree = ast.parse(text)
         for node in ast.walk(tree):
+            # A bare ``TurnDriver(...)`` or one read off a module (``facade.TurnDriver(...)``,
+            # how a composed owner reaches a name tests patch on its facade).
             if not (
                 isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "TurnDriver"
+                and (
+                    (isinstance(node.func, ast.Name) and node.func.id == "TurnDriver")
+                    or (isinstance(node.func, ast.Attribute) and node.func.attr == "TurnDriver")
+                )
             ):
                 continue
             sites += 1
@@ -262,8 +266,13 @@ def test_every_pipeline_channel_stop_path_records_the_stop() -> None:
     compaction replay blind to a Stop issued in the reset gap."""
     root = Path(__file__).resolve().parents[1] / "src/kiro_crew"
     checked: list[str] = []
+    # A channel's dispatcher is its facade and the owners beside it (``transport_dispatch_*``),
+    # judged as one text.
     for path in sorted(root.glob("*/transport_dispatch.py")):
-        source = path.read_text(encoding="utf-8")
+        source = "\n".join(
+            p.read_text(encoding="utf-8")
+            for p in [path, *sorted(path.parent.glob("transport_dispatch_*.py"))]
+        )
         if "drive_turn(" not in source:
             continue
         cancels_directly = "cancel(wait_ack_timeout=0)" in source

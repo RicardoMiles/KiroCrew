@@ -197,6 +197,9 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post(
         "/api/agent-panel/dashboard/write", _deferred("agent_panel", "api_dashboard_write")
     )
+    app.router.add_post(
+        "/api/agent-panel/dashboard/save", _deferred("agent_panel", "api_dashboard_save")
+    )
     app.router.add_get(
         "/api/agent-panel/dashboard/types", _deferred("agent_panel", "api_dashboard_types")
     )
@@ -225,6 +228,21 @@ def _register_mcp_routes(app: web.Application) -> None:
     app.router.add_post(
         "/api/members/{slug}/dashboard/lock",
         _deferred("member_dashboard", "api_member_dashboard_lock"),
+    )
+    # The gap refetch: a page that cannot place a patch in order asks for the whole
+    # read. A strict suffix of the ``/dashboard`` read path, separated by METHOD, so
+    # the resolver needs no ordering between them.
+    app.router.add_post(
+        "/api/members/{slug}/dashboard/refetch",
+        _deferred("member_dashboard", "api_member_dashboard_refetch"),
+    )
+    app.router.add_post(
+        "/api/members/{slug}/dashboard/preview/apply",
+        _deferred("member_dashboard", "api_member_dashboard_preview_apply"),
+    )
+    app.router.add_post(
+        "/api/members/{slug}/dashboard/preview/discard",
+        _deferred("member_dashboard", "api_member_dashboard_preview_discard"),
     )
     # UI guides (``kirocrew-guide``). The agent half is MCP-only and sits under
     # the strict "/api/guide/agent" prefix; the browser half is cookie-authed and
@@ -260,6 +278,52 @@ def _register_mcp_routes(app: web.Application) -> None:
         ("POST", "/api/members/{slug}/self-changes/{change_id}/undo", "api_member_self_undo"),
     ):
         app.router.add_route(_method, _path, _deferred("member_self", _name))
+    # A crewmate's goals (``member_goals``). The Goals tab's half is owner-only
+    # cookie auth under the member's own "/api/members/{slug}"; the crewmate's
+    # half (the kirocrew-mate goal tools) is MCP-only under the strict
+    # "/api/member/self" prefix, like update_self.
+    for _method, _path, _name in (
+        ("GET", "/api/members/{slug}/goals", "api_member_goals_get"),
+        (
+            "DELETE",
+            "/api/members/{slug}/goals/key-results/{kr_id}",
+            "api_member_goals_key_result_delete",
+        ),
+        (
+            "POST",
+            "/api/members/{slug}/goals/key-results/{kr_id}/restore",
+            "api_member_goals_key_result_restore",
+        ),
+        (
+            "DELETE",
+            "/api/members/{slug}/goals/items/{goal_id}",
+            "api_member_goals_goal_delete",
+        ),
+        (
+            "POST",
+            "/api/members/{slug}/goals/items/{goal_id}/restore",
+            "api_member_goals_goal_restore",
+        ),
+        ("POST", "/api/member/self/goals/read", "api_member_self_goals_read"),
+        ("POST", "/api/member/self/goals/key-result", "api_member_self_key_result"),
+        ("POST", "/api/member/self/goals/report", "api_member_self_goal_report"),
+    ):
+        app.router.add_route(_method, _path, _deferred("member_goals", _name))
+    # Spelled with ``add_put``: the ``crewmate.goal``, ``crewmate.key_results``
+    # and ``crewmate.check_ins`` cards apply and undo through these routes, and
+    # the card hook's route list is pinned against them.
+    app.router.add_put(
+        "/api/members/{slug}/goals/long-term",
+        _deferred("member_goals", "api_member_goals_long_term"),
+    )
+    app.router.add_put(
+        "/api/members/{slug}/goals/key-results",
+        _deferred("member_goals", "api_member_goals_key_results"),
+    )
+    app.router.add_put(
+        "/api/members/{slug}/goals/schedules",
+        _deferred("member_goals", "api_member_goals_schedules"),
+    )
     # Change cards. Same split as the guide: the agent half is MCP-only under the
     # strict "/api/cards/agent" prefix, the browser half is owner-only cookie auth.
     # The paths are duplicated from ``change_cards.register_change_card_routes``,
@@ -359,6 +423,10 @@ def _register_mcp_routes(app: web.Application) -> None:
     )
     app.router.add_post(
         "/api/session-control/revive", _deferred("session_control", "api_session_control_revive")
+    )
+    app.router.add_get(
+        "/api/session-control/history",
+        _deferred("session_control", "api_session_control_history"),
     )
     app.router.add_post(
         "/api/session-control/send", _deferred("session_control", "api_session_control_send")

@@ -37,6 +37,7 @@ from kiro_crew.deploy import profiles as profiles_mod
 from kiro_crew.deploy.render import render_standalone
 from kiro_crew.deploy.scan import Finding, is_credential_finding, scan_content, summarize
 from kiro_crew.publish_governance import DEPLOY_WEB_PROVIDER_ID, publish_denied_reason
+from kiro_crew.sandbox import SandboxUnavailableError
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 from kiro_crew.validation import FieldSpec, ValidationError, validate_field
@@ -284,6 +285,11 @@ _ARTIFACT_SLUG_SPEC = FieldSpec(name="artifact_slug", type=str, max_len=128, pat
 # Pre-publish scan: skip files larger than this (likely binary/media) when
 # scanning a local_dir's full contents.
 _SCAN_SIZE_LIMIT = 2 * 1024 * 1024  # 2 MiB
+
+# Size cap on a local_dir tree, measured before staging. `_do_deploy` refuses a
+# bigger tree before copying it, and `_handle_pending_confirm` applies the same
+# cap at confirm time.
+_MAX_STAGE_BYTES = 200 * 1024 * 1024  # 200 MiB
 
 
 def _safe_resolve(p: Path) -> Path:
@@ -970,19 +976,7 @@ async def _do_deploy(params: dict[str, Any]) -> tuple[int, dict[str, Any]]:
 
             # TOCTOU defense — stage an immutable snapshot before scan+deploy.
             # Size guard: refuse trees > 200 MiB before copying.
-            _MAX_STAGE_BYTES = 200 * 1024 * 1024
-
-            def _compute_tree_size(root: Path) -> int:
-                total = 0
-                for p in root.rglob("*"):
-                    if p.is_file():
-                        try:
-                            total += p.stat().st_size
-                        except OSError:
-                            pass
-                return total
-
-            tree_size = await asyncio.to_thread(_compute_tree_size, src)
+            tree_size = await asyncio.to_thread(_compute_tree_size_global, src)
             if tree_size > _MAX_STAGE_BYTES:
                 return 400, {"error": f"local_dir tree exceeds 200 MiB ({tree_size} bytes)"}
 
@@ -1861,7 +1855,33 @@ async def _handle_pricing(request: web.Request) -> web.Response:
 async def _handle_profiles_get(_request: web.Request) -> web.Response:
     """Registry + AWS-CLI-discovered profile names (names only, read-only)."""
     reg = await asyncio.to_thread(profiles_mod.load_registry)
-    discovered = await asyncio.to_thread(profiles_mod.discover_aws_profiles)
+    try:
+        discovered = await asyncio.to_thread(profiles_mod.discover_aws_profiles)
+    except SandboxUnavailableError as exc:
+        # Discovery spawns the AWS CLI through wrap_argv, and on a host with no
+        # sandbox backend (`unshare` EPERM) and allow_unsandboxed_exec unset
+        # that raises. SandboxUnavailableError subclasses RuntimeError -- the
+        # shape nothing here caught -- so it escaped and aiohttp answered its
+        # bare "Server got itself in trouble" 500. This is the one degraded
+        # cause no retry clears, so it must not be an anonymous 500: answer the
+        # typed 503 the chat path renders for the same condition
+        # (dashboard/handlers/agents.py api_models), carrying the machine
+        # -readable code plus the probe detail and remedy the exception has.
+        logger.warning(
+            "deploy-web: profile discovery refused by the sandbox "
+            "(kind=%s, detail=%s); returning 503. Retrying will not clear this.",
+            exc.kind, exc.detail,
+        )
+        return web.json_response(
+            {
+                "error": "profile discovery unavailable: no sandbox backend on this host",
+                "code": "sandbox_unavailable",
+                "kind": exc.kind,
+                "detail": exc.detail,
+                "remedy": exc.remedy,
+            },
+            status=503,
+        )
     registered = {p["name"] for p in reg["profiles"]}
     # The blocking credential-redaction rule applies to EVERY
     # profile-related string in the response -- `default` and the discovered
@@ -2502,10 +2522,9 @@ async def _handle_pending_confirm(request: web.Request) -> web.Response:
                    error=confinement_error)
             return web.json_response({"error": confinement_error}, status=409)
 
-        # Size guard (same _MAX_STAGE_BYTES as deploy path).
-        _MAX_STAGE_BYTES_CONFIRM = 200 * 1024 * 1024
+        # Size guard, the same _MAX_STAGE_BYTES cap as the deploy path.
         tree_size = await asyncio.to_thread(_compute_tree_size_global, local_path)
-        if tree_size > _MAX_STAGE_BYTES_CONFIRM:
+        if tree_size > _MAX_STAGE_BYTES:
             await asyncio.to_thread(add_pending, entry)
             _audit("pending_confirm", entry_id, "denied",
                    error=f"size guard exceeded ({tree_size} bytes)")

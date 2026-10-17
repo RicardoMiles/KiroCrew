@@ -423,7 +423,7 @@ command installed on `PATH`.
 Optional extras. Kiro Crew is not on PyPI, so `pip install "kirocrew[voice]"`
 cannot resolve — install an extra's own distributions into the environment that
 runs the gateway instead (e.g. `pip install 'boto3>=1.34,<2'
-'amazon-transcribe>=0.6,<1' 'pywhispercpp>=1.5,<2'` for `voice`). The dashboard
+'amazon-transcribe>=0.6.3,<1' 'pywhispercpp>=1.5,<2'` for `voice`). The dashboard
 prints the exact command, already pointed at the right interpreter.
 
 | Extra | Adds | For |
@@ -574,6 +574,16 @@ The desktop app bundles its own kiro-cli by default (`BUNDLE_KIRO_CLI=1` at
 build time). That copy is not on your shell `PATH`, so the **Set up Kiro** page
 serves the login command with the bundled binary's absolute path; run that
 command instead of a bare `kiro-cli login`.
+
+The built-in KAS engine is an alternative that needs no Kiro CLI. It is in
+shadow testing: the switch is off by default on every platform and nothing turns
+it on for you. From a source install, `bash install.sh --kas` downloads the
+engine version this release pins; after any other install, `kirocrew kas
+install` does the same. The desktop app ships that engine inside the app
+(`BUNDLE_KAS=1` at build time), so there is nothing to download. To try the
+route, turn on **Use the built-in KAS engine** under Settings → Agent Harness →
+KAS (or `kirocrew config set agent.kas_bundle true`) and restart; you then sign
+in from the dashboard's **Kiro sign-in** card, and `kiro-cli login` is not used.
 
 Then start Kiro Crew:
 

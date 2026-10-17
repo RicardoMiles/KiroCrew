@@ -15,6 +15,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from kiro_crew.subagent import SubagentInfo, SubagentManager
+from kiro_crew.testing.wait import async_wait_until, await_until
 
 
 @pytest.fixture(autouse=True)
@@ -120,7 +121,7 @@ class TestFollowUpDelivery:
         )
         # Simulate the run finishing while the watcher polls.
         info.done = True  # task never in mgr._tasks → both conditions met
-        await asyncio.wait_for(mgr._deliver_followups(info), timeout=2)
+        await await_until(asyncio.ensure_future(mgr._deliver_followups(info)))
         assert len(continues) == 1
         cid, task, kw = continues[0]
         assert cid == "r3"
@@ -153,7 +154,7 @@ class TestFollowUpDelivery:
             mgr._tasks.pop("r4")
 
         pop_task = asyncio.ensure_future(_pop_later())
-        await asyncio.wait_for(mgr._deliver_followups(info), timeout=2)
+        await await_until(asyncio.ensure_future(mgr._deliver_followups(info)))
         await pop_task
         assert continues == ["r4"]
 
@@ -175,7 +176,7 @@ class TestFollowUpDelivery:
             mgr,
             lambda cid, task, **kw: (calls.append(cid), results.pop(0))[1],
         )
-        await asyncio.wait_for(mgr._deliver_followups(info), timeout=2)
+        await await_until(asyncio.ensure_future(mgr._deliver_followups(info)))
         assert len(calls) == 2, "busy result must be retried"
 
     @pytest.mark.asyncio
@@ -205,11 +206,61 @@ class TestFollowUpDelivery:
                 SubagentInfo(id="child", task=task),
             )[1],
         )
-        await asyncio.wait_for(mgr._deliver_followups(info), timeout=2)
+        await await_until(asyncio.ensure_future(mgr._deliver_followups(info)))
         assert continues == []
         assert len(announced) == 1
         assert announced[0].done and "expired" in announced[0].error
         assert announced[0].parent_session_key == "dash:9"
+
+    @pytest.mark.asyncio
+    async def test_an_expired_watcher_stops_counting_as_its_parents_pending_work(
+        self, monkeypatch
+    ) -> None:
+        """The watcher term of the parent's pending-work signal ends at the
+        watcher's deadline.
+
+        The run is finished but its task entry is never popped, so the watcher is
+        the only work the parent is still owed. The parent reads as owing work
+        while the watcher announces its expiry, and as owing none once the
+        watcher exits. A teardown that defers on this signal is therefore held
+        for at most the watcher's deadline plus the announce.
+        """
+        mgr = _manager()
+        _fast(mgr, monkeypatch)
+        mgr._default_timeout = -301  # deadline already in the past
+        parent = "dash:9"
+        announcing = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _on_done(i):
+            announcing.set()
+            await release.wait()
+
+        mgr._on_done = _on_done
+        info = SubagentInfo(id="r-held", task="t", parent_session_key=parent, done=True)
+        mgr._agents[info.id] = info
+        finished: asyncio.Future = asyncio.get_running_loop().create_future()
+        finished.set_result(None)
+        mgr._tasks[info.id] = finished  # type: ignore[assignment]
+        info.pending_followups = ["msg"]
+        mgr._arm_followup_watcher(info)
+        watcher = mgr._followup_watchers[info.id]
+        try:
+            await await_until(announcing, what="the watcher's expiry announce")
+            assert mgr.has_in_memory_pending_work_for(parent)
+            assert await mgr.has_pending_work_for_async(parent)
+
+            release.set()
+            await await_until(watcher, what="the watcher to exit at its deadline")
+            assert info.id not in mgr._followup_watchers
+            assert not mgr.has_in_memory_pending_work_for(parent)
+            assert not await mgr.has_pending_work_for_async(parent)
+        finally:
+            release.set()
+            if not watcher.done():
+                watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+            mgr._tasks.pop(info.id, None)
 
     @pytest.mark.asyncio
     async def test_live_timeout_reduction_keeps_run_deadline(self, monkeypatch) -> None:
@@ -326,7 +377,7 @@ class TestFollowUpDelivery:
                 SubagentInfo(id="child", task=task),
             )[1],
         )
-        await asyncio.wait_for(mgr._deliver_followups(info), timeout=2)
+        await await_until(asyncio.ensure_future(mgr._deliver_followups(info)))
         assert continues == [], "user-stopped work must not be resurrected"
         assert len(announced) == 1 and "suppressed" in announced[0].error
 
@@ -349,7 +400,7 @@ class TestFollowUpDelivery:
             id="x", task="msg", done=True, error="conversation_gone: files pruned"
         )
         _patch_continue(monkeypatch, mgr, lambda cid, task, **kw: failure)
-        await asyncio.wait_for(mgr._deliver_followups(info), timeout=2)
+        await await_until(asyncio.ensure_future(mgr._deliver_followups(info)))
         assert announced == [failure]
 
     @pytest.mark.asyncio
@@ -466,11 +517,8 @@ class TestFollowUpDelivery:
         assert ok
         first_watcher = mgr._followup_watchers.get("r10")
         if first_watcher is not None:  # may have finished + popped itself already
-            await asyncio.wait_for(first_watcher, timeout=2)
-        for _ in range(50):  # let the done-callback run
-            if not info._followup_watcher:
-                break
-            await asyncio.sleep(0.02)
+            await await_until(first_watcher)
+        await async_wait_until(lambda: not info._followup_watcher)
         assert info._followup_watcher is False, "latch must reset with the task"
         assert "r10" not in mgr._followup_watchers
         # A later follow-up arms a NEW watcher and delivers once the run ends.
@@ -487,7 +535,7 @@ class TestFollowUpDelivery:
         ok, _ = await mgr.follow_up_run("r10", "second")
         assert ok and "r10" in mgr._followup_watchers
         info.done = True
-        await asyncio.wait_for(mgr._followup_watchers["r10"], timeout=2)
+        await await_until(mgr._followup_watchers["r10"])
         assert dispatched == ["second"]
 
     @pytest.mark.asyncio
@@ -540,15 +588,12 @@ class TestFollowUpDelivery:
         # Release the announce; the done-callback must re-arm for "second".
         mgr._default_timeout = 3600  # the re-armed watcher gets a real deadline
         slow_gate.set()
-        await asyncio.wait_for(first_watcher, timeout=2)
-        for _ in range(100):
-            if "r11" in mgr._followup_watchers:
-                break
-            await asyncio.sleep(0.01)
+        await await_until(first_watcher)
+        await async_wait_until(lambda: "r11" in mgr._followup_watchers)
         assert "r11" in mgr._followup_watchers, "done-callback must re-arm for the survivor"
         # The re-armed watcher delivers once the run completes.
         info.done = True
-        await asyncio.wait_for(mgr._followup_watchers["r11"], timeout=2)
+        await await_until(mgr._followup_watchers["r11"])
         assert dispatched == ["second"]
 
 

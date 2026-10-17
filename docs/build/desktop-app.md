@@ -203,6 +203,62 @@ for.
 the app then detects a system kiro-cli exactly as before. The Windows installer
 grows by about 190 MB before outer installer compression.
 
+
+### Bundled KAS engine — the `agent.kas_bundle` route with no download
+
+By default (`BUNDLE_KAS=1`), the build stages the KAS engine bundle this release
+PINS (`src/kiro_crew/acp/kas_pin.py`: `KAS_PIN_VERSION` and
+`KAS_PIN_MANIFEST_SHA256`) into the app's resources, so the built-in engine
+route runs with nothing to download and no kiro-cli at all. The staging IS the
+backend's own installer, `acp.kas_bundle.install_bundle`, run from the
+just-built backend tree's interpreter: the manifest's bytes are checked against
+the pin before parsing, every artifact is sha256+size-pinned by that manifest,
+tar extraction uses `filter="data"`, the staged Node answers `--version` on the
+build host, and the tree is published with one rename. The result is
+byte-for-byte what `kirocrew kas install` lays down under the data home, read
+back at build time through the same reader the gateway uses
+(`installed_bundle(root=…)`), so a tree the reader would reject is a build
+error, not a refusal on the user's first prompt.
+
+Layout mirrors the backend trees. A universal macOS build stages one root per
+architecture, `backend-dist/kas-arm64/` and `backend-dist/kas-x64/` (Node ships
+no universal binary; the engine's own JS is shared), a single-arch build stages
+`backend-dist/kas/`. Each root holds `<version>/{bundle,node,install.json}` plus
+a `BUNDLED-VERSION` file beside the version directory. The Electron shell
+(`gateway-env.js`, `bundledKasEnvironment`) reads that file and the install
+record beside it, and exports the root as `KIROCREW_BUNDLED_KAS_DIR` — the
+arch-suffixed root first, the unsuffixed one second, never a root for another
+architecture. It runs nothing at boot: the route is off by default, the build
+already probed the staged Node, and a copy that cannot run on this machine
+fails at session spawn, only for a user who turned the switch on. A build
+without the payload or a source checkout exports nothing, and the backend then
+sees only the data home, exactly as an unbundled build does.
+The two values the shell joins onto the staged tree, the version and the
+record's `node_bin`, must be relative and free of `.`/`..`/empty segments
+(`staysWithinStagedTree`); and because that record chooses a program the shell
+and the gateway run outside any sandbox, the backend seals the exported root
+read-only for every sandboxed child, the same seal as its own packaged install
+tree (`sandbox_tiers._resolved_install_root_targets`; the rules are in the
+[security spec](../system-specs/modules/security.md)).
+
+The backend (`acp.kas_bundle.installed_bundle`) reads the exported root as a
+SECOND root after the data home's `engines/kas`: an operator's own `kirocrew kas
+install` (or a `--unpinned` test install) wins over the copy the app was built
+with, the same precedence `KIROCREW_KIRO_BIN` has over the bundled kiro-cli.
+`kirocrew kas status` and `kirocrew doctor` say which one answered (`built into
+the app`), the status payload carries `installed.bundled`, and the Settings card
+names where each copy came from: "KAS engine … (included with the app)" for the
+app's copy, "KAS engine … (installed by you)" for the data home's.
+
+Bundling the engine does not turn the route on: `agent.kas_bundle` keeps its
+default (off) on every platform while the route is in shadow testing, and the
+app still ships the bundled kiro-cli for the relay route. Nothing in the build,
+the installer or the shell flips the switch; that stays the user's own step. `BUNDLE_KAS=0 make desktop` opts a build out (the payload is ~55 MB
+compressed, ~370 MB extracted per architecture); the switch then needs
+`kirocrew kas install` first, exactly as a pip install does. `KAS_BUNDLE_URL`
+names another manifest host (a mirror serving the same bytes; the pin refuses
+anything else).
+
 ### macOS opt-out and Linux — host-arch-only builds
 
 `UNIVERSAL=0 make desktop` (and every Linux build) produces an installer for
@@ -355,7 +411,7 @@ wholesale so single- and dual-backend layouts both package.
 > "am I the bundled interpreter?" via
 > `platform_compat.is_bundled_interpreter()`
 > (`BUNDLED_BACKEND_DIST_DIRNAME`), which is what stops `pip` from writing
-> into the signed bundle during app builds. `test/test_platform_compat.py`
+> into the signed bundle during app builds. `test/test_platform_compat_pinned_tools.py`
 > pins that constant to both `extraResources` here and
 > `packaging/build-desktop.sh`, so a rename fails a test — update the constant
 > and the packaging layer in the same change.
@@ -841,6 +897,11 @@ Crashpad dump directory (`app.getPath("crashDumps")`) and, on macOS, the user's
   Crashpad handler) is acknowledged and deleted, since nothing else prunes it.
   Unreadable dumps, Electron-shaped strangers and this app's own dumps are
   never deleted.
+- Minidumps that reached `crashes-seen.json` without that check (the first
+  scan's baseline writes them off unread) are swept: each is opened once more,
+  oldest first, within what the fresh artifacts leave of the same 25-file
+  budget, and deleted on the same proof. The state file lists them as swept,
+  so none is opened again.
 
 ### Native window chrome
 
@@ -1359,7 +1420,7 @@ asymmetry is a useful triage question ("how did you start the gateway?") and a
 usable workaround, not evidence that the app is fine.
 
 One caveat worth knowing before concluding the usage string alone fixed it: agent
-shell commands are wrapped by `sandbox_exec_argv` in `src/kiro_crew/sandbox.py`,
+shell commands are wrapped by `sandbox_exec_argv` in `src/kiro_crew/sandbox_argv.py`,
 which `exec`s the target through `/usr/bin/sandbox-exec` and replaces the process
 image. The Seatbelt profile itself is `(allow default)` plus filesystem denies and
 carries **no** network rules, so the sandbox does not block sockets — but whether
@@ -1421,13 +1482,14 @@ ones the packager never reads). The body is optional JSON:
 
 A marker without `updateCommand` turns the updater off, and About shows the
 "updates are managed by …" message naming `managedBy`. A marker with
-`updateCommand` runs the managed lane below instead, and About shows the normal
-update card, with no managed-by message and no copyable command. That lane also
-needs `checkCommand`: without it every check fails with "this managed install
-has no checkCommand", so no update is ever offered or applied
-([#15799](https://github.com/kirodotdev/KiroCrew/issues/15799)). An empty or unparsable body still counts as managed — an
+`updateCommand` (and a `checkCommand`) runs the managed lane below instead, and
+About shows the "managed by …" notice and the copyable command above the regular
+update controls. An empty or unparsable body still counts as managed — an
 operator who dropped the file gets the safe behavior even when the metadata is
-wrong.
+wrong. The build script (`KIROCREW_MANAGED_INSTALL_MARKER`) rejects a marker
+with `updateCommand` but no `checkCommand`: every managed-lane check would fail
+with "this managed install has no checkCommand" and no update would ever be
+offered or applied.
 
 The body is only read when the marker's **provenance** can be established:
 neither the marker nor its directory may be owned by the account the app runs

@@ -17,9 +17,8 @@ projection, and a ``frozenset`` is why they are only two: it carries one bit -- 
 or out -- so nothing about a non-member is legible in the source data, and three
 reasons a reader wants told apart collapse into one absence: cannot do it, does it
 differently, and nobody has measured it. ``ACP_BACKENDS_MEMBER_DISPATCH`` shows the
-collapse: pi is a non-member because a mount there is INERT (the array is accepted
-and never forwarded), kiro is a non-member because it has no per-session channel at
-all, and KAS is a member on a captured mount.
+collapse: kiro is a non-member because it has no per-session channel at all, and
+KAS is a member on a captured mount.
 
 The third level is NOT derived from the sets, because it is not in them. It is
 :data:`DECLARED_UNMEASURED`, a per-harness per-line table carrying a reason per
@@ -182,7 +181,7 @@ from kiro_crew.agent_sdk.backend_mcp_ability import ability_payload
 LINE_CREW_TOOLS = "crew_tools"
 #: A crew-member chat gets the session-control tools mounted.
 LINE_MEMBER_THREAD_TOOLS = "member_thread_tools"
-#: An enrolled member's whole saved agent spec is loaded at spawn.
+#: An enrolled member's saved spec is loaded or projected at spawn.
 LINE_MEMBER_SAVED_AGENT = "member_saved_agent"
 #: A Side Chat turn may execute read-only tools.
 LINE_SIDE_CHAT_TOOLS = "side_chat_tools"
@@ -275,10 +274,18 @@ USER_FACING_LINES: Tuple[_LineSpec, ...] = (
     ),
     _LineSpec(LINE_MEMBER_THREAD_TOOLS, ("ACP_BACKENDS_MEMBER_DISPATCH",)),
     _LineSpec(LINE_SIDE_CHAT_TOOLS, ("ACP_BACKENDS_SIDE_READONLY",)),
-    # Two verbs carry a user's mid-turn message: kiro-cli's ``_session/steer`` and
-    # codex-acp's ``_session/steering``. A user asks "can I add to a running turn?",
-    # and either verb answers yes, so the line is their union.
-    _LineSpec(LINE_MID_TURN_STEER, ("ACP_BACKENDS_STEER", "ACP_BACKENDS_STEERING_REQUEST")),
+    # Three verbs carry a user's mid-turn message: kiro-cli's ``_session/steer``,
+    # codex-acp's ``_session/steering``, and opencode's second ``session/prompt``
+    # that joins the running turn. A user asks "can I add to a running turn?", and
+    # any of them answers yes, so the line is their union.
+    _LineSpec(
+        LINE_MID_TURN_STEER,
+        (
+            "ACP_BACKENDS_STEER",
+            "ACP_BACKENDS_STEERING_REQUEST",
+            "ACP_BACKENDS_STEER_CONCURRENT_PROMPT",
+        ),
+    ),
     _LineSpec(LINE_MANUAL_COMPACT, ("ACP_BACKENDS_COMPACT",)),
     # Effort travels down one of two channels, and neither set alone answers the
     # question a user asks. The config-option members advertise an ``effort``
@@ -500,6 +507,10 @@ OFF_CARD_SETS: Mapping[str, str] = {
     "ACP_BACKENDS_RESUME_WITHOUT_LOAD": (
         "which verb restores a session, and which capability advertises it. The "
         "user reopens a chat either way"
+    ),
+    "ACP_BACKENDS_FORK_AT_MESSAGE": (
+        "whether an edited message's rewind forks the native session or replays "
+        "the transcript as text. The edit runs either way"
     ),
     "ACP_BACKENDS_SELF_SERVED_ACP": (
         "whether a harness's whole launch is a row of ACP_BACKEND_LAUNCH, so the "

@@ -4,21 +4,27 @@
  *  of this. Collapsing a group hides its rows and never changes the selection.
  *  Inside a group the crew's own folders (its spaces) nest its rows, unfiled
  *  rows last: a read-only mirror of the crew's tree, edited on the crew. */
-import { Server } from 'lucide-react'
-import { createContext, useCallback, useState, type ReactNode } from 'react'
+import { Loader, MessageCircleQuestionMark, Server, ShieldCheck } from 'lucide-react'
+import { createContext, useCallback, useMemo, useState, type ReactNode } from 'react'
 import { FolderBody } from '../../components/FolderBody'
 import FolderGlyph from '../../components/FolderGlyph'
 import { orderFoldersWithPaths } from '../../utils/folderTree'
 import type { ChatFolder } from '../../types'
 import type { CrewBadge, CrewGroup, PeerFolder } from '../../hooks/useInstanceSessions'
+import { fmtList } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
+import { tabStatus } from '../../lib/sessionTabs'
+import { useAppDispatch } from '../../store'
+import { switchSlot } from '../../store/chatSlice'
 import { safeSetItem } from '../../utils/safeStorage'
 import ErrorNotice from '../../components/ErrorNotice'
 import { Btn } from '../../components/ui'
 import { CREW_COLLAPSED_LS_KEY, CREW_SPACE_COLLAPSED_LS_KEY, readCollapsedCrews } from './persistence'
+import { opensElsewhereOf } from './rows'
 import type { Slot } from './types'
 
-const HEADER_CLS = 'w-full flex items-center gap-1.5 pl-2 pr-3 pt-3 pb-1 text-[11px] font-semibold text-muted select-none bg-transparent border-none text-left'
+const HEADER_BOX_CLS = 'flex items-center gap-1.5 pl-2 pr-3 pt-3 pb-1 text-[11px] font-semibold text-muted select-none bg-transparent border-none text-left'
+const HEADER_CLS = `w-full ${HEADER_BOX_CLS}`
 
 /** True inside an offline crew group's body, so a row can say it is not
  *  reachable. A context, not a scope suffix: the row scope must stay stable
@@ -123,6 +129,96 @@ export function crewSpaceChain(crew: string, folders: readonly PeerFolder[], fol
   return out
 }
 
+/** A group's rows in the order it draws them: inside each space its subspaces
+ *  first, then its own rows, with the unfiled rows last (`CrewSpaceTree`); flat
+ *  when the group draws no spaces. Every row appears once. */
+export function crewDrawOrder<R extends { peer_folder_id?: string }>(folders: readonly PeerFolder[] | undefined, rows: readonly R[]): readonly R[] {
+  if (!folders?.length) return rows
+  const tree = crewSpaces(folders, rows)
+  const out: R[] = []
+  const walk = (parent: string) => {
+    for (const f of tree.children.get(parent) ?? []) {
+      walk(f.id)
+      out.push(...(tree.rowsIn.get(f.id) ?? []))
+    }
+  }
+  walk('')
+  out.push(...tree.unfiled)
+  return out
+}
+
+/** What a row asks of the user, in urgency order. */
+const CREW_ATTENTION_KINDS = ['approval', 'question', 'working'] as const
+type CrewAttentionKind = typeof CREW_ATTENTION_KINDS[number]
+
+const NO_UNREAD: readonly string[] = []
+
+/** The one kind a row counts toward, in the session tabs' own status order
+ *  (`tabStatus`): an owed approval, then an unanswered question, then a running
+ *  turn. A blocking card keeps the turn running, so the order is what stops one
+ *  row from counting twice. */
+function crewAttentionOf(row: Slot, isRunning: (row: Slot) => boolean): CrewAttentionKind | null {
+  const status = tabStatus({ pending_approval: row.pending_approval, needs_input: row.needs_input, running: isRunning(row) }, NO_UNREAD, row.key)
+  return status === 'permission' ? 'approval' : status === 'question' ? 'question' : status === 'running' ? 'working' : null
+}
+
+export interface CrewAttention {
+  counts: Record<CrewAttentionKind, number>
+  /** The most urgent kind with a row, and that kind's first row in draw order:
+   *  the chat the header's button opens. */
+  kind: CrewAttentionKind
+  target: Slot
+}
+
+/** The header's read-out over the group's shown rows, or null when no row asks
+ *  for anything. */
+export function crewAttention(rows: readonly Slot[], folders: readonly PeerFolder[] | undefined, isRunning: (row: Slot) => boolean): CrewAttention | null {
+  const counts: Record<CrewAttentionKind, number> = { approval: 0, question: 0, working: 0 }
+  const first: Partial<Record<CrewAttentionKind, Slot>> = {}
+  for (const row of crewDrawOrder(folders, rows)) {
+    const kind = crewAttentionOf(row, isRunning)
+    if (!kind) continue
+    counts[kind] += 1
+    first[kind] ??= row
+  }
+  const kind = CREW_ATTENTION_KINDS.find(k => counts[k] > 0)
+  return kind ? { counts, kind, target: first[kind]! } : null
+}
+
+/** What the header's attention button needs from the sidebar: the row model's
+ *  running signal and the actions a row's own click calls, so the button opens
+ *  its chat exactly as that click does. */
+interface CrewAttentionWiring {
+  isRunning: (row: Slot) => boolean
+  /** The gateway connection. While it is down a row click does nothing. */
+  connected: boolean
+  actions: {
+    onOpenPeerSession: (instanceId: string, remoteSlot: string) => void
+    openElsewhere: (path: string) => void
+    onSelectSlot?: (key: string) => void
+  }
+}
+
+const ATTENTION_GLYPH = {
+  approval: <ShieldCheck size={10} className="shrink-0 text-warn" aria-hidden="true" />,
+  question: <MessageCircleQuestionMark size={10} className="shrink-0 text-info" aria-hidden="true" />,
+  // Static: the button names a state, it does not animate one.
+  working: <Loader size={10} className="shrink-0 text-accent" aria-hidden="true" />,
+} satisfies Record<CrewAttentionKind, ReactNode>
+
+const attentionCount = (kind: CrewAttentionKind, count: number): string => (
+  kind === 'approval' ? i18nT('pages.chatSidebar.crew_attention_approval', { count })
+    : kind === 'question' ? i18nT('pages.chatSidebar.crew_attention_question', { count })
+      : i18nT('pages.chatSidebar.crew_attention_working', { count })
+)
+
+/** Where the button goes, named by the kind of chat it opens. */
+const attentionTarget = (kind: CrewAttentionKind): string => (
+  kind === 'approval' ? i18nT('pages.chatSidebar.crew_attention_go_approval')
+    : kind === 'question' ? i18nT('pages.chatSidebar.crew_attention_go_question')
+      : i18nT('pages.chatSidebar.crew_attention_go_working')
+)
+
 /** Enable for a disabled crew, plus the notice for a failed one. The sidebar
  *  holds it, not the group: once the flag is cleared an unreachable crew with no
  *  rows drops out of the groups, and its failure must still be on screen. */
@@ -155,9 +251,11 @@ export function LocalGroupHeader() {
   )
 }
 
-/** One crew's group: header with chevron, name, badge and row count, then its
- *  rows. An offline crew's rows are the last cached answer, drawn dimmed. */
-export function CrewGroupSection({ group, rows, collapsed, onToggle, hideWhenEmpty, chevron, renderRows, onEnable, spaces }: {
+/** One crew's group: header with chevron, name, badge and chat count, then its
+ *  rows. An offline crew's rows are the last cached answer, drawn dimmed. Beside
+ *  the header's toggle, one button says what the shown rows ask of the user and
+ *  opens the most urgent of them. */
+export function CrewGroupSection({ group, rows, collapsed, onToggle, hideWhenEmpty, chevron, renderRows, onEnable, spaces, attention }: {
   group: CrewGroup
   /** The crew's spaces: which are closed, how to toggle one, and the sidebar's
    *  own folder body (its connector line and inset), so a space nests exactly
@@ -173,27 +271,93 @@ export function CrewGroupSection({ group, rows, collapsed, onToggle, hideWhenEmp
   /** True while a filter or search narrows the list: an empty group then hides. */
   hideWhenEmpty: boolean
   renderRows: (rows: Slot[], scope: string) => ReactNode
+  /** Absent, the header draws no attention button. */
+  attention?: CrewAttentionWiring
 }) {
+  const dispatch = useAppDispatch()
+  const drawnFolders = spaces ? group.folders : undefined
+  const isRunning = attention?.isRunning
+  // From the same rows the chat count counts, so a filter moves both together.
+  // No read-out while offline: like the count, the cached rows are not current.
+  const asks = useMemo(
+    () => (isRunning && !group.offline ? crewAttention(rows, drawnFolders, isRunning) : null),
+    [rows, drawnFolders, isRunning, group.offline],
+  )
   if (hideWhenEmpty && rows.length === 0) return null
   const regionId = `crew-group-rows-${group.id}`
+  const shown = asks ? CREW_ATTENTION_KINDS.filter(k => asks.counts[k] > 0) : []
+  // The name is the visible text with its pauses: the target, then the counts.
+  const askLabel = asks
+    ? i18nT('pages.chatSidebar.crew_attention_name', {
+      target: attentionTarget(asks.kind),
+      counts: fmtList(shown.map(k => attentionCount(k, asks.counts[k])), { type: 'unit' }),
+    })
+    : ''
+  // A plain click on the target row (SessionRow's `onClick`), through the same row
+  // actions: nothing while the gateway is down, a peer row as a window onto its
+  // crew, a row whose session lives on another page there, else the local slot.
+  const openTarget = (row: Slot, wiring: CrewAttentionWiring) => {
+    // Through the header's own toggle, so the open group is stored as a click on
+    // the header stores it.
+    if (collapsed) onToggle(group.id)
+    if (!wiring.connected) return
+    if (row.peer_id) { wiring.actions.onOpenPeerSession(row.peer_id, row.key); return }
+    const elsewhere = opensElsewhereOf(row)
+    if (elsewhere) { wiring.actions.openElsewhere(elsewhere); return }
+    dispatch(switchSlot({ key: row.key, announceOnMissing: true }))
+    wiring.actions.onSelectSlot?.(row.key)
+  }
   return (
     <section data-testid={`crew-group-${group.id}`} data-offline={group.offline ? '' : undefined}>
-      <button type="button" aria-expanded={!collapsed} aria-controls={regionId}
-        data-testid={`crew-group-toggle-${group.id}`}
-        onClick={() => onToggle(group.id)}
-        className={`${HEADER_CLS} cursor-pointer hover:text-accent`}>
-        {chevron}
-        <Server size={11} aria-hidden="true" className="shrink-0" />
-        <span className="min-w-0 truncate">{group.name}</span>
-        {group.badge && (
-          <span className={`shrink-0 font-normal ${BADGE_CLS[group.badge]}`}
-            data-testid={`crew-group-badge-${group.id}`} data-badge={group.badge}>
-            {badgeLabel(group.badge)}
-          </span>
+      {/* The row's inset is the crew name's own (the toggle's `pl-2`, the 11px
+       *  chevron and server glyph and their gaps); the toggle cancels it, so where
+       *  the attention button wraps onto a second line it starts under the name. */}
+      <div className="flex flex-wrap items-end pl-[42px]">
+        <button type="button" aria-expanded={!collapsed} aria-controls={regionId}
+          data-testid={`crew-group-toggle-${group.id}`}
+          onClick={() => onToggle(group.id)}
+          className={`${HEADER_BOX_CLS} -ml-[42px] flex-auto min-w-0 cursor-pointer hover:text-accent`}>
+          {chevron}
+          <Server size={11} aria-hidden="true" className="shrink-0" />
+          <span className="min-w-0 truncate">{group.name}</span>
+          {group.badge && (
+            <span className={`shrink-0 font-normal ${BADGE_CLS[group.badge]}`}
+              data-testid={`crew-group-badge-${group.id}`} data-badge={group.badge}>
+              {badgeLabel(group.badge)}
+            </span>
+          )}
+          {/* No count while offline: the cached rows are not a current tally. */}
+          {!group.offline && (
+            <span className="ml-auto shrink-0 font-normal tabular-nums" data-testid={`crew-group-count-${group.id}`}>
+              {i18nT('pages.chatSidebar.crew_group_chats', { count: rows.length })}
+            </span>
+          )}
+        </button>
+        {asks && attention && (
+          // The visible text names the chat the click opens, so it cannot read as
+          // answering the approval it counts; the counts sit behind a rule, as
+          // status, and keep their muted ink on hover while only the target
+          // underlines. Each count leads with its rows' glyph. The target may
+          // wrap: a long translation breaks onto a second line rather than
+          // overflowing.
+          <Btn type="button" onClick={() => openTarget(asks.target, attention)}
+            aria-label={askLabel}
+            data-testid={`crew-group-attention-${group.id}`}
+            className="group mr-3 mb-0.5 min-w-0 flex-wrap gap-x-2 gap-y-0 px-1.5 py-px text-left text-[11px] text-muted tabular-nums">
+            <span className="font-medium text-accent group-hover:underline" data-testid={`crew-group-attention-target-${group.id}`}>
+              {attentionTarget(asks.kind)}
+            </span>
+            <span className="inline-flex flex-wrap items-center gap-x-2 border-l border-border pl-2">
+              {shown.map(k => (
+                <span key={k} className="inline-flex items-center gap-0.5 whitespace-nowrap" data-testid={`crew-group-attention-${k}-${group.id}`}>
+                  {ATTENTION_GLYPH[k]}
+                  {attentionCount(k, asks.counts[k])}
+                </span>
+              ))}
+            </span>
+          </Btn>
         )}
-        {/* No count while offline: the cached rows are not a current tally. */}
-        {!group.offline && <span className="ml-auto shrink-0 font-normal tabular-nums">{rows.length}</span>}
-      </button>
+      </div>
       {/* FolderBody keeps the rows mounted while closed, as folders do, so
        *  keyboard navigation and reveal can still reach them. */}
       <div id={regionId}>

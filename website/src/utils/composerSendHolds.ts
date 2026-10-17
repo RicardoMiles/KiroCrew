@@ -53,6 +53,9 @@ function ownsStoredArrivals(): boolean {
 class ComposerSync {
   private readonly holds = new Map<string, number>()
   private readonly controllers = new Map<string, Set<AbortController>>()
+  /** Each running upload's current slot, so a hand-over moves exactly the
+   *  uploads running at that moment and none started later. */
+  private readonly uploadSlots = new Map<AbortController, string>()
   private readonly arrivals = new Map<string, string[]>()
   private readonly listeners = new Set<() => void>()
   private readonly arrivalListeners = new Map<string, Set<() => void>>()
@@ -184,6 +187,7 @@ class ComposerSync {
     const live = this.controllers.get(slot)
     if (live) live.add(controller)
     else this.controllers.set(slot, new Set([controller]))
+    this.uploadSlots.set(controller, slot)
     this.notify()
   }
 
@@ -192,7 +196,14 @@ class ComposerSync {
     const live = this.controllers.get(slot)
     if (!live?.delete(controller)) return
     if (live.size === 0) this.controllers.delete(slot)
+    this.uploadSlots.delete(controller)
     this.notify()
+  }
+
+  /** The slot this upload belongs to now: where it started, or where a
+   *  hand-over moved it. Undefined once it is unregistered. */
+  composerUploadSlot(controller: AbortController): string | undefined {
+    return this.uploadSlots.get(controller)
   }
 
   cancelComposerUploads(slot: Slot) {
@@ -200,8 +211,32 @@ class ComposerSync {
     this.controllers.get(slot)?.forEach(controller => controller.abort())
   }
 
-  isComposerUploadCancellable(slot: Slot): boolean {
-    return !!slot && (this.controllers.get(slot)?.size ?? 0) > 0
+  /** A slot replaced by another (a memory-mode switch) hands the uploads
+   *  running right now, each with its own Send hold, to the replacement, so
+   *  Send stays held and Cancel stays offered where the user now is. Uploads
+   *  started in `from` later stay in `from`, and so do holds no upload owns. */
+  handOverComposerUploads(from: Slot, to: Slot) {
+    if (!from || !to || from === to) return
+    const live = this.controllers.get(from)
+    if (!live) return
+    this.controllers.delete(from)
+    const target = this.controllers.get(to)
+    if (target) live.forEach(controller => target.add(controller))
+    else this.controllers.set(to, live)
+    live.forEach(controller => this.uploadSlots.set(controller, to))
+    const held = this.holds.get(from) ?? 0
+    const moved = Math.min(held, live.size)
+    if (moved) {
+      if (held === moved) this.holds.delete(from)
+      else this.holds.set(from, held - moved)
+      this.holds.set(to, (this.holds.get(to) ?? 0) + moved)
+    }
+    this.notify()
+  }
+
+  /** How many uploads `cancelComposerUploads(slot)` would abort right now. */
+  composerUploadCount(slot: Slot): number {
+    return slot ? this.controllers.get(slot)?.size ?? 0 : 0
   }
 
   close() {
@@ -222,9 +257,13 @@ let composerSync = createProductionSync()
 export function holdComposerSend(slot: Slot) { composerSync.holdComposerSend(slot) }
 export function releaseComposerSend(slot: Slot) { composerSync.releaseComposerSend(slot) }
 export function isComposerSendHeld(slot: Slot) { return composerSync.isComposerSendHeld(slot) }
+export function landComposerAttachments(slot: Slot, paths: string[]) { composerSync.landComposerAttachments(slot, paths) }
+export function takeComposerArrivals(slot: Slot) { return composerSync.takeComposerArrivals(slot) }
+export function handOverComposerUploads(from: Slot, to: Slot) { composerSync.handOverComposerUploads(from, to) }
 export function finishComposerAttachment(slot: Slot, paths: string[] = []) { composerSync.finishComposerAttachment(slot, paths) }
 export function registerComposerUpload(slot: Slot, controller: AbortController) { composerSync.registerComposerUpload(slot, controller) }
 export function unregisterComposerUpload(slot: Slot, controller: AbortController) { composerSync.unregisterComposerUpload(slot, controller) }
+export function composerUploadSlot(controller: AbortController) { return composerSync.composerUploadSlot(controller) }
 export function cancelComposerUploads(slot: Slot) { composerSync.cancelComposerUploads(slot) }
 
 export function useComposerSendHeld(slot: Slot) {
@@ -249,11 +288,13 @@ export function useComposerArrivals(
   }, [slot, enabled])
 }
 
-export function useComposerUploadCancellable(slot: Slot) {
+/** The live upload count for a slot, as state, so a label that names it
+ *  re-renders when a second upload starts or one of two settles. */
+export function useComposerUploadCount(slot: Slot) {
   return useSyncExternalStore(
     composerSync.subscribe,
-    () => composerSync.isComposerUploadCancellable(slot),
-    () => false,
+    () => composerSync.composerUploadCount(slot),
+    () => 0,
   )
 }
 

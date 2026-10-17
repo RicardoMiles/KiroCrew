@@ -41,6 +41,18 @@ def _admission_modules():
     return sorted(f"subagent_manager/admission/{p.name}" for p in pkg.glob("*.py"))
 
 
+def _artifact_store_modules():
+    """The artifact store's modules: the facade and every ``artifacts_*`` owner."""
+    pkg = Path(ev.__file__).resolve().parent.parent
+    return sorted(p.name for p in pkg.glob("artifacts*.py"))
+
+
+def _cron_service_modules():
+    """Every module ``CronService`` binds its members from, relative to the package root."""
+    pkg = Path(ev.__file__).resolve().parent.parent / "cron_service" / "service"
+    return sorted(f"cron_service/service/{p.name}" for p in pkg.glob("*.py"))
+
+
 def _named(rec, name):
     return [c for c in rec.counters if c["name"] == name]
 
@@ -244,12 +256,12 @@ class TestCallSitesAreWired:
 
     OWNERS = {
         "SUBAGENTS_SPAWNED": "subagent_manager/admission/pump.py",
-        "CRON_FIRES": "cron.py",
-        "ARTIFACTS_CREATED": "artifacts.py",
+        "CRON_FIRES": "cron_service/service/run_execution.py",
+        "ARTIFACTS_CREATED": "artifacts_writes.py",
         "WORKFLOW_RUNS": "workflows/runner.py",
         "CONTEXT_COMPACTIONS": "session_compaction.py",
         "MCP_RECONNECTS": "mcp_gateway/stub.py",
-        "APPROVAL_DECISIONS": "hooks.py",
+        "APPROVAL_DECISIONS": "hook_runtime/hook_types.py",
         "ADAPTIVE_DECISIONS": "adaptive/controller.py",
         # Overload-resilience series (RFC §10). Sampled ones are emitted by the
         # structured health sampler; the recovery ones by the ladder; the
@@ -299,15 +311,20 @@ class TestAttributeValuesAreBounded:
             # leave a sibling's future emit unscanned.
             *_admission_modules(),
             "cron.py",
-            "artifacts.py",
+            *_cron_service_modules(),
+            *_artifact_store_modules(),
             "workflows/runner.py",
             "session_compaction.py",
             "mcp_gateway/stub.py",
             "mcp_gateway/manager.py",
-            "hooks.py",
+            "hook_runtime/hook_types.py",
             "adaptive/controller.py",
             "dashboard/session_health.py",
             "taskq/store.py",
+            "taskq/store_vocab.py",
+            "taskq/store_events.py",
+            "taskq/store_waits.py",
+            "taskq/store_reads.py",
             "recovery/ladder.py",
         ],
     )

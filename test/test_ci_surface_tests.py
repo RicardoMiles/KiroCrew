@@ -87,7 +87,7 @@ _BACKEND_GUARDS = (
     # src/kiro_crew/apps/builtins was added to _BACKEND_ROOTS.
     "src/kiro_crew/apps/builtins/design_critique/tests/test_manifest.py",
     "src/kiro_crew/apps/builtins/crew_companion/tests/test_manifest.py",
-    "src/kiro_crew/apps/builtins/ops_mission_control/tests/test_routes.py",
+    "src/kiro_crew/apps/builtins/ops_mission_control/tests/test_routes_claim_and_slot.py",
 )
 
 _FRONTEND_GUARDS = (
@@ -397,20 +397,50 @@ def test_ignore_list_matches_the_names_conftest_previously_inlined() -> None:
     no-op on NTFS so the stub is never the ``gh`` that resolves. Listing the module
     is how a POSIX-only-by-design suite is stated here; a class-level ``skipif``
     would leave a marker that proves nothing on that shard either.
+
+    ``test_ci_fork_windows_scope_posix.py`` is listed for the same reason: it runs
+    ci.yml's fork Windows scope step under bash inside a throwaway git checkout.
     """
     assert _ignore_names() == {
+        "test_ci_fork_windows_scope_posix.py",
         "test_macos_pool_ceiling_posix.py",
         "test_sandbox_argv.py",
+        "test_sandbox_argv_launcher_plan.py",
+        "test_sandbox_argv_profile.py",
+        "test_sandbox_argv_resource_ceilings.py",
+        "test_sandbox_argv_spawn.py",
         "test_sandbox_cc_mode.py",
         "test_sandbox_hardlink_scan.py",
         "test_sandbox_md_notebook_carveout.py",
         "test_sandbox_nested_tier.py",
         "test_pid_lifecycle.py",
+        "test_pid_lifecycle_browser_daemon.py",
+        "test_pid_lifecycle_orphan_cleanup.py",
+        "test_pid_lifecycle_process_sweeps.py",
+        "test_pid_lifecycle_provider_tree.py",
+        "test_pid_lifecycle_teardown.py",
+        "test_pid_lifecycle_tracking_integrity.py",
         "test_pid_sweep_helpers.py",
         "test_process_tree_kill.py",
         "test_source_providers.py",
         "test_terminal_handler.py",
         "test_acp_client.py",
+        "test_acp_client_binary_resolution.py",
+        "test_acp_client_commands.py",
+        "test_acp_client_compaction.py",
+        "test_acp_client_inbound.py",
+        "test_acp_client_model_entitlement.py",
+        "test_acp_client_model_substitution.py",
+        "test_acp_client_process_lifecycle.py",
+        "test_acp_client_prompt_turn.py",
+        "test_acp_client_session_setup.py",
+        "test_acp_client_settings_restore.py",
+        "test_acp_client_spawn.py",
+        "test_acp_client_stale_turn.py",
+        "test_acp_client_tool_call_updates.py",
+        "test_acp_client_tool_events.py",
+        "test_acp_client_tool_hooks.py",
+        "test_acp_client_transient_errors.py",
         "test_stop_kill_cancel.py",
         "test_app_backend_stale_reap.py",
         "test_env.py",
@@ -425,6 +455,18 @@ def test_ignore_list_matches_the_names_conftest_previously_inlined() -> None:
         "test_file_office_preview.py",
         "test_dashboard_file_io.py",
         "test_dev_fleet_app.py",
+        "test_dev_fleet_app_make_live.py",
+        "test_dev_fleet_app_make_live_cutover.py",
+        "test_dev_fleet_app_trusted_helpers.py",
+        "test_dev_fleet_app_context.py",
+        "test_dev_fleet_app_prune.py",
+        "test_dev_fleet_app_fleet_cache.py",
+        "test_dev_fleet_app_teardown.py",
+        "test_dev_fleet_app_foreground.py",
+        "test_dev_fleet_app_pull_build.py",
+        "test_dev_fleet_app_worktrees.py",
+        "test_dev_fleet_app_sync.py",
+        "test_dev_fleet_app_guards.py",
         "test_pod_windows_boot.py",
     }
 

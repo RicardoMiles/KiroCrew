@@ -26,10 +26,44 @@ Files:
 | Module | Owns |
 |---|---|
 | `model.py` | `TaskRecord`, the state vocabulary (`STATES`), the one validated `TRANSITIONS` table, `check_transition`, side-effect classes, lease/backoff constants. |
-| `store.py` | `TaskStore`: open/journal selection, write-before-ack `accept`, atomic `claim`, generation-fenced writes, `cancel` (from anywhere non-terminal, or conditional on `only_from` / `generation`), `defer`, `expedite` (a deferral ended early, with no event) and `deferred_longer_than`, the owed-report reads (`finish(report_owed=)`, `mark_reported`, `owed_reports`), `task_events`, the window reads. `TaskStoreUnavailable`. Network-filesystem detection. |
+| `store.py` | `TaskStore`, the import path of the store and the class that binds its members from the `store_*` owners below. It keeps open/journal selection and corrupt-file quarantine, the writer thread (`run` / `post`), the unstarted-row index, write-before-ack `accept` / `insert_if_absent` and the lane a new row is filed under (`_lane_in_tx`), atomic `claim` and leases, generation-fenced writes (`transition`, `advance`, `finish`, `record_progress`, `restamp_accepted_by`), `cancel` (from anywhere non-terminal, or conditional on `only_from` / `generation`), the deferral beside `claim` (`defer`, `expedite` (a deferral ended early, with no event) and `deferred_longer_than`, the parked time those two write), the owed-report reads (`finish(report_owed=)`, `mark_reported`, `owed_reports`), `doctor_lines`, and network-filesystem detection. It re-exports `TaskStoreUnavailable`. |
+| `store_vocab.py` | What every owner shares: `TaskStoreUnavailable` (its `__module__` stays `kiro_crew.taskq.store`), `_typed_read` (a read's `sqlite3.Error` becomes `TaskStoreUnavailable`), and the state-set SQL fragments several owners filter on. |
+| `store_events.py` | The `task_events` log: `_append_event_in_tx` (each write's own event), `append_event`, `events`, `latest_events`, `lost_owner_recoveries`. |
+| `store_waits.py` | The wait-row writes and reads behind `waits.WaitLedger`: `enter_wait`, `update_wait`, `wake_wait`, `children_of`, `waiting_rows`, `orphaned_children`. |
+| `store_reads.py` | Row reads: `get`, `state_of`, the dispatch reads (`fetch_dispatchable`, `fetch_dispatchable_fair`, `pending_lanes`, `next_eligible_at`), the pending listings (`list_pending`, `fetch_pending_by_batch`), the counts (`count_pending`, `count`, `count_by_state`, `oldest_wait_secs`), `list_rows`, `active_rows`. |
 | `migrate.py` | Schema versioning (`SCHEMA_VERSION`, `apply_schema`) and the idempotent legacy import. |
 | `reconcile.py` | `reconcile_on_boot`: settle every row a dead incarnation still owned. |
 | `__init__.py` | `open_default_store(home)`: open, import, reconcile, in that order. |
+
+`TaskStore` is one class whose members live in the `store_*` owners above, one
+responsibility each. A member's body is a module-level function there whose first
+parameter is `self` (annotated `TaskStore` for type checkers only), and the class binds it
+by name under one comment header per owner (`events = _store_events.events`,
+`staticmethod(...)` for a static method). Every member therefore stays an attribute of the
+one class: a patch of a method on the class or on a store, and a subclass that overrides
+one and calls `super()`, reach every caller, because a moved body calls its siblings
+through `self`. Every field stays on the instance, and each owner's docstring names the
+fields its members write and read. A bound member's `__module__` names its owner and its
+`__qualname__` is the bare function name; nothing reads either.
+
+A `_typed_read` member's binding is annotated `Callable[..., Any]`, the type the decorator
+gives it, because mypy can check a module before this class body: the `_defer_then_read`
+closure in `subagent_manager/admission/taskq_bridge.py` calls `get` and `defer`, and a
+binding whose type mypy still has to infer there defers the enclosing method and loses the
+closure's narrowing. That is also why `defer` stays in `store.py`: a class-attribute
+annotation cannot spell its keyword-only signature, so its binding could only be
+inferred.
+
+`store.py` is a plain facade: an owner reads its globals in its own namespace, so a name a
+test patches through `kiro_crew.taskq.store` (`detect_network_filesystem`,
+`_linux_mount_type`) must be one only `store.py` reads. `_STORE_OWNERS` lists the modules
+lowest layer first; each imports only modules before it and never `store.py` at run time,
+and an owner that logs does so under the `kiro_crew.taskq.store` logger. `store.py` re-exports every module-level name it bound as one file.
+`test/test_store_taskq_bindings.py` pins the member inventory, the binding, the layering
+and that patch rule. A new store method goes to the owner whose row names its
+responsibility, with one binding line under that owner's header in the class and a row in
+that test's member inventory; a method none of them owns stays in `store.py` or becomes a
+new owner listed in `_STORE_OWNERS`.
 
 Adapters (who writes rows today): the subagent manager through the `taskq_*`
 glue in `subagent_manager/admission/taskq_bridge.py`, plus one shared
@@ -38,6 +72,36 @@ glue in `subagent_manager/admission/taskq_bridge.py`, plus one shared
 After a restart, the generic reconciler marks interrupted runner rows
 `awaiting_adapter` until the owning TaskRunner or workflow adoption sweep settles
 or resumes them; that marker is recovery hand-off, not their normal dispatch path.
+
+The subagent glue is one class, `_TaskqBridgeMixin`, and
+`subagent_manager/admission/taskq_bridge.py` is its import path. The class body keeps
+the store handle and its settings, the exclusion sets the reads and the refill share,
+the store's open / re-open / boot dispatch, and a run's own writes (the best-effort
+write path `_post_store_write` / `track_store_task`, the marks, a refused row's
+`failed`, the terminal settle). Every other member is a module-level function of one
+of the owners below whose first parameter is `self`; the class binds it under the same
+name (`staticmethod` for one with no `self`), so `self.<name>`,
+`SpawnAdmissionCoordinator.<name>` and a class-level patch reach it as they reach a
+method written in the class. The facade re-exports every module-level name an owner
+took (`UNKNOWN_PENDING`, `QUEUED_LISTING_CAP`, `_read_queued_rows`, …), and no owner
+imports it at run time. A bound member reports its owner module as `__module__` and
+its bare name as `__qualname__` (`taskq_refill_window`, not
+`_TaskqBridgeMixin.taskq_refill_window`); nothing reads either beyond the names the
+stall diagnostics print for loop callbacks. New work of a kind an owner holds goes to
+that owner; a new kind is a new sibling module named `taskq_bridge_<role>.py` next to
+the others, never a package (the admission scans read the package's top level only),
+and is listed in `test_taskq_bridge_bindings.py`. A member a sibling mixin declares as
+a typing stub, and a member that a function with a narrowing closure calls through
+`self`, stay `def`s of the class body: mypy checks multiple inheritance, and narrows
+inside nested functions, only against methods.
+
+| Owner | Holds |
+|---|---|
+| `admission/taskq_bridge_accept.py` | a waiting spawn's row: `taskq_accept`, `taskq_build_record`, `taskq_accept_record`, and each defer the gate writes for it (`taskq_defer`, `taskq_defer_posted`, `await_pending_defer`, `park_defer`, `finish_parked_defer`) |
+| `admission/taskq_bridge_expiry.py` | the max wait of a memory deferral (`agent.subagent_queue_max_wait_secs`) and the expiry reports it owes: the sweep, the report, the owed-mark clear, the replay |
+| `admission/taskq_bridge_reads.py` | reads of accepted work with no run yet: the overflow counts, the chip's count, the pending ids a stop cancels, the queued listing and by-id lookup, a wave's batch membership |
+| `admission/taskq_bridge_window.py` | the bounded dispatch window: `taskq_should_window`, the lane-fair refill, eviction, hydration (`_window_entry`), the refill's wake and lane balance, the retired-stage stop |
+| `admission/taskq_bridge_cancel.py` | cancelling rows that have not started (`taskq_cancel_queued` and its async, bulk and posted forms) and the claimed-unstarted probe |
 
 ## Schema (v1, the only shape any build has written)
 
@@ -94,7 +158,7 @@ entry did; it is written nowhere else.
 from the row alone", and the pump respawns a recovered row by forwarding those
 params verbatim — so anything in there is replayed after a restart, on nobody's
 renewed say-so. Two keys are therefore process-local and dropped at build time
-(`taskq_bridge.taskq_build_record`): `_agent_prevalidated`, an off-loop agent check
+(`taskq_bridge_accept.taskq_build_record`): `_agent_prevalidated`, an off-loop agent check
 whose app could be disabled by the time the row starts, and `approval_mode`, whose
 `"auto"` skips the spawn gate AND pre-approves the run's tools. A recovered row
 faces the gate its caller faced. `scope_ref` still RECORDS both, which is why the
@@ -235,7 +299,7 @@ defers it, or marks it failed.
 
 **`TaskStoreUnavailable` is the ONE type a database failure reaches a caller as,
 reads included.** Every public read is wrapped at the store boundary
-(`store._typed_read`), not at its call sites. A read is exactly as failure-prone
+(`store_vocab._typed_read`), not at its call sites. A read is exactly as failure-prone
 as a transaction under `journal_mode=delete` — what a data home on a network
 filesystem auto-detects into and what `agent.task_store_journal_mode=delete`
 selects — because DELETE mode blocks readers behind a competing writer, where WAL
@@ -388,7 +452,7 @@ it is a defect, found with `TaskStore.loop_thread_calls` under an armed pin (see
 the guard's raise.
 
 - the terminal write on an unwinding arm (`except CancelledError` /
-  `except BaseException` in `taskrunner`, `workflows.agent_pool`, and both the
+  `except BaseException` in `TaskRunner`, `workflows.agent_pool`, and both the
   `waiting_dependency` cancel and `_end_row_on_cancel` — `admit`'s
   `CancelledError` arm, for a row whose handle never reached the caller — in
   `adapters.runner`) stays SYNCHRONOUS, because an
@@ -973,7 +1037,7 @@ deferral, so at most what was left of the deferral counts (the wake brings
 forward only rows that now fit, so this is a re-check that lost a race). A row
 not waiting or not deferred is left alone. The subagent adapter fails each row it returns past
 `agent.subagent_queue_max_wait_secs` with a generation-fenced `finish` and
-reports `never started: waiting for memory`
+reports `never started: waiting for memory (not enough memory freed up in time); retry once memory frees up`
 ([subagent.md](subagent.md) § Durable task queue).
 
 That `finish` passes `report_owed=True`: the terminal `transition` event then
@@ -1531,7 +1595,7 @@ of the sites that had to change than the store packages did. What had to change:
 `waiting_input`'s `enter_wait` (above), `taskq_settle`'s `finish`
 (§ posted vs inline), the stall recovery's `recovering_async` and its re-claimed
 `running_async` (`task_executor`), and the `running` mark of a step
-(`taskrunner._execute_single_task`) and of a workflow agent call
+(`TaskRunner._execute_single_task`) and of a workflow agent call
 (`workflows.agent_pool.admitted_agent_fn`). The rest are safe for a reason that is
 theirs, not the class's:
 
@@ -1551,7 +1615,7 @@ theirs, not the class's:
   `await` the way `waiting_input` did, because its wake is the admission resume
   grant and never `WaitLedger.wake` — the call that moves only a row the store
   already holds in a WAITING state.
-- `taskq_defer_posted`'s `store.defer` (`admission/taskq_bridge.py`): the boolean
+- `taskq_defer_posted`'s `store.defer` (`admission/taskq_bridge_accept.py`): the boolean
   is discarded because `_post_store_write` hands back the TASK, not the result, and
   a refused defer is the benign direction. `defer` only moves `next_run_at`, so a
   refusal leaves the row exactly as claimable as it already was and the pump refills
@@ -1624,7 +1688,7 @@ theirs, not the class's:
 - `on_child_terminal`'s `fail_parent` `transition`: the outcome it returns cancels
   the parent, and `cancelled` is legal from every non-terminal state, so a refused
   `failed` is superseded rather than lost.
-- `_taskq_begin_run`'s `running_async` on the RUN row (`taskrunner`), the one
+- `_taskq_begin_run`'s `running_async` on the RUN row (`TaskRunner`), the one
   `running` mark in this tree that stays discarded: the run row never enters a
   WAITING state — the steps hold the waits — so every later write on it is a
   TERMINAL one, and `done` / `failed` / `cancelled` are legal from `starting`
@@ -1635,7 +1699,7 @@ theirs, not the class's:
   for that same reason. This is the reason the STEP and workflow-agent marks do
   NOT share: those rows do enter waits.
 - every terminal `done_async` / `fail_async` / `cancel_async` and the synchronous
-  `fail` / `cancel` in `taskrunner`, `workflows.agent_pool` and `task_executor`'s
+  `fail` / `cancel` in `TaskRunner`, `workflows.agent_pool` and `task_executor`'s
   callers: the `Admitted.settle` contract above is the whole reason — the write is
   KEPT when the store is unavailable (`retry_terminal_writes` replays it until it
   commits or is fenced), so a False is either that retry taking ownership or a
@@ -1711,6 +1775,8 @@ startup), so later edits require restart. Fairness settings (`lane_weights`,
 - `test_taskq_state_machine.py`: 15 states, every edge in one table, terminals have no exits (except `unknown_side_effect→done|failed`), cancel from every non-terminal state, record round-trip; `steps_to` over every state pair — each step an edge `check_transition` accepts, no identity, no terminal intermediate; and the DIRECTION it refuses: `running→queued` / `running→admitted` / `starting→queued` answer nothing although two legal edges join each, the surviving two-step set is exactly `admitted → starting → {running, recovering, retry_wait}`, and `admitted→recovering` stays available because that is the mark a `session/new` timeout writes before any stream event.
 - `test_subagent_dependency_mark.py`: the dependency park against a row whose `starting` write was lost — the whole park lands (`admitted→starting→running→waiting_dependency`, a real wait record, zero `rejected_transition`), the next boot asks the side-effect class instead of requeueing blind, a cancel in the claim window still fences the replay as `stale_result`, and both marks reach ONE store method (`TaskStore.advance`); on `journal_mode=delete` with a competing writer every read is `TaskStoreUnavailable` and `taskq_mark` stays a debug-level best effort rather than raising into the spawn path; a refused terminal write on a parked row is logged with the row's real state.
 - `test_taskq_store.py`: `apply_schema` is one shape at `SCHEMA_VERSION` (fresh file has `wait_json`, `lane`, both indexes) and a second apply changes nothing; a newer-stamped file is refused; ids only after commit; an injected write failure raises `TaskStoreUnavailable` and commits nothing (not even the batch's first row); duplicate id / idempotency key refuse; locked past busy timeout refuses rather than hangs; network FS → `delete` journal + warning; defer keeps `queued` but ineligible; a conditional `cancel` refuses a row that left `only_from` (`rejected_transition`, and the row's own owner still settles it) and one whose generation moved although the state is still acceptable (`stale_result`, and the same call under the row's real generation cancels), while the unconditional form still ends `starting` and `running`.
+- `test_store_taskq_bindings.py`: every `TaskStore` member keeps its kind and signature and IS its owner's function; no bound function needs a class body; owners import only earlier layers and never `store.py` at run time, and nothing else in `src/` imports one; each owner's `Writes:` / `Reads:` line is what its methods touch; `TaskStoreUnavailable` renders under `kiro_crew.taskq.store`; every module-level name `store.py` bound as one file still resolves on it to the owner's object; a subclass's `super()` reaches a moved member; and no name a test tree patches through `kiro_crew.taskq.store` is read by an owner.
+- `test_store_taskq_owner_paths.py`: the failure arms of the moved writes and of the deferral beside them, on a real store: an `append_event`, `defer`, `expedite`, `update_wait` or `wake_wait` whose `COMMIT` fails raises `TaskStoreUnavailable` and leaves the row and its events as they were; an event whose `data_json` is not JSON reads back as an empty dict, and a deferral whose `until` is unreadable counts no parked time.
 - `test_taskq_claim_fencing.py`: two real threads on separate connections, 40 rows → each row won exactly once; stale generation `finish` is a no-op with a `stale_result` event; terminal never regresses; duplicate completion no-op; cancel before/after claim and during run all end `cancelled`.
 - `test_taskq_reconcile.py`: crash at queued / admitted / running / result-written-not-acked → nothing lost, terminals kept, `admitted→queued`, class-driven recovery, cancelled never revives, idempotent; legacy import fields and idempotency.
 - `test_taskq_admission_integration.py` + `test_subagent_scale.py::TestDurableQueueScale`: real admission + fake worker; 2000 submissions → 2000 rows before any id returned, window ≤ 64 throughout, 2000 unique `done`, depth 0; FIFO across the window boundary; store-only cancel never starts; a queued row the drain CLAIMED and started inside `taskq_cancel_queued`'s own read is not cancelled under the spawn (the caller falls through to the live reap); a `queued` or `retry_wait` row a concurrent claim moved to a new generation inside that read is still cancelled, with no `stale_result` refusal (`test_a_stop_whose_generation_moved_under_an_unstarted_row_still_cancels`); restart with a fresh manager re-dispatches queued rows; `task_queue_enabled=false` leaves no `tasks/` directory.

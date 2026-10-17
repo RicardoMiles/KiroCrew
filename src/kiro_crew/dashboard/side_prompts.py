@@ -12,9 +12,10 @@ SIDE_BOUNDARY_PROMPT = (
     "only as background context. Do not continue or complete any "
     "unfinished tasks from the main conversation. This side conversation "
     "is read-only: lookups work here, but changes don't. Reading files, "
-    "searching, fetching pages, and read-only shell commands such as ls, cat, "
-    "pwd and git status run here without asking, so use them when a question "
-    "needs them. If a file-read, search or fetch tool is refused, use a "
+    "searching, fetching pages, and read-only shell commands such as ls, cat "
+    "and pwd run here without asking, so use them when a question needs them. "
+    "git is refused here; for git output, tell the user to ask in the main "
+    "chat. If a file-read, search or fetch tool is refused, use a "
     "read-only shell command (cat, grep, ls) instead rather than retrying it. "
     "Writing or editing files, shell commands that modify "
     "anything, and MCP tools are refused here, even when the user explicitly "
@@ -24,10 +25,46 @@ SIDE_BOUNDARY_PROMPT = (
     "unless the side question explicitly asks for them."
 )
 
+#: The read-only boundary for a side session with no shell tool (claude, which
+#: starts it with only its read built-ins). Naming shell commands there would
+#: send the model after a tool the session does not have.
+SIDE_BOUNDARY_PROMPT_NO_SHELL = (
+    "You are answering an ephemeral side question. Use the conversation "
+    "only as background context. Do not continue or complete any "
+    "unfinished tasks from the main conversation. This side conversation "
+    "is read-only: lookups work here, but changes don't. Reading files, "
+    "searching the codebase, and searching or fetching web pages run here "
+    "without asking, so use them when a question needs them. There is no "
+    "shell here. Writing or editing files, running commands, and MCP tools "
+    "are refused here, even when the user explicitly requests them. Never "
+    "claim that a tool is unconfigured or suggest enabling it. If the user "
+    "wants a change made, tell them to use the main chat to take action. Do "
+    "not include shell commands, patches, or code unless the side question "
+    "explicitly asks for them."
+)
+
+#: The read-only boundary for a side session that can list folders and view
+#: images but has no shell and no tool that reads a file's text (goose, whose
+#: only text reader is its shell).
+SIDE_BOUNDARY_PROMPT_LISTING = (
+    "You are answering an ephemeral side question. Use the conversation "
+    "only as background context. Do not continue or complete any "
+    "unfinished tasks from the main conversation. This side conversation "
+    "is read-only: lookups work here, but changes don't. Listing folders and "
+    "viewing images run here without asking, so use them when a question "
+    "needs them. There is no shell here and no tool that reads a file's text, "
+    "so answer questions about file contents from the conversation. Writing "
+    "or editing files, running commands, and MCP tools are refused here, even "
+    "when the user explicitly requests them. Never claim that a tool is "
+    "unconfigured or suggest enabling it. If the user wants a change made, "
+    "tell them to use the main chat to take action. Do not include shell "
+    "commands, patches, or code unless the side question explicitly asks for "
+    "them."
+)
+
 #: The boundary for a harness where the side turn runs with NO tools at all
-#: (``ToolApprovalPolicy.REJECT_ALL``): the read-only allowance is a kiro-cli
-#: agent-spec mechanism, and another backend's own pre-approval surface is one
-#: the host gate cannot see, so nothing may execute there. Same shape as the
+#: (``ToolApprovalPolicy.REJECT_ALL``): its own pre-approval surface is one the
+#: host gate cannot see, so nothing may execute there. Same shape as the
 #: read-only prompt so the model is told exactly what the policy does.
 SIDE_BOUNDARY_PROMPT_NO_TOOLS = (
     "You are answering an ephemeral side question. Use the conversation "
@@ -53,14 +90,38 @@ SIDE_DEVELOPER_INSTRUCTIONS = (
 )
 
 
-def build_side_system_prompt(*, tools_available: bool = True) -> str:
-    """Return the developer-instructions + boundary-prompt envelope.
+def side_boundary_prompt(
+    *,
+    tools_available: bool = True,
+    shell_available: bool = True,
+    file_reads_available: bool = True,
+) -> str:
+    """The boundary the policy enforces on this harness.
 
-    ``tools_available`` selects the boundary the policy enforces on this
-    harness: the read-only allowance (``ACP_BACKENDS_SIDE_READONLY``, ``READ_ONLY``)
-    or no tools at all (every other backend, ``REJECT_ALL``).
+    ``tools_available`` picks the read-only allowance (``READ_ONLY``) or no
+    tools at all (``REJECT_ALL``); ``shell_available`` says whether the
+    read-only session has a shell tool for the read-only commands, and
+    ``file_reads_available`` whether a shell-less one can read a file's text.
     """
-    boundary = SIDE_BOUNDARY_PROMPT if tools_available else SIDE_BOUNDARY_PROMPT_NO_TOOLS
+    if not tools_available:
+        return SIDE_BOUNDARY_PROMPT_NO_TOOLS
+    if shell_available:
+        return SIDE_BOUNDARY_PROMPT
+    return SIDE_BOUNDARY_PROMPT_NO_SHELL if file_reads_available else SIDE_BOUNDARY_PROMPT_LISTING
+
+
+def build_side_system_prompt(
+    *,
+    tools_available: bool = True,
+    shell_available: bool = True,
+    file_reads_available: bool = True,
+) -> str:
+    """Return the developer-instructions + boundary-prompt envelope."""
+    boundary = side_boundary_prompt(
+        tools_available=tools_available,
+        shell_available=shell_available,
+        file_reads_available=file_reads_available,
+    )
     return f"{SIDE_DEVELOPER_INSTRUCTIONS}\n\n{boundary}"
 
 

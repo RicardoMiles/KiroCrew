@@ -17,7 +17,7 @@ silently fails to act.
 
 * **Deny on silence.** The wait resolves to DENY on timeout. There is no path
   where not answering means yes. :data:`TEXT_APPROVAL_TIMEOUT_S` is held well
-  under ``acp/client.py``'s ``_TOOL_STALL_TIMEOUT`` because no provider frame
+  under ``acp/client_timeouts.py``'s ``_TOOL_STALL_TIMEOUT`` because no provider frame
   arrives while a permission is pending, so a longer window here would let the
   harness's own stall watchdog fire first and tear down a turn the operator was
   still deciding on.
@@ -60,7 +60,7 @@ logger = logging.getLogger(__name__)
 
 #: How long a pending approval waits for a typed answer before DENYING.
 #:
-#: Must stay comfortably below ``acp/client.py``'s ``_TOOL_STALL_TIMEOUT``
+#: Must stay comfortably below ``acp/client_timeouts.py``'s ``_TOOL_STALL_TIMEOUT``
 #: (600s): while a permission request is outstanding the provider emits no
 #: frames, so that watchdog is armed against this wait. Five minutes is the
 #: window for someone answering from a phone; the cost of it being too short is
@@ -627,18 +627,8 @@ class PendingApprovals:
                 self._pending.pop(k, None)
                 self._nonces.pop(k, None)
 
-    async def decide(self, session_key: str, event: Any) -> bool:
-        """Await the user's decision for *event*; deny on timeout.
-
-        The channel's renderer has already presented the prompt by the time
-        this is awaited (``TurnDriver`` dispatches ``PROMPT_CHOICE`` before
-        calling the decider), so this only waits.
-        """
-        approved, _cause = await self.decide_with_cause(session_key, event)
-        return approved
-
     async def decide_with_cause(self, session_key: str, event: Any) -> tuple[bool, str]:
-        """:meth:`decide`, plus WHY a denial happened.
+        """Await the user's decision for *event*; return ``(approved, cause)``.
 
         The cause is ``""`` for a human's answer and
         :data:`DENY_CAUSE_APPROVAL_TIMEOUT` when the window closed unanswered.

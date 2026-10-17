@@ -7,10 +7,12 @@ import contextlib
 import json
 import logging
 import os
+import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from consolidation_lease_helpers import lease_aware_log
 from windows_sim import builtin_open_sharing_violation
 
 from kiro_crew import history, history_search
@@ -3146,13 +3148,10 @@ class TestConsolidationDoesNotBlockLoop:
         loop_thread_id = threading.get_ident()
         write_thread_id: dict[str, int] = {}
 
-        log = MagicMock()
+        log = lease_aware_log()
         log.snapshot_for_consolidation.return_value = (
             [{"role": "user", "content": "hi"}], 1, 0, 0
         )
-        log.get_metadata.return_value = {}
-        # A fresh span is eligible; _consolidate's inner gate reads this.
-        log.get_metadata_status.return_value = ({}, True)
         log.consolidation_retry_state.return_value = (0, 0.0)
 
         memory = MagicMock()
@@ -3196,13 +3195,10 @@ class TestConsolidationDoesNotBlockLoop:
         loop_thread_id = threading.get_ident()
         save_thread_id: dict[str, int] = {}
 
-        log = MagicMock()
+        log = lease_aware_log()
         log.snapshot_for_consolidation.return_value = (
             [{"role": "user", "content": "hi"}], 1, 0, 0
         )
-        log.get_metadata.return_value = {}
-        # A fresh span is eligible; _consolidate's inner gate reads this.
-        log.get_metadata_status.return_value = ({}, True)
         log.consolidation_retry_state.return_value = (0, 0.0)
 
         memory = MagicMock()
@@ -4632,6 +4628,93 @@ class TestConsolidateSession:
     """Tests for the public consolidate_session() method (session-end trigger)."""
 
     @pytest.mark.asyncio
+    async def test_cold_transcript_is_never_parsed_on_the_event_loop(self, tmp_path):
+        """Idle expiry calls this on the loop after the parsed-transcript cache
+        has expired, so every transcript read it needs must run in a worker
+        thread: a full parse there stalls every other gateway task."""
+        from kiro_crew.memory import MemoryStore
+
+        conv_log = ConversationLog(base_dir=tmp_path / "sessions")
+        conv_log.init()
+        mem = MemoryStore(workspace=tmp_path / "memory")
+        mem.init()
+        consolidator = HistoryConsolidator(log=conv_log, memory=mem)
+        key = "dashboard:chat-cold-expiry"
+        for i in range(5):
+            conv_log.append(key, "user", f"m{i}")
+        conv_log._msg_cache.clear()  # what the idle TTL leaves at session expiry
+
+        loop_thread = threading.get_ident()
+        reads: list[tuple[str, int]] = []
+        projection = conv_log._read_projection
+        real_read, real_count = projection._read_messages, projection._count_messages
+
+        def spy_read(k, *a, **kw):
+            reads.append(("read", threading.get_ident()))
+            return real_read(k, *a, **kw)
+
+        def spy_count(k, *a, **kw):
+            reads.append(("count", threading.get_ident()))
+            return real_count(k, *a, **kw)
+
+        with (
+            patch.object(projection, "_read_messages", side_effect=spy_read),
+            patch.object(projection, "_count_messages", side_effect=spy_count),
+            patch.object(consolidator, "_consolidate", new_callable=AsyncMock) as run,
+        ):
+            consolidator.consolidate_session(key)
+            on_loop = [kind for kind, tid in reads if tid == loop_thread]
+            assert on_loop == [], f"transcript read on the event loop: {on_loop}"
+            await asyncio.gather(*list(consolidator._tasks))
+
+        assert reads, "premise: the eligibility check read the transcript"
+        assert all(tid != loop_thread for _kind, tid in reads), reads
+        run.assert_awaited_once_with(key, include_history=True)
+
+    @pytest.mark.asyncio
+    async def test_repeated_expiry_starts_one_read_per_transcript(self, tmp_path):
+        """A second call while the first read is in flight starts no second
+        full parse of the same file, so a large transcript is never resident
+        twice because of this path."""
+        from kiro_crew.memory import MemoryStore
+
+        conv_log = ConversationLog(base_dir=tmp_path / "sessions")
+        conv_log.init()
+        mem = MemoryStore(workspace=tmp_path / "memory")
+        mem.init()
+        consolidator = HistoryConsolidator(log=conv_log, memory=mem)
+        key = "dashboard:chat-twice"
+        conv_log.append(key, "user", "hello")
+
+        entered, release = threading.Event(), threading.Event()
+        calls: list[str] = []
+        real = consolidator._session_end_eligibility
+
+        def gated(k):
+            calls.append(k)
+            entered.set()
+            assert release.wait(timeout=60), "eligibility worker was not released"
+            return real(k)
+
+        with (
+            patch.object(consolidator, "_session_end_eligibility", side_effect=gated),
+            patch.object(consolidator, "_consolidate", new_callable=AsyncMock) as run,
+        ):
+            try:
+                consolidator.consolidate_session(key)
+                assert await asyncio.to_thread(entered.wait, timeout=60), (
+                    "eligibility worker did not enter"
+                )
+                consolidator.consolidate_session(key)
+            finally:
+                release.set()
+                await asyncio.wait_for(asyncio.gather(*list(consolidator._tasks)), timeout=60)
+
+        assert calls == [key]
+        run.assert_awaited_once_with(key, include_history=True)
+        assert not consolidator._counting
+
+    @pytest.mark.asyncio
     async def test_consolidate_session_fires_for_eligible(self, tmp_path):
         """consolidate_session triggers consolidation for sessions with messages."""
         from kiro_crew.memory import MemoryStore
@@ -4729,8 +4812,11 @@ class TestConsolidateSession:
         # Seed a session with a sensitive tool call
         conv_log.append("dashboard:chat-sensitive", "assistant", "reading secrets", tools=["cat .aws/credentials"])
 
-        consolidator.consolidate_session("dashboard:chat-sensitive")
-        # No tasks created — sensitive session skipped
+        with patch.object(consolidator, "_consolidate", new_callable=AsyncMock) as run:
+            consolidator.consolidate_session("dashboard:chat-sensitive")
+            await asyncio.gather(*list(consolidator._tasks))
+        # Sensitive session skipped: the off-loop check ran no pass
+        run.assert_not_awaited()
         assert len(consolidator._tasks) == 0
         assert "dashboard:chat-sensitive" not in consolidator._running
 

@@ -40,6 +40,16 @@ def _log(unit_id: str = SESSION, **fields) -> CrewLog:
     return CrewLog.create(lg.KIND_SESSION, unit_id, **fields)
 
 
+@pytest.fixture
+def owned_log():
+    """Refusal tracebacks can retain the writer beyond the test's lifetime."""
+    handle = _log()
+    try:
+        yield handle
+    finally:
+        handle.release_ownership()
+
+
 def _opened(handle: CrewLog, *, resumed: bool = False, model: str = "opus") -> None:
     handle.append(
         "session/opened",
@@ -1506,7 +1516,7 @@ def test_fold_session_continues_from_an_earlier_bundle():
     assert second.projection("usage").value == crew_log.fold_usage(_entries(handle))
 
 
-def test_fold_session_incremental_refuses_a_backward_seq_like_a_fold_from_the_start():
+def test_fold_session_incremental_refuses_a_backward_seq_like_a_fold_from_the_start(owned_log):
     """A non-advancing seq in the tail refuses BOTH ways -- never one way only.
 
     The append-only writer cannot produce a duplicate or backward seq, so one
@@ -1517,7 +1527,7 @@ def test_fold_session_incremental_refuses_a_backward_seq_like_a_fold_from_the_st
     The guard in ``iter_from`` makes the incremental read refuse the same
     damage with the same code.
     """
-    handle = _log()
+    handle = owned_log
     _opened(handle)
     _turn(handle, 1)
     bundle = crew_log.fold_session(SESSION)
@@ -1537,9 +1547,9 @@ def test_fold_session_incremental_refuses_a_backward_seq_like_a_fold_from_the_st
     assert incremental.value.code == lg.CODE_BAD_DATA
 
 
-def test_fold_session_incremental_refuses_a_backward_tail_after_real_growth():
+def test_fold_session_incremental_refuses_a_backward_tail_after_real_growth(owned_log):
     """A regressed physical tail cannot hide valid growth from a cached fold."""
-    handle = _log()
+    handle = owned_log
     _opened(handle)
     _turn(handle, 1)
     bundle = crew_log.fold_session(SESSION)
@@ -1563,9 +1573,9 @@ def test_fold_session_incremental_refuses_a_backward_tail_after_real_growth():
     assert incremental.value.code == lg.CODE_BAD_DATA
 
 
-def test_fold_session_incremental_refuses_same_size_rewrite_of_folded_seq():
+def test_fold_session_incremental_refuses_same_size_rewrite_of_folded_seq(owned_log):
     """A same-size rewrite behind the resume point must invalidate the cache."""
-    handle = _log()
+    handle = owned_log
     _opened(handle)
     _turn(handle, 1)
     bundle = crew_log.fold_session(SESSION)

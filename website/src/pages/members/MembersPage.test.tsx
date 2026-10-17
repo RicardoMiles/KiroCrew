@@ -15,6 +15,7 @@ import { PILL_ACTIVITY_MAX_CHARS } from './pillActivity'
 import { MEMBERS_ROSTER_QUERY_KEY, memberThreadQueryKey } from '../../api/membersQuery'
 import { __resetPaneDraftsForTests, readPaneDraft, writePaneDraft } from '../../utils/chatPaneDrafts'
 import { getViewedThreadSlot, _resetViewedThreadForTests } from '../../lib/viewedThread'
+import { getMountedMemberThreadSlot } from '../../lib/mountedMemberThread'
 import { bindSlotReadSender, emitSlotRead, _resetSlotReadRelayForTest } from '../../lib/slotReadRelay'
 import {
   __resetErrorJournalForTests,
@@ -60,6 +61,8 @@ vi.mock('../../api/client', () => ({
     // the default is "feature on, nothing armed" so every other case renders
     // the page without a loop in the way.
     autonudgeList: vi.fn(() => Promise.resolve({ enabled: true, loops: [] })),
+    autonudgeForSlot: vi.fn(() => Promise.resolve({ enabled: true, loop: null })),
+    monitorForSlot: vi.fn(() => Promise.resolve({ enabled: true, monitor: null })),
     // The side panel's + menu gates its Summary row on this read; "disabled"
     // keeps the chat-style Summary row out of the menu, next to the Work log
     // chip it would be a second, unrelated summary of the same thread.
@@ -67,6 +70,16 @@ vi.mock('../../api/client', () => ({
     // The crew webview drawer. The Dashboard tab no longer reads it (the tab is
     // the crewmate's dynamic dashboard, mocked out below), but other surfaces on
     // this page still open it, and an unstubbed read rejects into a red alert.
+    // The goal record behind the Profile card's About. "No goal yet" is the
+    // state every case here wants: a failed read says so in an alert.
+    memberGoals: {
+      get: vi.fn(() => Promise.resolve({
+        slug: '', member: '', goals: [],
+        key_results: [], reports: [], removed_key_result: null, removed_goal: null,
+        schedules: { time: '09:00', timezone: '', daily: false, weekly: false, weekday: 1, monthly: false, month_day: 1 },
+        limits: { goal_text_max_chars: 2000, key_result_text_max_chars: 200, key_result_value_max_chars: 40, key_result_reading_max_chars: 120 },
+      })),
+    },
     // The panel's session-status frame reads the crewmate's automatic dashboard
     // card. "Waiting, nothing published" is the state every case here is about;
     // an unstubbed read rejects and the frame raises the same red alert, which
@@ -283,11 +296,12 @@ vi.mock('react-router-dom', async (importOriginal) => {
 import { api } from '../../api/client'
 import NewCrewmateDialog, { CACHE_WARM_BOUND_MS, RECONCILE_BOUND_MS } from './NewCrewmateDialog'
 import { MobileRosterBarContext } from '../../components/MobileNavRailContext'
+import { resetDashboardOnLoad } from './dashboardOnLoad'
 import MembersPage, { CREW_DASHBOARD_TAB_ID, CREW_PANEL_TAB_IDS, MEMBERS_UNCONFIRMED_WITHHELD_VIEWS, MEMBERS_UNFED_VIEWS, MEMBERS_WITHHELD_VIEWS, resolveDefaultMember, resolveMateLanding } from './MembersPage'
 import { resetFirstGreetingRequests } from './useFirstGreeting'
 import { __resetPanelTabs, VIEW_DATA_SOURCE } from '../../hooks/usePanelTabs'
 
-/** The page's own memory key (mirrors the constant in MembersPage.tsx). */
+/** The page's own memory key (mirrors `LAST_MEMBER_KEY` in useMembersPageNavigation.ts). */
 const LAST_MEMBER_KEY = 'mc-members-last-member'
 // Spelled out rather than imported: the value IS the contract with a returning
 // browser, so a rename of the page's constant must fail here.
@@ -609,6 +623,8 @@ beforeEach(() => {
   // The side panel's tab strip is a module-level, persisted store; a tab
   // opened in one case would otherwise be on the strip in the next.
   __resetPanelTabs()
+  // A fresh page load: no crewmate has had its strip put on the Dashboard yet.
+  resetDashboardOnLoad()
   setWindowWidth(WIDE_WINDOW)
   // Module-level "thread on screen" registration; a case that unmounted
   // mid-effect would otherwise leave its slot registered for the next one.
@@ -673,6 +689,18 @@ describe('MembersPage roster', () => {
     expect(await notices.findByTestId('member-main-teams-error', undefined, PANE_READY)).toBeInTheDocument()
     // No hand-off from above the thread: Profile may hold an unsaved schedule draft.
     expect(notices.queryByRole('button', { name: /ask the agent/i })).toBeNull()
+  })
+
+  it('shows a patrol error when a refetch fails after a good cached read', async () => {
+    const { queryClient } = await renderPage([row()], 'kirocrew', { route: '/members?member=oncall' })
+    await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)
+    await waitFor(() => expect(api.autonudgeList).toHaveBeenCalled())
+
+    vi.mocked(api.autonudgeList).mockRejectedValue(new Error('patrol unavailable'))
+    await act(async () => { await queryClient.refetchQueries({ queryKey: ['autonudge-loops'] }) })
+
+    expect(await screen.findByTestId('member-main-patrol-error', undefined, PANE_READY)).toBeInTheDocument()
+    expect(screen.getByTestId('member-roster-patrol-error')).toBeInTheDocument()
   })
 
   it('the teams read notice dismisses for the outage, returns on a failure after a good read, and clears on a good read', async () => {
@@ -1020,8 +1048,8 @@ describe('MembersPage thread', () => {
     // transcript and composer halves itself; its default stays off for
     // split-view panes, which are already narrow).
     expect(pane).toHaveAttribute('data-follow-content-width', '1')
-    // A send while the member is working gets the main chat's Steer / Queue /
-    // Jev auto split, so the Members page must NOT ask for 'steer-only'.
+    // The host passes its crewmate identity; ChatPane owns the responsive
+    // send mode, leaving its default for ordinary session panes unchanged.
     expect(pane).toHaveAttribute('data-busy-mode', 'split')
     // The Crew page draws its own composer (no model / effort / permission /
     // context toolbar), not the ordinary chat one.
@@ -1082,7 +1110,10 @@ describe('MembersPage thread', () => {
       { thread: { slot_key: 'member-oncall', slug: 'oncall', member: 'Oncall', created: false } },
     )
     fireEvent.click(await rosterRow('oncall'))
-    expect(await screen.findByText(/shares its short name with/i)).toBeInTheDocument()
+    const notice = await screen.findByText(/shares its short name with/i)
+    // It names both crewmates: the one whose chat this is goes, the owner stays.
+    expect(notice).toHaveTextContent('delete “oncall” and create it again')
+    expect(notice).toHaveTextContent('Keep “Oncall”.')
     // The misrouted thread is NOT mounted — that is the entire point.
     expect(screen.queryByTestId('chat-pane-stub')).toBeNull()
   })
@@ -1330,6 +1361,38 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
     expect(screen.queryByTestId('member-identity-row')).toBeNull()
   })
 
+  describe('a refresh opens the Dashboard tab, not the last focused one', () => {
+    const dashTab = () => screen.getByTestId(`side-panel-leading-tab-${CREW_DASHBOARD_TAB_ID}`)
+    const openOncall = async () => {
+      const utils = await renderPage([row({ bound: true, slot_key: 'member-oncall' })], 'kirocrew', { route: '/members?member=oncall' })
+      await screen.findByTestId('side-panel-leading-tabs', undefined, PANE_READY)
+      return utils
+    }
+
+    it('reopens on Dashboard after a reload even when Files was focused', async () => {
+      const first = await openOncall()
+      fireEvent.click(screen.getByRole('tab', { name: 'Files' }))
+      await waitFor(() => expect(screen.getByRole('tab', { name: 'Files' })).toHaveAttribute('aria-selected', 'true'))
+      first.unmount()
+      // The strip keeps its stored focus on Files, as the persisted bucket does
+      // across a reload; the reload itself is the module state starting over.
+      resetDashboardOnLoad()
+      await openOncall()
+      await waitFor(() => expect(dashTab()).toHaveAttribute('aria-selected', 'true'))
+      expect(screen.getByRole('tab', { name: 'Files' })).toHaveAttribute('aria-selected', 'false')
+    })
+
+    it('keeps the tab the person picked on an in-app return', async () => {
+      const first = await openOncall()
+      fireEvent.click(screen.getByRole('tab', { name: 'Files' }))
+      await waitFor(() => expect(screen.getByRole('tab', { name: 'Files' })).toHaveAttribute('aria-selected', 'true'))
+      first.unmount()
+      await openOncall()
+      await waitFor(() => expect(screen.getByRole('tab', { name: 'Files' })).toHaveAttribute('aria-selected', 'true'))
+      expect(dashTab()).toHaveAttribute('aria-selected', 'false')
+    })
+  })
+
   describe('a preview link opens the Dashboard tab on the STAGED page', () => {
     // The link `dashboard_preview` hands a crewmate to show the person:
     // `instance.preview_url` builds exactly this shape.
@@ -1370,13 +1433,16 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
       invalidate.mockRestore()
     })
 
-    it('a staged page that is applied or expires stays on its closed notice, never an unlabelled live page', async () => {
+    it('a staged page the agent applied (or that expired) hands over to the live page, with a line saying so', async () => {
       await renderPage([row({ bound: true, slot_key: 'member-oncall' })], 'kirocrew', { route: '/members?member=oncall&dashboard=preview' })
       expect(await screen.findByTestId('dashboard-preview-badge', undefined, PANE_READY)).toBeInTheDocument()
       fireEvent.click(await screen.findByTestId('crew-dashboard-stub-gone', undefined, PANE_READY))
       await waitFor(() => expect(screen.queryByTestId('dashboard-preview-badge')).toBeNull())
-      expect(currentUrl()).toBe('/members?member=oncall&dashboard=preview')
-      expect(screen.getByTestId('crew-dashboard-stub')).toHaveAttribute('data-preview', 'true')
+      // The URL stops asking for the preview, so the tab reads the live page.
+      await waitFor(() => expect(currentUrl()).toBe('/members?member=oncall'))
+      expect(screen.getByTestId('crew-dashboard-stub')).toHaveAttribute('data-preview', 'false')
+      expect(screen.getByTestId('dashboard-preview-outcome')).toHaveAttribute('data-outcome', 'closed')
+      expect(screen.getByTestId('crew-dashboard-tab')).toBeInTheDocument()
     })
 
     it('a plain member link is the live page', async () => {
@@ -1550,6 +1616,43 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
     // The face is IN the card now: the pill keeps its slot but paints no face.
     expect(screen.getByTestId('member-pill-face')).toHaveStyle({ visibility: 'hidden' })
     expect(screen.getByTestId('crew-profile-face')).not.toHaveStyle({ visibility: 'hidden' })
+  })
+
+  it("Goals' track row sends a visible message to the crewmate and closes the floating card", async () => {
+    const sendMock = api.sendChat as ReturnType<typeof vi.fn>
+    sendMock.mockClear()
+    await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
+    fireEvent.click(await rosterRow('oncall'))
+    await screen.findByTestId('side-panel-root')
+    fireEvent.click(await screen.findByTestId('member-identity-pill'))
+    await screen.findByTestId('crew-profile-modal')
+    fireEvent.click(screen.getByRole('tab', { name: 'Goals' }))
+    fireEvent.click(await screen.findByTestId('crew-goals-track'))
+    fireEvent.change(await screen.findByTestId('crew-goals-track-input'), { target: { value: 'The release date' } })
+    fireEvent.click(screen.getByTestId('crew-goals-track-send'))
+    await waitFor(() => expect(sendMock).toHaveBeenCalledTimes(1))
+    const [message, slot, , , meta] = sendMock.mock.calls[0]
+    // The ordinary send path: the user's own words, no hidden nudge.
+    expect(message).toBe('Please track this for me: The release date')
+    expect(slot).toBe('member-oncall')
+    expect(meta).toBeUndefined()
+    await waitFor(() => expect(screen.queryByTestId('crew-profile-modal')).toBeNull(), { timeout: 3000 })
+  })
+
+  it("Goals' track row leaves the docked card open", async () => {
+    const sendMock = api.sendChat as ReturnType<typeof vi.fn>
+    sendMock.mockClear()
+    localStorage.setItem(PANEL_OPEN_KEY, '0')
+    await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
+    fireEvent.click(await rosterRow('oncall'))
+    fireEvent.click(await screen.findByTestId('member-identity-pill'))
+    await screen.findByTestId('crew-profile-docked')
+    fireEvent.click(screen.getByRole('tab', { name: 'Goals' }))
+    fireEvent.click(await screen.findByTestId('crew-goals-track'))
+    fireEvent.change(await screen.findByTestId('crew-goals-track-input'), { target: { value: 'The release date' } })
+    fireEvent.click(screen.getByTestId('crew-goals-track-send'))
+    await waitFor(() => expect(sendMock).toHaveBeenCalledTimes(1))
+    expect(screen.getByTestId('crew-profile-docked')).toBeInTheDocument()
   })
 
   it('with the side panel open, the pill face flies into the floating card and back on close', async () => {
@@ -1792,30 +1895,33 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
     expect(within(menu).getAllByRole('menuitem').map(el => el.textContent?.trim())).toEqual(['New crewmate'])
   })
 
-  it('the roster header "+" menu\'s New crewmate opens the card in place with Advanced settings folded, and they unfold inline — no trip to the crew manager', async () => {
+  it('the roster header "+" menu\'s New crewmate opens the card as a modal with Advanced settings folded, and they unfold inline — no trip to the crew manager', async () => {
     await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
     await rosterRow('oncall')
     // Creating a crewmate IS creating a crew record, and the write path is
     // still `POST /api/agents`; what changed is the front door. The primary
-    // row opens the New crewmate card inside the page with Advanced settings
+    // row opens the New crewmate card as a modal with Advanced settings
     // folded; they unfold inline. Nothing navigates.
     expect(screen.getByTestId('member-add')).toHaveAttribute('aria-label', 'Add…')
     await clickAddCrewmate()
     expect(await screen.findByTestId('crewmate-create-look')).toBeInTheDocument()
-    expect(screen.getByTestId('member-create-pane')).toContainElement(screen.getByTestId('crewmate-create-look'))
+    // The card is now a Radix-less Modal (role="dialog"), holding the look.
+    const dialog = screen.getByRole('dialog')
+    expect(dialog).toContainElement(screen.getByTestId('crewmate-create-look'))
     expect(screen.queryByRole('combobox', { name: 'Built from' })).toBeNull()
     expect(screen.getByTestId('crewmate-create-advanced-toggle')).toHaveAttribute('aria-expanded', 'false')
     // Advanced settings unfolds inline, in the same card.
     fireEvent.click(screen.getByTestId('crewmate-create-advanced-toggle'))
     expect(await screen.findByRole('combobox', { name: 'Built from' })).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    // The modal's own header X ("Close") is the way out, in place of the old
+    // in-place card's Cancel.
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }))
     await clickAddAdvanced()
     expect(await screen.findByRole('combobox', { name: 'Built from' })).toBeInTheDocument()
     expect(screen.getByTestId('crewmate-create-advanced-toggle')).toHaveAttribute('aria-expanded', 'true')
-    // In place, not a modal: a labelled page region where the chat was.
-    expect(screen.queryByRole('dialog')).toBeNull()
-    expect(screen.getByRole('region', { name: 'New crewmate' })).toBe(screen.getByTestId('crewmate-create-embedded'))
-    expect(screen.getByTestId('member-create-pane')).toContainElement(screen.getByTestId('crewmate-create-embedded'))
+    // A modal named "New crewmate", holding the form — no in-place page region.
+    expect(screen.getByRole('dialog')).toHaveAccessibleName('New crewmate')
+    expect(screen.getByRole('dialog')).toContainElement(screen.getByTestId('crewmate-create-form'))
     expect(navigateSpy).not.toHaveBeenCalledWith(expect.stringContaining('/capabilities'))
   })
 
@@ -2382,7 +2488,7 @@ describe('MembersPage side panel (Dashboard / Work log / Notes / Schedules) and 
     expect(await screen.findByTestId('crewmate-create-look')).toBeInTheDocument()
     expect(screen.getByTestId('crewmate-create-advanced-toggle')).toHaveAttribute('aria-expanded', 'false')
     expect(screen.queryByRole('combobox', { name: 'Built from' })).toBeNull()
-    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Close' }))
     fireEvent.click((await screen.findAllByTestId('crewmate-empty-advanced'))[0])
     expect(await screen.findByRole('combobox', { name: 'Built from' })).toBeInTheDocument()
     expect(screen.getByTestId('crewmate-create-advanced-toggle')).toHaveAttribute('aria-expanded', 'true')
@@ -2561,6 +2667,20 @@ describe('MembersPage viewed-thread registration', () => {
     fireEvent.click(await rosterRow('oncall'))
     await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)
     await waitFor(() => expect(getViewedThreadSlot()).toBe('member-oncall'))
+    expect(getMountedMemberThreadSlot()).toBe('member-oncall')
+  })
+
+  it('window blur retires unread state but keeps visible mounted presence', async () => {
+    await renderPage()
+    fireEvent.click(await rosterRow('oncall'))
+    await waitFor(() => expect(getViewedThreadSlot()).toBe('member-oncall'), PANE_READY)
+    const focus = vi.spyOn(document, 'hasFocus').mockReturnValue(false)
+    act(() => window.dispatchEvent(new Event('blur')))
+    await waitFor(() => expect(getViewedThreadSlot()).toBeNull())
+    expect(getMountedMemberThreadSlot()).toBe('member-oncall')
+    focus.mockReturnValue(true)
+    act(() => window.dispatchEvent(new Event('focus')))
+    focus.mockRestore()
   })
 
   it('re-registers on switch: the new thread replaces the old one', async () => {
@@ -2579,6 +2699,9 @@ describe('MembersPage viewed-thread registration', () => {
     try {
       act(() => { document.dispatchEvent(new Event('visibilitychange')) })
       await waitFor(() => expect(getViewedThreadSlot()).toBeNull())
+      // The mounted identity stays available for the synchronous return frame;
+      // the hidden frame already cleared server presence.
+      expect(getMountedMemberThreadSlot()).toBe('member-oncall')
       hidden.mockReturnValue(false)
       act(() => { document.dispatchEvent(new Event('visibilitychange')) })
       await waitFor(() => expect(getViewedThreadSlot()).toBe('member-oncall'))
@@ -2623,6 +2746,7 @@ describe('MembersPage viewed-thread registration', () => {
     await waitFor(() => expect(getViewedThreadSlot()).toBe('member-oncall'), PANE_READY)
     unmount()
     expect(getViewedThreadSlot()).toBeNull()
+    expect(getMountedMemberThreadSlot()).toBeNull()
   })
 })
 
@@ -3083,8 +3207,8 @@ describe('New crewmate dialog', () => {
       // A typed name is a draft: the shell must ask, and a refusal keeps the page.
       fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'radar' } })
       expect(askToLeave()).toBe('false')
-      // The in-place form's own wording (no dialog closes; the page is left).
-      expect(confirmSpy).toHaveBeenCalledWith('Leave this page? Your unsaved crewmate draft will be lost.')
+      // The modal's own leave-draft wording (the dialog closes; the page is left).
+      expect(confirmSpy).toHaveBeenCalledWith('Leave this page? The New crewmate dialog closes and what you typed is lost.')
       expect(screen.getByTestId('crewmate-create-form')).toBeInTheDocument()
       // Accepting the prompt lets the navigation through.
       confirmSpy.mockReturnValue(true)
@@ -3103,7 +3227,7 @@ describe('New crewmate dialog', () => {
       fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'radar' } })
       // Stay: the row asked, the user kept the draft, nothing moved.
       clickRailMembers()
-      expect(confirmSpy).toHaveBeenCalledWith('Leave this page? Your unsaved crewmate draft will be lost.')
+      expect(confirmSpy).toHaveBeenCalledWith('Leave this page? The New crewmate dialog closes and what you typed is lost.')
       expect(screen.getByTestId('crewmate-create-form')).toBeInTheDocument()
       expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('radar')
       expect(currentUrl()).toBe('/members?member=oncall')
@@ -3137,7 +3261,7 @@ describe('New crewmate dialog', () => {
       // so the page asks the card's own guard before it would drop the text.
       clickRawMembers()
       await waitFor(() => expect(confirmSpy).toHaveBeenCalledTimes(1))
-      expect(confirmSpy).toHaveBeenCalledWith('Leave this page? Your unsaved crewmate draft will be lost.')
+      expect(confirmSpy).toHaveBeenCalledWith('Leave this page? The New crewmate dialog closes and what you typed is lost.')
       expect(screen.getByTestId('crewmate-create-form')).toBeInTheDocument()
       expect((screen.getByLabelText('Name') as HTMLInputElement).value).toBe('radar')
       confirmSpy.mockReturnValue(true)
@@ -3274,6 +3398,8 @@ describe('New crewmate dialog', () => {
       triggers: '',
       session_color: '',
       first_greeting: true,
+      // New mates default to a name-seeded icon avatar, never the trait ghost.
+      avatar: expect.objectContaining({ kind: 'icon', pose: expect.any(String), bg: expect.stringMatching(/^#[0-9a-f]{6}$/i) }),
     }))
     // Roster re-read BEFORE the URL names the new crewmate, then its chat
     // opens through the verified thread endpoint, like any click would.
@@ -3309,7 +3435,11 @@ describe('New crewmate dialog', () => {
       description: '',
       first_greeting: true,
     }))
-    expect(vi.mocked(api.createKirocrewAgent).mock.calls[0][0]).not.toHaveProperty('avatar')
+    // Built from a name alone, the new mate wears a name-seeded ICON (pose +
+    // colour), not the trait ghost a missing avatar used to fall back to.
+    const createdBody = vi.mocked(api.createKirocrewAgent).mock.calls[0][0] as { avatar: { kind: string; pose: string; bg: string } }
+    expect(createdBody.avatar).toMatchObject({ kind: 'icon' })
+    expect(createdBody.avatar.bg).toMatch(/^#[0-9a-f]{6}$/i)
     await waitFor(() => expect(screen.getByTestId('chat-pane-stub')).toHaveTextContent('member-radar'), PANE_READY)
     await waitFor(() => expect(api.memberGreet).toHaveBeenCalledWith('radar'), PANE_READY)
     // Once, and never as a message the user typed.
@@ -3381,21 +3511,24 @@ describe('New crewmate dialog', () => {
     await renderPage([row()])
     expect(await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)).toHaveTextContent('member-oncall')
     await openDialog()
+    // Capture the create modal while it is still the active dialog: once the
+    // nested New workspace form opens, the create modal goes inert
+    // (aria-hidden), which removes its `dialog` role from the a11y tree.
+    const outerDialog = screen.getByRole('dialog', { name: 'New crewmate' })
     unfoldAdvanced()
     const workspace = await screen.findByRole('combobox', { name: 'Workspace' })
     fireEvent.keyDown(workspace, { key: 'ArrowDown' })
     fireEvent.click(await screen.findByRole('option', { name: '+ New workspace…' }))
-    // The form is in place (no modal of its own); the nested form is the only
-    // dialog, and the outer form's own exits wait for it.
-    const outerDialog = screen.getByTestId('crewmate-create-embedded')
-    expect(within(outerDialog).getByRole('button', { name: 'Cancel', hidden: true })).toBeDisabled()
+    // While the nested form is up the outer modal's own exit (its header X,
+    // "Close") is disabled.
+    expect(within(outerDialog).getByRole('button', { name: 'Close', hidden: true })).toBeDisabled()
     expect(document.querySelector('.z-\\[109\\]')).toBeInTheDocument()
     expect(screen.getByTestId('crewmate-create-submit')).toBeDisabled()
     const wsName = await screen.findByPlaceholderText('e.g. oncall')
     // Empty form: Escape is an ordinary dismissal.
     fireEvent.keyDown(wsName, { key: 'Escape' })
     await waitFor(() => expect(screen.queryByPlaceholderText('e.g. oncall')).toBeNull())
-    expect(within(outerDialog).getByRole('button', { name: 'Cancel' })).toBeEnabled()
+    expect(within(outerDialog).getByRole('button', { name: 'Close' })).toBeEnabled()
     // The crewmate dialog underneath is untouched by that Escape.
     expect(screen.getByTestId('crewmate-create-form')).toBeInTheDocument()
     // Reopen, type a name: Escape is now refused, the draft stays.
@@ -3437,7 +3570,7 @@ describe('New crewmate dialog', () => {
     await waitFor(() => expect(screen.getByRole('combobox', { name: 'Workspace' })).toHaveTextContent('staging'))
     // Dismiss and reopen while the refresh is still pending: the fresh form
     // says default, and the refresh landing later must not change that.
-    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    fireEvent.click(within(screen.getByRole('dialog', { name: 'New crewmate' })).getByRole('button', { name: 'Close' }))
     await waitFor(() => expect(screen.queryByTestId('crewmate-create-form')).toBeNull())
     await openDialog()
     unfoldAdvanced()
@@ -3503,8 +3636,9 @@ describe('New crewmate dialog', () => {
     await settle()
     expectStaleDropped(queryClient, readsSince, readsAtClose)
     expect(cachedWorkspaceNames(queryClient)).toEqual(before)
-    // And the parent's Cancel is live again: the nested dialog is closed for good.
-    expect(screen.getByRole('button', { name: 'Cancel' })).toBeEnabled()
+    // And the parent modal's own exit (its header X, "Close") is live again:
+    // the nested dialog is closed for good.
+    expect(within(screen.getByRole('dialog', { name: 'New crewmate' })).getByRole('button', { name: 'Close' })).toBeEnabled()
   })
 
   it('a workspace create that answers after the nested form\'s X does not change the parent\'s pick or the cache', async () => {
@@ -3520,7 +3654,7 @@ describe('New crewmate dialog', () => {
     finish()
     await settle()
     expectStaleDropped(queryClient, readsSince, readsAtClose)
-    expect(screen.getByRole('button', { name: 'Cancel' })).toBeEnabled()
+    expect(within(screen.getByRole('dialog', { name: 'New crewmate' })).getByRole('button', { name: 'Close' })).toBeEnabled()
   })
 
   it('a workspace create that answers after the nested form was dismissed with Escape does not change the parent\'s pick', async () => {
@@ -3739,9 +3873,9 @@ describe('New crewmate dialog', () => {
     expect(membersMock.mock.results.some((r) => r.value === stalled)).toBe(true)
     expect(notice).toHaveTextContent("Couldn't confirm whether radar was created. Check the list before trying again.")
     expect(api.createKirocrewAgent).toHaveBeenCalledTimes(1)
-    // Unlocked again: the mutation settled, so Cancel is live.
+    // Unlocked again: the mutation settled, so the modal's Close is live.
     expect(screen.getByTestId('crewmate-create-fieldset')).not.toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Cancel' })).toBeEnabled()
+    expect(within(screen.getByRole('dialog', { name: 'New crewmate' })).getByRole('button', { name: 'Close' })).toBeEnabled()
     expect(api.sendChat).not.toHaveBeenCalled()
   })
 
@@ -3847,7 +3981,7 @@ describe('New crewmate dialog', () => {
     await rosterRow('oncall')
     await openDialog()
     await waitFor(() => expect(catalogMock).toHaveBeenCalledTimes(1))
-    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    fireEvent.click(within(screen.getByRole('dialog', { name: 'New crewmate' })).getByRole('button', { name: 'Close' }))
     await waitFor(() => expect(screen.queryByTestId('crewmate-create-form')).toBeNull())
     // A template was installed while the dialog was closed. No server event
     // invalidates this key, so only a per-open re-read can show it.
@@ -3860,7 +3994,7 @@ describe('New crewmate dialog', () => {
     })
     await openDialog()
     await waitFor(() => expect(catalogMock).toHaveBeenCalledTimes(2))
-    const dlg = within(screen.getByTestId('crewmate-create-embedded'))
+    const dlg = within(screen.getByRole('dialog', { name: 'New crewmate' }))
     fireEvent.keyDown(dlg.getByRole('combobox', { name: 'Built from' }), { key: 'ArrowDown' })
     expect(await screen.findByRole('option', { name: 'kirocrew-research' })).toBeInTheDocument()
   })
@@ -4483,7 +4617,7 @@ describe('New crewmate dialog', () => {
     await renderPage([row()])
     await rosterRow('oncall')
     await openDialog()
-    const dlg = within(screen.getByTestId('crewmate-create-embedded'))
+    const dlg = within(screen.getByRole('dialog', { name: 'New crewmate' }))
     await waitFor(() => expect(dlg.getByRole('combobox', { name: 'Built from' })).toHaveTextContent('kirocrew (default)'))
     // A crew alias (`default`) is not a template and must not be offered: a
     // record storing it as `kiro_agent` would boot a fallback, not that crew.
@@ -4551,14 +4685,17 @@ describe('MembersPage create links open the New crewmate card', () => {
     }
     return false
   }
-  const pane = () => screen.getByTestId('member-create-pane')
-  const isHiddenClass = (el: Element) => /(^|\s)hidden(\s|$)/.test(el.className)
-  const cardOpen = () => !isHiddenClass(pane()) && !!within(pane()).queryByTestId('crewmate-create-embedded')
-  const card = () => within(pane()).getByTestId('crewmate-create-embedded')
+  // The create form is now a Modal (`role="dialog"`), portaled over the chat
+  // that stays mounted behind it — no `member-create-pane` wrapper, no
+  // `crewmate-create-embedded` region.
+  const cardOpen = () => screen.queryByRole('dialog') !== null
+  const card = () => screen.getByRole('dialog')
   const nameField = () => within(card()).getByLabelText('Name') as HTMLInputElement
   /** "What it looks after": in the Advanced settings, so present only unfolded. */
   const goalField = () => within(card()).queryByLabelText('What it looks after') as HTMLTextAreaElement | null
-  const closeCard = () => fireEvent.click(within(card()).getByRole('button', { name: 'Cancel' }))
+  // The modal's own header X carries the "Close" name (components.modal.close),
+  // the Modal path's dismiss affordance in place of the embedded card's Cancel.
+  const closeCard = () => fireEvent.click(within(card()).getByRole('button', { name: 'Close' }))
   /** No step of the removed guided flow, and no creation receipt, anywhere. */
   const noGuidedFlow = () => {
     expect(document.querySelector('[data-testid^="meet-crewmates-"]')).toBeNull()
@@ -4583,7 +4720,7 @@ describe('MembersPage create links open the New crewmate card', () => {
     expect(await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)).toHaveTextContent('member-mate')
   }
 
-  it('a create link in Mate\'s chat opens the New crewmate card in place, prefilled: name in Name, goal in What it looks after; the chat stays MOUNTED; nothing is sent', async () => {
+  it('a create link in Mate\'s chat opens the New crewmate card as a modal, prefilled: name in Name, goal in What it looks after; the chat stays MOUNTED and VISIBLE behind it; nothing is sent', async () => {
     await openAssistant()
     const through = passedThrough()
     try {
@@ -4600,9 +4737,10 @@ describe('MembersPage create links open the New crewmate card', () => {
       expect(within(card()).getByTestId('crewmate-create-advanced-toggle')).toHaveAttribute('aria-expanded', 'true')
       expect(goalField()?.value).toBe('Watch the release train')
       noGuidedFlow()
-      // Hidden, not unmounted: same element, no new mount, composer state kept.
+      // Mounted AND visible: the modal is a portaled scrim over the chat, which
+      // keeps its element, its mount, and its composer state behind it.
       expect(screen.getByTestId('chat-pane-stub')).toBe(stub)
-      expect(hiddenByStyle(stub)).toBe(true)
+      expect(hiddenByStyle(stub)).toBe(false)
       expect(chatPaneMounts.count).toBe(mountsBefore)
       closeCard()
       await waitFor(() => expect(cardOpen()).toBe(false))
@@ -4665,7 +4803,8 @@ describe('MembersPage create links open the New crewmate card', () => {
     )
     await waitFor(() => expect(currentUrl()).toBe('/members?member=scout'), PANE_READY)
     await waitFor(() => expect(screen.getByTestId('chat-pane-stub')).toHaveTextContent('member-scout'), PANE_READY)
-    expect(cardOpen()).toBe(false)
+    // The modal closes through its exit motion once the create hands over.
+    await waitFor(() => expect(cardOpen()).toBe(false))
     // No schedule is written by the card: when it runs is settled in the chat.
     expect(api.createCron).not.toHaveBeenCalled()
     // The greeting is the crewmate's own turn, never a message sent for the user.
@@ -4733,7 +4872,7 @@ describe('MembersPage create links open the New crewmate card', () => {
   it('a create link the guide already asked about replaces an edited card without asking again', async () => {
     await openAssistant()
     await clickAddAdvanced()
-    await screen.findByTestId('crewmate-create-embedded')
+    await screen.findByRole('dialog')
     fireEvent.change(nameField(), { target: { value: 'half-typed' } })
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
     try {
@@ -4751,32 +4890,35 @@ describe('MembersPage create links open the New crewmate card', () => {
     }
   })
 
-  it('a hidden chat behind a creation surface is not the viewed thread, and is again once the chat returns', async () => {
+  it('a chat behind a creation surface is not the viewed thread, and is again once the chat returns', async () => {
     vi.spyOn(document, 'hasFocus').mockReturnValue(true)
     await openAssistant()
     await waitFor(() => expect(getViewedThreadSlot()).toBe('member-mate'))
+    expect(getMountedMemberThreadSlot()).toBe('member-mate')
     await clickAddAdvanced()
-    await screen.findByTestId('crewmate-create-embedded')
-    // Messages arriving now must badge: nobody is looking at this chat.
+    await screen.findByRole('dialog')
+    // Messages arriving now must badge: the create surface is open over this
+    // chat (keyed off createOpen, not off a hidden column), so it is not the
+    // viewed thread even though the chat stays mounted behind the modal.
     await waitFor(() => expect(getViewedThreadSlot()).toBeNull())
-    fireEvent.click(within(screen.getByTestId('crewmate-create-embedded')).getByRole('button', { name: 'Cancel' }))
+    expect(getMountedMemberThreadSlot()).toBeNull()
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Close' }))
     await waitFor(() => expect(getViewedThreadSlot()).toBe('member-mate'))
+    expect(getMountedMemberThreadSlot()).toBe('member-mate')
   })
 
-  it('Advanced opens the full form IN PLACE of the chat: chat and side panel hidden, chat still mounted', async () => {
+  it('Advanced opens the full form as a modal over the chat: chat still mounted and visible behind the scrim', async () => {
     await openAssistant()
     const stub = screen.getByTestId('chat-pane-stub')
     const mountsBefore = chatPaneMounts.count
     await clickAddAdvanced()
-    await screen.findByTestId('crewmate-create-embedded')
-    expect(screen.queryByRole('dialog')).toBeNull()
-    expect(hiddenByStyle(stub)).toBe(true)
-    const panel = screen.queryByTestId('member-side-panel')
-    if (panel) expect(panel.closest('.hidden')).not.toBeNull()
-    expect(isHiddenClass(screen.getByTestId('member-create-advanced'))).toBe(false)
-    fireEvent.click(within(screen.getByTestId('crewmate-create-embedded')).getByRole('button', { name: 'Cancel' }))
-    await waitFor(() => expect(screen.queryByTestId('crewmate-create-embedded')).toBeNull())
-    expect(isHiddenClass(pane())).toBe(true)
+    const dialog = await screen.findByRole('dialog')
+    // A modal now, not an in-place region: the chat is mounted AND visible
+    // behind the portaled scrim, and the Advanced region is unfolded in it.
+    expect(hiddenByStyle(stub)).toBe(false)
+    expect(within(dialog).getByTestId('crewmate-create-advanced')).toBeInTheDocument()
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
     expect(screen.getByTestId('chat-pane-stub')).toBe(stub)
     expect(hiddenByStyle(stub)).toBe(false)
     expect(chatPaneMounts.count).toBe(mountsBefore)
@@ -4804,7 +4946,8 @@ describe('MembersPage create links open the New crewmate card', () => {
       await waitFor(() => expect(cardOpen()).toBe(true))
       fireEvent.click(await rosterRow('alpha'))
       await waitFor(() => expect(screen.getByTestId('chat-pane-stub')).toHaveTextContent('member-alpha'), PANE_READY)
-      expect(cardOpen()).toBe(false)
+      // The modal closes through its exit motion as the chat opens.
+      await waitFor(() => expect(cardOpen()).toBe(false))
       expect(confirm).not.toHaveBeenCalled()
       expect(hiddenByStyle(screen.getByTestId('chat-pane-stub'))).toBe(false)
     } finally {
@@ -4819,7 +4962,7 @@ describe('MembersPage create links open the New crewmate card', () => {
       ;(api.createKirocrewAgent as ReturnType<typeof vi.fn>).mockReturnValueOnce(new Promise((resolve) => { finish = resolve }))
       await openAssistant()
       await clickAddCrewmate()
-      await screen.findByTestId('crewmate-create-embedded')
+      await screen.findByRole('dialog')
       fireEvent.change(nameField(), { target: { value: 'radar' } })
       fireEvent.click(screen.getByTestId('crewmate-create-submit'))
       await waitFor(() => expect(api.createKirocrewAgent).toHaveBeenCalledTimes(1))
@@ -4853,15 +4996,15 @@ describe('MembersPage create links open the New crewmate card', () => {
       ;(api.createKirocrewAgent as ReturnType<typeof vi.fn>).mockReturnValueOnce(new Promise((resolve) => { finish = resolve }))
       await openAssistant()
       await clickAddCrewmate()
-      await screen.findByTestId('crewmate-create-embedded')
+      await screen.findByRole('dialog')
       fireEvent.change(nameField(), { target: { value: 'radar' } })
       fireEvent.click(screen.getByTestId('crewmate-create-submit'))
       await waitFor(() => expect(api.createKirocrewAgent).toHaveBeenCalledTimes(1))
       fireEvent.click(await rosterRow('alpha'))
       await waitFor(() => expect(screen.getByTestId('chat-pane-stub')).toHaveTextContent('member-alpha'), PANE_READY)
-      await waitFor(() => expect(screen.getByTestId('member-create-pane')).toHaveClass('hidden'))
+      await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
       await clickAddCrewmate()
-      expect(screen.getByTestId('member-create-pane')).toHaveClass('hidden')
+      expect(screen.queryByRole('dialog')).toBeNull()
       expect(screen.getByTestId('chat-pane-stub')).toHaveTextContent('member-alpha')
       await act(async () => { finish({ ok: true }) })
       expect(screen.getByTestId('chat-pane-stub')).toHaveTextContent('member-alpha')
@@ -4877,7 +5020,7 @@ describe('MembersPage create links open the New crewmate card', () => {
       ;(api.createKirocrewAgent as ReturnType<typeof vi.fn>).mockReturnValueOnce(new Promise((_, reject) => { fail = reject }))
       await openAssistant()
       await clickAddCrewmate()
-      await screen.findByTestId('crewmate-create-embedded')
+      await screen.findByRole('dialog')
       fireEvent.change(nameField(), { target: { value: 'radar' } })
       fireEvent.click(screen.getByTestId('crewmate-create-submit'))
       await waitFor(() => expect(api.createKirocrewAgent).toHaveBeenCalledTimes(1))
@@ -4901,7 +5044,7 @@ describe('MembersPage create links open the New crewmate card', () => {
       ;(api.createKirocrewAgent as ReturnType<typeof vi.fn>).mockReturnValueOnce(new Promise((resolve) => { finish = resolve }))
       await openAssistant()
       await clickAddCrewmate()
-      await screen.findByTestId('crewmate-create-embedded')
+      await screen.findByRole('dialog')
       fireEvent.change(nameField(), { target: { value: 'radar' } })
       fireEvent.click(screen.getByTestId('crewmate-create-submit'))
       await waitFor(() => expect(api.createKirocrewAgent).toHaveBeenCalledTimes(1))
@@ -4932,7 +5075,7 @@ describe('MembersPage create links open the New crewmate card', () => {
     try {
       await openAssistant()
       await clickAddCrewmate()
-      await screen.findByTestId('crewmate-create-embedded')
+      await screen.findByRole('dialog')
       fireEvent.change(nameField(), { target: { value: 'half-typed' } })
       await clickAddCrewmate()
       await waitFor(() => expect(confirm).toHaveBeenCalledTimes(1))
@@ -6025,13 +6168,14 @@ describe('MembersPage default member, memory and URL', () => {
       await clickAddCrewmate()
       // Opened on the drawer's own duplicate entry, so the close spends it.
       await waitFor(() => expect(navigateSpy).toHaveBeenCalledWith(-1))
-      const pane = screen.getByTestId('member-create-pane')
-      await waitFor(() => expect(pane.className).not.toMatch(/(^|\s)hidden(\s|$)/))
+      // The modal is responsive: below md its DialogContent fills the frame
+      // (w-[calc(100%-4rem)]). It renders as a role="dialog".
+      const dialog = await screen.findByRole('dialog')
       // The creation surface retires the drawer and the roster yields with it.
       await waitFor(() => expect(screen.queryByTestId('roster-drawer')).toBeNull(), { timeout: 3000 })
       expect(screen.getByTestId('member-roster').className).toMatch(/(^|\s)hidden(\s|$)/)
-      fireEvent.click(within(await within(pane).findByTestId('crewmate-create-embedded')).getByRole('button', { name: 'Cancel' }))
-      await waitFor(() => expect(pane.className).toMatch(/(^|\s)hidden(\s|$)/))
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }))
+      await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
       expect(currentUrl()).toBe('/members?member=alpha')
       expect(screen.getByTestId('chat-pane-stub')).toHaveTextContent('member-alpha')
     })
@@ -6042,8 +6186,7 @@ describe('MembersPage default member, memory and URL', () => {
       await openRosterDrawer()
       navigateSpy.mockClear()
       fireEvent.click(screen.getByTestId('guide-nav-granted'))
-      const pane = screen.getByTestId('member-create-pane')
-      await waitFor(() => expect(pane.className).not.toMatch(/(^|\s)hidden(\s|$)/))
+      await screen.findByRole('dialog')
       await waitFor(() => expect(screen.queryByTestId('roster-drawer')).toBeNull(), { timeout: 3000 })
       // The pop would have taken the guide's entry, not the drawer's duplicate.
       expect(navigateSpy).not.toHaveBeenCalledWith(-1)
@@ -6399,7 +6542,7 @@ describe('MembersPage cold welcome (a new or long-idle thread)', () => {
     // A message from the crewmate in its chat, not a card above it.
     expectCrewmateMessage(card)
     expect(api.memberRecap).toHaveBeenCalledExactlyOnceWith('oncall', 'oncall')
-    expect(within(card).getByTestId('member-welcome-items')).toHaveTextContent('Paused: Rotate the pager keys (next: confirm with Sam)')
+    expect(within(card).getByTestId('member-welcome-items')).toHaveTextContent('Paused: Rotate the pager keys (its next step: confirm with Sam)')
     expect(within(card).getByTestId('member-welcome-items')).toHaveTextContent("Recent session, may be finished: Triage last night's alarms")
     expect(screen.queryByTestId('member-resume-card')).toBeNull()
     expect(api.sendChat).not.toHaveBeenCalled()
@@ -6407,7 +6550,7 @@ describe('MembersPage cold welcome (a new or long-idle thread)', () => {
   })
 })
 
-describe('MembersPage warm greeting (a return in the middle of a goal)', () => {
+describe('MembersPage active task greeting', () => {
   const midGoal = {
     conductor: { schema: 1, slot_key: 'member-oncall', goal: 'Ship the crew page', round: 1, depth: 0, parent_item: null, created_at: '' },
     conductor_alive: 'idle',
@@ -6420,107 +6563,49 @@ describe('MembersPage warm greeting (a return in the middle of a goal)', () => {
   }
   beforeEach(() => { sessionStorage.clear() })
 
-  it('opening a crewmate mid-goal says where the goal stands and the next step, as its message in the chat, without a chat turn', async () => {
+  it('opening a crewmate mid-goal shows no immediate static warm card', async () => {
     vi.mocked(api.crewBoard).mockResolvedValue(midGoal as never)
     await renderPage([row()])
     fireEvent.click(await rosterRow('oncall'))
-    const card = await screen.findByTestId('member-resume-card', undefined, PANE_READY)
-    expectCrewmateMessage(card)
-    expect(api.crewBoard).toHaveBeenCalledExactlyOnceWith('member-oncall')
-    expect(within(card).getByTestId('member-resume-goal')).toHaveTextContent('Ship the crew page')
-    expect(within(card).getByTestId('member-resume-counts')).toHaveTextContent('Finished 1 · Running 1 · Idle 0 · Needs a look 1')
-    expect(within(card).getByTestId('member-resume-attention')).toHaveTextContent('Write the RFC has a question waiting')
-    expect(within(card).getByTestId('member-resume-next')).toHaveTextContent('Next: tell oncall here how to answer the question on Write the RFC.')
-    expect(api.sendChat).not.toHaveBeenCalled()
-
-    fireEvent.click(within(card).getByTestId('member-resume-dismiss'))
+    await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)
+    await waitFor(() => expect(api.crewBoard).toHaveBeenCalledExactlyOnceWith('member-oncall'))
     expect(screen.queryByTestId('member-resume-card')).toBeNull()
+    expect(api.memberRecap).not.toHaveBeenCalled()
+    expect(api.sendChat).not.toHaveBeenCalled()
   })
 
-  it('a failed status read is said through ErrorNotice, not hidden as "no ledger"', async () => {
+  it('return summary rows stay ordinary crewmate messages', async () => {
+    vi.mocked(api.crewBoard).mockResolvedValue(midGoal as never)
+    const { store } = await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
+    fireEvent.click(await rosterRow('oncall'))
+    await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)
+    act(() => {
+      store.dispatch(sseChatMessage({
+        slot: 'member-oncall',
+        role: 'assistant',
+        cls: 'msg msg-a',
+        content: 'Preparing your current-task summary. You can wait here.',
+        meta: { kind: 'warm_task_brief_preparing' },
+      }))
+      store.dispatch(sseChatMessage({
+        slot: 'member-oncall',
+        role: 'assistant',
+        cls: 'msg msg-a',
+        content: 'Problem\nFix the current task\n\nCurrent status\n- Ready\n\nSuggested actions\n1. Review it',
+        meta: { kind: 'warm_task_brief_result' },
+      }))
+    })
+    const messages = store.getState().chat.slotMessages['member-oncall']
+    expect(messages.slice(-2).map(message => message.role)).toEqual(['assistant', 'assistant'])
+    expect(screen.queryByTestId('warm-task-brief-card')).toBeNull()
+  })
+
+  it('a failed board read uses the cold-welcome error surface', async () => {
     vi.mocked(api.crewBoard).mockRejectedValue(Object.assign(new Error('ledger needs repair'), { status: 409 }))
     await renderPage([row()])
     fireEvent.click(await rosterRow('oncall'))
-    expect(await screen.findByTestId('member-resume-error', undefined, PANE_READY)).toHaveTextContent("Could not read where oncall's goal stands.")
+    expect(await screen.findByTestId('member-resume-error', undefined, PANE_READY)).toHaveTextContent("Couldn't read what oncall was working on.")
     expect(screen.queryByTestId('member-resume-card')).toBeNull()
   })
 
-  it('a crewmate opened while its own turn runs gets no greeting: its reply is about to speak', async () => {
-    vi.mocked(api.crewBoard).mockResolvedValue(midGoal as never)
-    const { store } = await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
-    act(() => {
-      store.dispatch(sseSlots([{ key: 'member-oncall', mode: 'member', running: true, messages: 1 }] as never))
-    })
-    fireEvent.click(await rosterRow('oncall'))
-    await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)
-    expect(api.crewBoard).not.toHaveBeenCalled()
-    expect(screen.queryByTestId('member-resume-card')).toBeNull()
-  })
-
-  // A conductor's monitor loop wakes it every few minutes. Those patrol turns
-  // are not a reply to the user, so they neither skip nor take down the card.
-  const TURN_TEXT = { nudge: '[auto-nudge cycle 2] Checking on round 3', subagent: 'Worker K finished: CODED', user: 'how is it going?' }
-  const turnStarts = (store: { dispatch: (a: unknown) => unknown }, role: 'nudge' | 'subagent' | 'user') => {
-    store.dispatch(sseChatMessage({ slot: 'member-oncall', role, content: TURN_TEXT[role] }))
-    store.dispatch(sseSlots([{ key: 'member-oncall', mode: 'member', running: true, messages: 2 }] as never))
-  }
-
-  it('a patrol turn starting keeps the card up; a turn the user starts takes it down', async () => {
-    vi.mocked(api.crewBoard).mockResolvedValue(midGoal as never)
-    const { store } = await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
-    fireEvent.click(await rosterRow('oncall'))
-    await screen.findByTestId('member-resume-card', undefined, PANE_READY)
-    act(() => { turnStarts(store, 'nudge') })
-    expect(screen.getByTestId('member-resume-card')).toBeInTheDocument()
-    act(() => { turnStarts(store, 'user') })
-    expect(screen.queryByTestId('member-resume-card')).toBeNull()
-  })
-
-  it('a worker finishing after the user\'s turn wakes the crewmate in the background: the card stays up', async () => {
-    vi.mocked(api.crewBoard).mockResolvedValue(midGoal as never)
-    const { store } = await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
-    act(() => { store.dispatch(sseChatMessage({ slot: 'member-oncall', role: 'user', content: TURN_TEXT.user })) })
-    fireEvent.click(await rosterRow('oncall'))
-    await screen.findByTestId('member-resume-card', undefined, PANE_READY)
-    act(() => { turnStarts(store, 'subagent') })
-    expect(screen.getByTestId('member-resume-card')).toBeInTheDocument()
-  })
-
-  it('a crewmate opened during a patrol turn still greets with where its goal stands', async () => {
-    vi.mocked(api.crewBoard).mockResolvedValue(midGoal as never)
-    const { store } = await renderPage([row()])
-    // The patrol turn runs before the roster lands; the page then opens its
-    // only crewmate on its own (a click now would be a re-click repair).
-    act(() => { turnStarts(store, 'nudge') })
-    await screen.findByTestId('member-resume-card', undefined, PANE_READY)
-    expect(api.crewBoard).toHaveBeenCalledExactlyOnceWith('member-oncall')
-  })
-
-  it('a running crewmate whose transcript lands after the open is judged by it: a patrol still greets', async () => {
-    vi.mocked(api.crewBoard).mockResolvedValue(midGoal as never)
-    const { store } = await renderPage([row()])
-    act(() => { store.dispatch(sseSlots([{ key: 'member-oncall', mode: 'member', running: true, messages: 1 }] as never)) })
-    await screen.findByTestId('chat-pane-stub', undefined, PANE_READY)
-    expect(api.crewBoard).not.toHaveBeenCalled()
-    act(() => { store.dispatch(sseChatMessage({ slot: 'member-oncall', role: 'nudge', content: '[auto-nudge cycle 2] Checking on round 3' })) })
-    await screen.findByTestId('member-resume-card', undefined, PANE_READY)
-    expect(api.crewBoard).toHaveBeenCalledExactlyOnceWith('member-oncall')
-  })
-
-  it('a monitor wake whose slot runs before its row is written keeps the card up', async () => {
-    vi.mocked(api.crewBoard).mockResolvedValue(midGoal as never)
-    const { store } = await renderPage([row({ bound: true, slot_key: 'member-oncall' })])
-    act(() => { store.dispatch(sseChatMessage({ slot: 'member-oncall', role: 'user', content: TURN_TEXT.user })) })
-    fireEvent.click(await rosterRow('oncall'))
-    await screen.findByTestId('member-resume-card', undefined, PANE_READY)
-    // A structured monitor writes its row only once its turn is accepted, so the
-    // slot runs first while the user's older row is still the newest; the frame
-    // says a wake is starting.
-    act(() => {
-      store.dispatch(sseSlots([{ key: 'member-oncall', mode: 'member', running: true, wake_starting: true, messages: 1 }] as never))
-    })
-    expect(screen.getByTestId('member-resume-card')).toBeInTheDocument()
-    act(() => { turnStarts(store, 'nudge') })
-    expect(screen.getByTestId('member-resume-card')).toBeInTheDocument()
-  })
 })

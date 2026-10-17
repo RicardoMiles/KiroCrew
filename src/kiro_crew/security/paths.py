@@ -147,7 +147,7 @@ _SENSITIVE_HOME_DIRS: list[str] = [
     # covered too. Agent file tools must not read them through the shared gate.
     # The internal reader opens the DB read-only + SEL-audited (NOT via
     # is_sensitive_path), so it still works; the sandbox bind-mount list
-    # (sandbox.py) is SEPARATE, so kiro-cli's own auth is unaffected.
+    # (sandbox_tiers.py) is SEPARATE, so kiro-cli's own auth is unaffected.
     # The identity-store directories come from the single canonical table
     # (``identity_stores.IDENTITY_STORE_ROOTS``) so this fence and the five other
     # readers cannot drift apart. The splice emits all eight in table
@@ -411,6 +411,9 @@ _CREW_SECRET_LEAVES: list[str] = [
     # run it; file tools must not inspect or replace the executable the
     # unsandboxed gateway later uses for startup cleanup and owner launches.
     "playwright-cli",
+    # KAS engine bundles the gateway installs then executes (``acp.kas_bundle``);
+    # same class as ``playwright-cli``: READONLY in-sandbox, fenced from file tools.
+    "engines",
     # Legacy SEL HMAC key location (pre-``trust/`` installs, and any stale file
     # a backup restore resurrects). Kept alongside the ``trust``
     # directory entry below so the key is gated at BOTH locations.
@@ -786,7 +789,7 @@ _CREW_SECRET_LEAVES: list[str] = [
     # dashboard render/relay) open it directly in-process.
     "mcp-apps",
     # Runtime exec dir. ``run/`` holds paths the gateway executes OUTSIDE the
-    # agent sandbox: the sandbox launcher scripts (``sandbox.py`` execs
+    # agent sandbox: the sandbox launcher scripts (``sandbox_argv.py`` execs
     # ``python <home>/run/kirocrew_sandbox_*.py``) and the remote-instance
     # run-marker ``gateway-<port>.bin`` (``instances/run_marker.py``), whose
     # contents the SSH token-mint reads and ``exec``s on the remote host. A
@@ -1022,8 +1025,9 @@ _WRITE_PROTECTED_HOME_PATHS += [
     # are written by the gateway, and reading them decides nothing inside the sandbox.
     f"{prefix}/{leaf}"
     for prefix in _CREW_HOME_PREFIXES
-    for leaf in ("mcp-launch-approvals", "mcp/resolved", "gateway_id")
+    for leaf in ("mcp-launch-approvals", "mcp/resolved", "gateway_id", "skill-projection")
 ]
+
 _WRITE_PROTECTED_HOME_PATHS += [
     # The cloud launcher's LAUNCH RECORD (``cloud/launch_state.py``): the profile, region
     # and tag the last launch decided. WRITE-protected on the same footing as
@@ -1037,6 +1041,16 @@ _WRITE_PROTECTED_HOME_PATHS += [
     # and sealing it against reads would break them all. The gateway and the CLI write it
     # outside the agent's file-edit gate, so the launch path is unaffected.
     f"{prefix}/cloud_launch_state.json"
+    for prefix in _CREW_HOME_PREFIXES
+]
+_WRITE_PROTECTED_HOME_PATHS += [
+    # The microvm lane's CREW RECORDS (``cloud/microvm/record.py``): the launch record's
+    # reason above without the confirmation step it still has. Each row carries a
+    # ``microvm_id`` that ``teardown`` passes straight to ``launcher.terminate``, so an
+    # agent able to write this file could point one crew's row at another crew's VM and
+    # have the owner's next delete destroy that one instead. Readable like the paths
+    # above, and the gateway writes it outside the agent's file-edit gate.
+    f"{prefix}/microvm_crews.json"
     for prefix in _CREW_HOME_PREFIXES
 ]
 _WRITE_PROTECTED_HOME_PATHS += [

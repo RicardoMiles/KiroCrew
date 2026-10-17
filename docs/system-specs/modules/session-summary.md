@@ -20,8 +20,8 @@ to pay for, so the whole subsystem is inert until `session_summary.enabled`.
 | Config section and its clamps | `config/memory_sections.py` (`SessionSummaryConfig`; built by `config/section_builders.py`) |
 | Transcript extraction, payload shaping | `session_summary.py` |
 | Turn-end generation, the prompt | `dashboard/chat_summary.py` |
-| Sidecar cache | `history.py` (`ConversationLog`) |
-| Read endpoint | `dashboard/chat_handlers.py` (`api_chat_slot_summary`) |
+| Sidecar cache | `history_summaries.py` (bound on `ConversationLog`) |
+| Read endpoint | `dashboard/chat_api/slot_summary.py` (`api_chat_slot_summary`) |
 
 ## Storage: a sidecar, never the transcript
 
@@ -492,7 +492,7 @@ incognito mode, liveness, a clean `end_turn`, the turn count and the cadence, an
 nothing else. Coverage is decided instead by *where the generator is called from*:
 the automatic pass has exactly one dispatch site, `_finish_queue_cycle` at the
 tail of a `_ChatSlot` turn in `dashboard/chat_runner.py`, plus the explicit
-on-demand route in `dashboard/chat_handlers.py`. Only a turn that ran through
+on-demand route in `dashboard/chat_api/slot_summary.py`. Only a turn that ran through
 `_run_chat` on a slot reaches the automatic pass — and reaching it is not the same
 as producing a summary, because the gates above still apply. The on-demand route
 is the one path that produces a summary with no turn at all.
@@ -505,7 +505,7 @@ than "not the dashboard":
 | Slack | `slack/handler.py` (native ACP loop) or `messaging/driver.py` (`TurnDriver`) |
 | Discord, Telegram, Teams, Webex, WeCom, WeChat | `messaging/driver.py` (`TurnDriver`), one shared loop |
 | Task runner | `task_executor.py`, streaming an ACP client directly |
-| Cron wake | `slack/gateway.py`; the result is *appended* into a `cron-<id>` slot by `dashboard/cron_inject.py` — a bare append with no turn lifecycle |
+| Cron wake | `slack/gateway_runtime/cron_turn.py` and `cron_delivery.py`; the result is *appended* into a `cron-<id>` slot by `dashboard/cron_inject.py` — a bare append with no turn lifecycle |
 | Agent webhooks | `dashboard/handlers/hooks.py` |
 | Workflow phase calls | `workflows/agent_exec.py` |
 | Subagents | `subagent.py` — never a `_ChatSlot` at all, so a `.intents` sidecar is not reachable |

@@ -36,8 +36,8 @@ const ACTION_CREATORS = [
   'clearSlotReveal', 'clearSlotState', 'clearSubagentsForSnapshot', 'clearSwitchSlotGone',
   'clearTerminalSubagents', 'clearUndeletableHistory', 'clearUnresumableResume',
   'clearWorkflowRun', 'confirmOptimisticSend', 'dismissFollowupItem', 'editQueuedMessage',
-  'endLocalTurn', 'finalizeAssistant', 'hydrateSlotMessages', 'markQuestionSettled', 'markSendUnconfirmed', 'markSubagentApproving',
-  'openActivityPanel', 'openActivityToTab', 'openActivityToTool', 'reconcileSubagentQueuedFromSlots', 'reconcileWorkflowRuns',
+  'endLocalTurn', 'finalizeAssistant', 'hydrateSlotMessages', 'markQuestionSettled', 'markSendUnconfirmed', 'markSubagentApprovalGone', 'markSubagentApproving',
+  'openActivityPanel', 'openActivityToTab', 'openActivityToTool', 'reconcileSubagentApprovalGone', 'reconcileSubagentQueuedFromSlots', 'reconcileWorkflowRuns',
   'removeAutomation', 'removeByApprovalId', 'removeQueuedMessage', 'removeThinking',
   'reorderQueuedMessages', 'replaceMessages', 'requestFolderReveal', 'requestSlotReveal',
   'resolveByApprovalId', 'resolveOptimisticSteer', 'resolveQuestionCard', 'selectSubagent',
@@ -45,7 +45,7 @@ const ACTION_CREATORS = [
   'setFollowupCard', 'setPendingInput', 'setQuestionCard', 'setQuestionDraft', 'setQuestionNotice', 'setQuestionRequestInFlight', 'setSlotRunning',
   'setSlotState', 'setSlotStatusDetail', 'setSlotStopping', 'setStopPressedAt', 'setVoiceAudio',
   'setVoicePlaying', 'setVoicePreparing', 'settleStopNotRunning', 'sideClose', 'sideOptimisticAppend',
-  'sideOptimisticRollback', 'sideReleaseConsumed', 'sseActivityEvent', 'sseAutomation',
+  'sideOptimisticRollback', 'sideReleaseConsumed', 'sideSendStatus', 'sseActivityEvent', 'sseAutomation',
   'sseChatMessage', 'sseChatMessagePatchByTs', 'sseChatMessageUpdate', 'sseContextUsage',
   'sseMcpAppRender', 'sseSideQueue', 'sseSideResult', 'sseSubagentBatchChunks',
   'sseSubagentBatchUpdate', 'sseSubagentDone', 'sseSubagentPending', 'sseSubagentQueued',
@@ -56,6 +56,7 @@ const ACTION_CREATORS = [
 ]
 
 const THUNKS: Record<string, string> = {
+  clearHistorySessions: 'chat/clearHistorySessions',
   createSlot: 'chat/createSlot',
   deleteHistorySession: 'chat/deleteHistorySession',
   deleteSlot: 'chat/deleteSlot',
@@ -65,6 +66,7 @@ const THUNKS: Record<string, string> = {
   loadOlderSlotMessages: 'chat/loadOlderSlot',
   refreshSlot: 'chat/refreshSlot',
   requestStop: 'chat/requestStop',
+  reconcileGoneSubagent: 'chat/reconcileGoneSubagent',
   resumeFromHistory: 'chat/resumeFromHistory',
   switchSlot: 'chat/switchSlot',
   warmSlotCache: 'chat/warmSlotCache',
@@ -72,11 +74,11 @@ const THUNKS: Record<string, string> = {
 
 const FUNCTIONS = [
   'abortActiveOlderFetch', 'batchedTextAboveFloor', 'capturePendingAskId', 'clampToolOutput',
-  'countMatchedFetchLimit', 'floorForGen', 'hasUnidentifiedDurableRow', 'isAnsweredQuestionEnding', 'isAwaitingSpawnApproval',
-  'isSupersededPagingRejection', 'isTerminalWorkflowStatus', 'mcpAppKey', 'missedChunkMarker',
+  'countMatchedFetchLimit', 'floorForGen', 'hasUnidentifiedDurableRow', 'hydrateQueuedBubbles', 'isActiveSubagent', 'isAnsweredQuestionEnding', 'isAwaitingSpawnApproval', 'isSpawnApprovalGone', 'isSpawnApprovalRetired',
+  'isSupersededPagingRejection', 'isTerminalWorkflowStatus', 'mcpAppKey', 'missedChunkMarker', 'normalizeQueueEntries',
   'pendingQuestionFor', 'queueEditBroadcastAt', 'queueEntryAttachments', 'queueEntryQuote', 'raiseChunkSeq',
   'selectActiveSlotProject', 'selectAutomationForSlot', 'selectComposerBusy', 'selectContinuable',
-  'selectSendConfirmed', 'selectSidebarApprovalCounts', 'selectSidebarAutomationRunningKeys',
+  'selectProjectChipLocked', 'selectSendAccepted', 'selectSendConfirmed', 'selectSidebarApprovalCounts', 'selectSidebarAutomationRunningKeys',
   'selectSidebarStartedSubagentCounts', 'selectSidebarSubagentCounts', 'selectSidebarWorkflowActive', 'selectSidebarWorkflowActiveKeys',
   'selectSlotMessages', 'selectSlotPendingApproval', 'selectSlotPendingSpawnApprovals',
   'selectSlotRunEpoch', 'selectSlotStreamState', 'selectSlotSubagents',

@@ -48,6 +48,7 @@ from typing import (
     NamedTuple,
     Optional,
     Sequence,
+    TypeVar,
 )
 
 # Loaded with this module, so each owner is complete before the forwarding at the end of
@@ -6652,6 +6653,11 @@ def _own_identity_token(pid: int) -> str | None:
     return None
 
 
+def process_incarnation_id(pid: int) -> str | None:
+    """Read a reboot-unique process token without the caller-lifetime cache."""
+    return _own_identity_token(pid)
+
+
 def own_process_start_time() -> str | None:
     """This process's own start-time identity, read once and cached.
 
@@ -7687,7 +7693,10 @@ def lstat_is_name_surrogate(info: os.stat_result) -> bool:
     return bool(getattr(info, "st_reparse_tag", 0) & _IO_REPARSE_TAG_NAME_SURROGATE)
 
 
-def strip_extended_length_prefix(path: Path) -> Path:
+_StrOrPath = TypeVar("_StrOrPath", str, Path)
+
+
+def strip_extended_length_prefix(path: _StrOrPath) -> _StrOrPath:
     r"""*path* without Windows' extended-length prefix; unchanged elsewhere.
 
     ``Path.resolve()`` on a file that another thread is replacing at that exact
@@ -8287,9 +8296,9 @@ def open_file_no_reparse(
 
 #: ``CreateFileW`` arguments only :func:`win_open_no_reparse` uses. A directory is
 #: opened for ``LIST_DIRECTORY`` (data access, so it takes part in sharing) with
-#: read-only sharing; a file read-write, open-or-create, sharing read and write.
+#: read-only sharing (``_WIN_FILE_SHARE_READ``, defined above); a file read-write,
+#: open-or-create, sharing read and write.
 _WIN_FILE_LIST_DIRECTORY = 0x00000001
-_WIN_FILE_SHARE_READ = 0x00000001
 _WIN_OPEN_ALWAYS = 4
 #: ``FILE_INFO_BY_HANDLE_CLASS.FileAttributeTagInfo``.
 _WIN_FILE_ATTRIBUTE_TAG_INFO = 9
@@ -8994,32 +9003,53 @@ def _glibc_mallopt() -> Callable[[int, int], int] | None:
         return None
 
 
+class MallocArenaCap(NamedTuple):
+    """What :func:`limit_malloc_arenas` did.
+
+    ``applied`` is the cap known to be in force, else 0. ``requested`` is the
+    cap handed to ``mallopt`` (0 when none was), and ``threads`` the OS thread
+    count just before that call. ``requested`` without ``applied`` means glibc
+    accepted the value but it may not hold: see :func:`limit_malloc_arenas`.
+    """
+
+    applied: int = 0
+    requested: int = 0
+    threads: int | None = None
+
+
 def limit_malloc_arenas(
     *,
     environ: Mapping[str, str] | None = None,
     mallopt: Callable[[int, int], int] | None = None,
-) -> int:
-    """Cap glibc malloc arenas for THIS process; return the cap applied, else 0.
+    thread_count: Callable[[], int | None] | None = None,
+) -> MallocArenaCap:
+    """Cap glibc malloc arenas for THIS process.
 
     Called first thing in the gateway command, so it holds for every launcher
     (systemd unit, pod, detached start, Dev Fleet re-exec) without depending on
     each one exporting ``MALLOC_ARENA_MAX`` before exec. ``mallopt`` is used
     rather than the env var because glibc reads that variable once, at its first
-    allocation -- long before any Python code runs. Arenas made before the call
-    keep serving; only new ones are refused, so calling it before the gateway
-    starts its thread pools is what makes it effective.
+    allocation -- long before any Python code runs.
+
+    glibc fixes its arena limit for good the first time a thread needs a new
+    arena while more than 8 exist; ``mallopt(M_ARENA_MAX)`` after that still
+    returns success but changes nothing. A single-threaded process has only the
+    main arena, so the cap is reported as ``applied`` only when this process
+    had exactly one OS thread at the call. With more threads (or an unreadable
+    count) the value is still handed to glibc, but reported as ``requested``
+    only, because whether it holds cannot be seen.
 
     An operator's own ``MALLOC_ARENA_MAX`` or ``glibc.malloc.arena_max`` tunable
     already took effect at process start and wins: nothing is changed. No-op on
     every non-Linux platform and on a non-glibc libc. Never raises.
     """
     if not IS_LINUX:
-        return 0
+        return MallocArenaCap()
     env = os.environ if environ is None else environ
     if env.get("MALLOC_ARENA_MAX", "").strip():
-        return 0
+        return MallocArenaCap()
     if "glibc.malloc.arena_max" in env.get("GLIBC_TUNABLES", ""):
-        return 0
+        return MallocArenaCap()
     value = GATEWAY_MALLOC_ARENA_MAX
     raw = env.get(MALLOC_ARENA_MAX_ENV, "").strip()
     if raw:
@@ -9028,14 +9058,30 @@ def limit_malloc_arenas(
         except ValueError:
             value = GATEWAY_MALLOC_ARENA_MAX
     if value <= 0:
-        return 0
+        return MallocArenaCap()
     try:
         fn = mallopt or _glibc_mallopt()
         if fn is None:
-            return 0
-        return value if fn(_M_ARENA_MAX, value) == 1 else 0
+            return MallocArenaCap()
+        threads = thread_count() if thread_count else process_thread_count(os.getpid())
+        if fn(_M_ARENA_MAX, value) != 1:
+            return MallocArenaCap(threads=threads)
+        return MallocArenaCap(value if threads == 1 else 0, value, threads)
     except Exception:  # noqa: BLE001 - an allocator hint must never stop the boot
-        return 0
+        return MallocArenaCap()
+
+
+def log_malloc_arena_cap(result: MallocArenaCap) -> None:
+    """Log *result* once logging is configured; silent when nothing was asked."""
+    if result.applied:
+        logger.info("glibc malloc arenas capped at %d", result.applied)
+    elif result.requested:
+        logger.warning(
+            "glibc malloc arena cap %d may not hold: %s OS threads were already "
+            "running when it was set",
+            result.requested,
+            "an unknown number of" if result.threads is None else result.threads,
+        )
 
 
 def trim_heap_if_needed(

@@ -21,11 +21,13 @@ from kiro_crew.messaging.link import ChannelLink
 from kiro_crew.session import (
     _BG_BLIND_RECYCLE_PROMPTS,
     BACKGROUND_KEY,
+    CONSOLIDATE_KEY,
     SessionClosingError,
     SessionEndingError,
     SessionManager,
 )
 from kiro_crew.start_priority import StartPriority
+from kiro_crew.testing.wait import async_wait_until, await_until
 
 
 @pytest.fixture
@@ -33,6 +35,11 @@ def cfg():
     c = KiroCrewConfig()
     c.session.timeout_secs = 2  # short for testing
     return c
+
+
+#: Ceiling for a wait that only fails on a hang: these steps finish in
+#: milliseconds, so a test fails by name instead of losing the xdist worker.
+_HANG_CEILING_S = 30
 
 
 async def _empty_provider_stream(_command: str):
@@ -425,7 +432,7 @@ class TestSessionManager:
         # With self._lock pinned by a2 (buggy) this hangs; with the fix a2
         # released the lock before blocking, so B cold-starts freely.
         b = asyncio.create_task(mgr.get_or_create("B"))
-        provider_b, is_new_b, _ = await asyncio.wait_for(b, timeout=3.0)
+        provider_b, is_new_b, _ = await await_until(b, what="B cold-starting")
         assert provider_b is not None
         assert is_new_b is True
 
@@ -477,7 +484,7 @@ class TestSessionManager:
         # While the loser is wedged, a DIFFERENT key must still cold-start. On
         # the buggy cold-start path the loser holds self._lock — this hangs.
         b = asyncio.create_task(mgr.get_or_create("B"))
-        provider_b, is_new_b, _ = await asyncio.wait_for(b, timeout=3.0)
+        provider_b, is_new_b, _ = await await_until(b, what="B cold-starting")
         assert provider_b is not None
         assert is_new_b is True
 
@@ -495,7 +502,7 @@ class TestSessionManager:
         await asyncio.sleep(0.2)
         assert not second.done()  # blocked on A's semaphore, as intended
         mgr.release("A")  # let the first holder's turn "finish"
-        provider, _, _ = await asyncio.wait_for(second, timeout=3.0)
+        provider, _, _ = await await_until(second, what="the serialized claim landing")
         assert provider is not None
         mgr.release("A")
 
@@ -523,7 +530,7 @@ class TestSessionManager:
         p1.is_alive = lambda: False
 
         mgr.release("A")  # caller 1's turn ends; caller 2 acquires + re-validates
-        p2, is_new2, _ = await asyncio.wait_for(second, timeout=3.0)
+        p2, is_new2, _ = await await_until(second, what="the re-validated claim landing")
 
         assert p2 is not p1  # cold-started a fresh provider
         assert is_new2 is True  # reported as new
@@ -567,6 +574,118 @@ class TestWarmPool:
         await mgr.get_or_create(BACKGROUND_KEY, agent=BACKGROUND_AGENT)
         assert calls, "first use with the background agent skipped _ensure_background"
         assert BACKGROUND_KEY in mgr._sessions
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_deferred_background_first_use_by_a_custom_agent(self, cfg):
+        """The task runner's lesson extraction asks for ``_bg`` with the run's own
+        agent. When it is the first user, ``_bg`` must still be created as the
+        background agent: the session is shared and persistent, so every later
+        background job would otherwise run on the custom agent."""
+        from kiro_crew.session import BACKGROUND_AGENT
+
+        created: list[object] = []
+        inner = _mock_provider_factory()
+
+        def factory(session_key=None, agent=None, **kwargs):
+            if session_key == BACKGROUND_KEY:
+                created.append(agent)
+            return inner(session_key, agent, **kwargs)
+
+        mgr = SessionManager(cfg, provider_factory=factory)
+        await mgr.start_pool()
+        assert BACKGROUND_KEY not in mgr._sessions
+
+        await mgr.get_or_create(BACKGROUND_KEY, agent="my-custom-agent")
+        mgr.release(BACKGROUND_KEY)
+
+        assert created == [BACKGROUND_AGENT]
+        assert mgr._sessions[BACKGROUND_KEY].agent == BACKGROUND_AGENT
+        await mgr.close_all()
+
+    @staticmethod
+    def _gated_bg_factory(monkeypatch, gates):
+        """A factory whose ``_bg`` providers block in ``start`` on ``gates[i]``.
+
+        Returns ``(factory, starts, started)``: ``starts`` lists each ``_bg``
+        provider as its start begins, ``started[i]`` is set when the i-th start
+        begins. ``warm_agent_specs`` is stubbed so the path to ``start`` stays on
+        the loop, and yielding the loop is enough for a second caller to reach
+        its own start if nothing serializes it.
+        """
+        import kiro_crew.session_background as session_background
+
+        async def _no_warm(**_kwargs):
+            return None
+
+        monkeypatch.setattr(session_background, "warm_agent_specs", _no_warm)
+        starts: list[object] = []
+        started = [asyncio.Event() for _ in gates]
+        inner = _mock_provider_factory()
+
+        def factory(session_key=None, agent=None, **kwargs):
+            provider = inner(session_key, agent, **kwargs)
+            if session_key == BACKGROUND_KEY:
+
+                async def _start():
+                    index = len(starts)
+                    starts.append(provider)
+                    started[index].set()
+                    await gates[index].wait()
+
+                provider.start = _start
+            return provider
+
+        return factory, starts, started
+
+    @pytest.mark.asyncio
+    async def test_concurrent_first_uses_start_one_background_session(self, cfg, monkeypatch):
+        """Two first-time ``_bg`` users at once cold-start ONE process; the second
+        waits for the first and reuses its session."""
+        gate = asyncio.Event()
+        factory, starts, started = self._gated_bg_factory(monkeypatch, [gate, gate])
+        mgr = SessionManager(cfg, provider_factory=factory)
+        await mgr.start_pool()
+        assert BACKGROUND_KEY not in mgr._sessions
+
+        first = asyncio.create_task(mgr._ensure_background())
+        await asyncio.wait_for(started[0].wait(), _HANG_CEILING_S)
+        second = asyncio.create_task(mgr._ensure_background())
+        for _ in range(50):
+            await asyncio.sleep(0)
+        gate.set()
+        await asyncio.wait_for(asyncio.gather(first, second), _HANG_CEILING_S)
+
+        assert len(starts) == 1, f"{len(starts)} background cold starts ran at once"
+        assert mgr._sessions[BACKGROUND_KEY].provider is starts[0]
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_foreground_first_use_does_not_wait_behind_a_background_start(
+        self, cfg, monkeypatch
+    ):
+        """A person waiting on ``_bg`` must not queue behind a background-priority
+        cold start: the foreground caller runs its own start and returns while the
+        background one is still in flight."""
+        background_gate, foreground_gate = asyncio.Event(), asyncio.Event()
+        foreground_gate.set()
+        factory, starts, started = self._gated_bg_factory(
+            monkeypatch, [background_gate, foreground_gate]
+        )
+        mgr = SessionManager(cfg, provider_factory=factory)
+        await mgr.start_pool()
+
+        background = asyncio.create_task(mgr._ensure_background())
+        await asyncio.wait_for(started[0].wait(), _HANG_CEILING_S)
+        await asyncio.wait_for(
+            mgr._ensure_background(start_priority=StartPriority.FOREGROUND), _HANG_CEILING_S
+        )
+
+        assert not background.done()
+        assert mgr._sessions[BACKGROUND_KEY].provider is starts[1]
+        background_gate.set()
+        await asyncio.wait_for(background, _HANG_CEILING_S)
+        assert mgr._sessions[BACKGROUND_KEY].provider is starts[1]
         await mgr.close_all()
 
     @pytest.mark.asyncio
@@ -664,6 +783,61 @@ class TestWarmPool:
 
         assert BACKGROUND_KEY in mgr._sessions
         await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_consolidation_expires_and_recreates_without_resume(self, cfg):
+        factory = MagicMock(side_effect=_mock_provider_factory())
+        mgr = SessionManager(cfg, provider_factory=factory)
+        mgr._session_map.get = MagicMock(return_value="stale-sid")
+        try:
+            assert CONSOLIDATE_KEY not in mgr._sessions
+            first, _, resumed = await mgr.get_or_create(CONSOLIDATE_KEY, agent="kirocrew-lite")
+            assert not resumed
+            mgr.release(CONSOLIDATE_KEY)
+            assert _raw_sid(mgr, CONSOLIDATE_KEY) is None
+            mgr._sessions[CONSOLIDATE_KEY].last_used = time.monotonic() - 9999
+            await mgr._expire_idle(1)
+            assert CONSOLIDATE_KEY not in mgr._sessions
+            first.shutdown.assert_awaited_once()
+
+            second, is_new, resumed = await mgr.get_or_create(
+                CONSOLIDATE_KEY, agent="kirocrew-lite"
+            )
+            mgr.release(CONSOLIDATE_KEY)
+            assert second is not first
+            assert is_new and not resumed
+            assert _raw_sid(mgr, CONSOLIDATE_KEY) is None
+            assert factory.call_count == 2
+            mgr._session_map.get.assert_not_called()
+        finally:
+            await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_active_consolidation_survives_idle_sweep(self, cfg):
+        from kiro_crew.llm_helpers import background_turn
+
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        try:
+            async with background_turn(
+                mgr, task="consolidation", agent="kirocrew-lite", session_key=CONSOLIDATE_KEY
+            ) as provider:
+                provider.last_prompt_stats = AcpPromptStats()
+                mgr._sessions[CONSOLIDATE_KEY].last_used = time.monotonic() - 9999
+                await mgr._expire_idle(1)
+                assert mgr._sessions[CONSOLIDATE_KEY].provider is provider
+                provider.shutdown.assert_not_awaited()
+                # _bg must not queue behind the held consolidation semaphore; the
+                # ceiling only turns a regression's hang into a named failure.
+                await asyncio.wait_for(mgr.get_or_create(BACKGROUND_KEY), 30)
+                mgr.release(BACKGROUND_KEY)
+            # The finished turn stamped its clock; age it again so the next
+            # sweep sees an idle session it is now free to reclaim.
+            mgr._sessions[CONSOLIDATE_KEY].last_used = time.monotonic() - 9999
+            await mgr._expire_idle(1)
+            assert CONSOLIDATE_KEY not in mgr._sessions
+            provider.shutdown.assert_awaited_once()
+        finally:
+            await mgr.close_all()
 
     @pytest.mark.asyncio
     async def test_channel_session_not_expired_by_idle(self, cfg):
@@ -788,6 +962,25 @@ class TestHeartbeatStateless:
 
 class TestRecycleBackground:
     """Tests for background session context overflow recycling."""
+
+    @pytest.mark.asyncio
+    async def test_consolidation_recycles_its_own_provider(self, cfg):
+        factory = MagicMock(side_effect=_mock_provider_factory())
+        mgr = SessionManager(cfg, provider_factory=factory)
+        try:
+            background, _, _ = await mgr.get_or_create(BACKGROUND_KEY)
+            mgr.release(BACKGROUND_KEY)
+            extraction, _, _ = await mgr.get_or_create(CONSOLIDATE_KEY, agent="kirocrew-lite")
+            mgr.release(CONSOLIDATE_KEY)
+            extraction.context_usage_pct = lambda: 75.0
+            await mgr.recycle_background(session_key=CONSOLIDATE_KEY, agent="kirocrew-lite")
+            assert mgr._sessions[CONSOLIDATE_KEY].provider is not extraction
+            extraction.shutdown.assert_awaited_once()
+            assert mgr._sessions[BACKGROUND_KEY].provider is background
+            background.shutdown.assert_not_awaited()
+            factory.assert_called_with(CONSOLIDATE_KEY, agent="kirocrew-lite")
+        finally:
+            await mgr.close_all()
 
     @pytest.mark.asyncio
     async def test_recycle_on_high_context(self, cfg):
@@ -1822,7 +2015,7 @@ class TestCompactCallback:
 
         # Turn finishes -> semaphore released -> recycle proceeds.
         mgr.release("dashboard:chat-1")
-        await asyncio.wait_for(task, timeout=2)
+        await await_until(task, what="the compact-session task finishing")
         # A fresh successor holds the key.
         assert mgr._sessions["dashboard:chat-1"].first_turn.is_new
         # This fixture's provider serves no native compaction, so the in-place
@@ -1847,7 +2040,10 @@ class TestCompactCallback:
         mgr.set_compact_callback(cb)
 
         with caplog.at_level(logging.WARNING, logger="kiro_crew.session"):
-            await asyncio.wait_for(mgr._compact_session("dashboard:chat-1", 92.0), timeout=2)
+            await await_until(
+                asyncio.ensure_future(mgr._compact_session("dashboard:chat-1", 92.0)),
+                what="the deferred compaction returning",
+            )
 
         # Session survives, the live turn was not killed, and nothing was
         # reported to the user (a deferral is not a failure).
@@ -2258,11 +2454,10 @@ class TestResetRetainsTheTornDownSession:
         design (the pop is the point of no return, so the teardown runs on) -- and a
         teardown that runs on into a hung shutdown keeps its entry, correctly.
         """
-        for _ in range(400):
-            if not mgr.has_session(key) and provider.shutdown.await_count:
-                return
-            await asyncio.sleep(0.005)
-        raise AssertionError(f"the teardown of {key} never reached the provider shutdown")
+        await async_wait_until(
+            lambda: not mgr.has_session(key) and provider.shutdown.await_count,
+            describe=lambda: f"the teardown of {key} never reached the provider shutdown",
+        )
 
     @pytest.mark.asyncio
     async def test_the_popped_session_is_readable_while_its_teardown_runs_and_gone_after(self, cfg):
@@ -2483,15 +2678,11 @@ class TestTheEndingFenceAdmitsNothingUnderTheKey:
         # The reservation is taken before ``provider.start()`` is reached (a
         # thread hop sits between them), so ``_has_allocation_reservation`` is not the
         # signal: the start itself says when it is in flight.
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await await_until(started, what="provider.start() in flight")
 
     @staticmethod
     async def _until(condition, what: str) -> None:
-        for _ in range(1000):
-            if condition():
-                return
-            await asyncio.sleep(0.005)
-        raise AssertionError(what)
+        await async_wait_until(condition, describe=lambda: what)
 
     @staticmethod
     async def _settle() -> None:
@@ -2525,7 +2716,7 @@ class TestTheEndingFenceAdmitsNothingUnderTheKey:
 
         assert not self._fenced(mgr, "k1")
         # The fence lifted: the held call lands, a new life under the recorded key.
-        provider, is_new, _ = await asyncio.wait_for(held, timeout=5)
+        provider, is_new, _ = await await_until(held, what="the held cold start landing")
         assert is_new and mgr.has_session("k1")
         mgr.release("k1")
         await mgr.reset("k1")
@@ -2543,7 +2734,7 @@ class TestTheEndingFenceAdmitsNothingUnderTheKey:
             await self._settle()
             assert not held.done(), "a claim racing the fence was answered while the fence was up"
 
-        again, is_new, _ = await asyncio.wait_for(held, timeout=5)
+        again, is_new, _ = await await_until(held, what="the held claim landing")
         assert again is provider and not is_new
         mgr.release("k1")
         await mgr.reset("k1")
@@ -2586,7 +2777,7 @@ class TestTheEndingFenceAdmitsNothingUnderTheKey:
                 assert not mgr._has_allocation_reservation(
                     "k1"
                 ), "the refused allocation kept its reservation while held"
-            provider, is_new, _ = await asyncio.wait_for(cold_start, timeout=5)
+            provider, is_new, _ = await await_until(cold_start, what="the cold start landing")
 
         hard_kill.assert_called_once()
         (killed,) = hard_kill.call_args.args
@@ -2614,7 +2805,7 @@ class TestTheEndingFenceAdmitsNothingUnderTheKey:
             # refused all the same: the reservation was in flight when the fence
             # went up. The call allocates again without waiting.
             gate.set()
-            provider, is_new, _ = await asyncio.wait_for(cold_start, timeout=5)
+            provider, is_new, _ = await await_until(cold_start, what="the cold start landing")
 
         hard_kill.assert_called_once()
         (killed,) = hard_kill.call_args.args
@@ -2668,7 +2859,7 @@ class TestTheEndingFenceAdmitsNothingUnderTheKey:
                     "while the fence was up"
                 )
                 assert not mgr.has_session("k1")
-            provider, is_new, _ = await asyncio.wait_for(cold_start, timeout=5)
+            provider, is_new, _ = await await_until(cold_start, what="the cold start landing")
 
         hard_kill.assert_not_called()  # nothing had been started when the fence caught it
         assert is_new and mgr.has_session("k1")
@@ -2694,7 +2885,7 @@ class TestTheEndingFenceAdmitsNothingUnderTheKey:
         assert not mgr.has_session("k1"), "nothing is published while start() runs"
 
         gate.set()
-        provider, is_new, _ = await asyncio.wait_for(cold_start, timeout=5)
+        provider, is_new, _ = await await_until(cold_start, what="the cold start landing")
 
         assert is_new and mgr.has_session("k1")
         assert not mgr._spawn_in_flight(
@@ -2738,7 +2929,7 @@ class TestTheEndingFenceAdmitsNothingUnderTheKey:
                 ), "the refused start left no receipt for the ending caller's read"
             # The fence lifted: the receipt went with it, and the held call lands.
             assert mgr._spawn_in_flight("k1") is None
-            provider, is_new, _ = await asyncio.wait_for(cold_start, timeout=5)
+            provider, is_new, _ = await await_until(cold_start, what="the cold start landing")
 
         hard_kill.assert_called_once()
         assert is_new and mgr.has_session("k1")
@@ -2757,7 +2948,7 @@ class TestTheEndingFenceAdmitsNothingUnderTheKey:
             with mgr.ending_key("k1"):
                 pass
             gate.set()
-            provider, is_new, _ = await asyncio.wait_for(cold_start, timeout=5)
+            provider, is_new, _ = await await_until(cold_start, what="the cold start landing")
 
         hard_kill.assert_called_once()
         assert is_new and mgr.has_session("k1")
@@ -2794,7 +2985,7 @@ class TestTheEndingFenceAdmitsNothingUnderTheKey:
             patch.object(mgr, "_dispatch_hard_kill") as hard_kill,
         ):
             call = asyncio.create_task(mgr.get_or_create("k1"))
-            await asyncio.wait_for(claimed.wait(), timeout=5)
+            await await_until(claimed, what="the gated claim entering")
             with mgr.ending_key("k1"):
                 # The fence goes up while the claim is in flight; the claim then
                 # returns a live pooled process that registration refuses.
@@ -2811,7 +3002,7 @@ class TestTheEndingFenceAdmitsNothingUnderTheKey:
                     "1 refused at registration during the ending, the provider hard-killed there "
                     "by the allocation path -- an outcome this record does not confirm"
                 ), "the refused warm-pool claim left no receipt for the ending caller's read"
-            provider, is_new, _ = await asyncio.wait_for(call, timeout=5)
+            provider, is_new, _ = await await_until(call, what="the gated claim landing")
 
         hard_kill.assert_called_once_with(pooled)
         assert is_new and provider is not pooled and mgr.has_session("k1")
@@ -2844,7 +3035,7 @@ class TestTheEndingFenceAdmitsNothingUnderTheKey:
             assert not mgr._spawn_in_flight("k1")
 
         mgr.release("k1")
-        claimed, is_new, _ = await asyncio.wait_for(waiter, timeout=5)
+        claimed, is_new, _ = await await_until(waiter, what="the held waiter landing")
         assert claimed is provider and not is_new
         assert not mgr._has_allocation_reservation("k1")
         mgr.release("k1")
@@ -2877,23 +3068,19 @@ class TestTheEndingFenceAdmitsNothingUnderTheKey:
             # The fence is up; the ending caller has not popped the session yet.
             # The busy turn ends normally and hands the permit to the waiter.
             mgr.release("k1")
-            for _ in range(200):
-                await asyncio.sleep(0.01)
-                assert not waiter.done(), (
-                    "the waiter the busy turn released to was handed the session while its key "
-                    "was being ended: the fence was bypassed after the semaphore wait"
-                )
-                if not mgr._has_allocation_reservation("k1"):
-                    break  # refused at the reacquire door, back at the front door: held
-            else:
-                pytest.fail(
-                    "the waiter never reached the front door: it still holds its reservation"
-                )
+            await async_wait_until(
+                lambda: not mgr._has_allocation_reservation("k1"),
+                describe=lambda: "the held waiter never reached the front door (still reserved)",
+            )
+            assert not waiter.done(), (
+                "the waiter the busy turn released to was handed the session while its key "
+                "was being ended: the fence was bypassed after the semaphore wait"
+            )
             assert not mgr._sessions[
                 "k1"
             ].semaphore.locked(), "the refused waiter kept the permit it must release"
 
-        claimed, is_new, _ = await asyncio.wait_for(waiter, timeout=5)
+        claimed, is_new, _ = await await_until(waiter, what="the held waiter landing")
         assert claimed is provider and not is_new, "the held waiter did not land after the lift"
         mgr.release("k1")
         await mgr.reset("k1")
@@ -3347,7 +3534,7 @@ class TestDestroy:
         finally:
             mgr._lock.release()
 
-        destroyed = await asyncio.wait_for(destroy_task, timeout=1.0)
+        destroyed = await await_until(destroy_task, what="the conditional destroy returning")
 
         assert destroyed is False
         provider.shutdown.assert_not_awaited()
@@ -3484,7 +3671,7 @@ class TestDestroy:
         assert expected_absence == 0
 
         allocation = asyncio.create_task(mgr.get_or_create(thread_ts))
-        await asyncio.wait_for(start_entered.wait(), timeout=1.0)
+        await await_until(start_entered, what="provider.start() entered")
 
         assert mgr.session_generation(canonical) > expected_absence
         assert thread_ts in mgr.session_keys()
@@ -3494,7 +3681,7 @@ class TestDestroy:
         assert destroyed is False
         mock_delete.assert_not_called()
         release_start.set()
-        allocated_provider, _, _ = await asyncio.wait_for(allocation, timeout=1.0)
+        allocated_provider, _, _ = await await_until(allocation, what="the allocation landing")
         assert allocated_provider is provider
         mgr.release(thread_ts)
         await mgr.destroy(thread_ts)
@@ -3526,7 +3713,7 @@ class TestDestroy:
         mgr = SessionManager(cfg, provider_factory=lambda *_args, **_kwargs: provider)
         before = mgr.session_generation("cancelled-key")
         allocation = asyncio.create_task(mgr.get_or_create("cancelled-key"))
-        await asyncio.wait_for(start_entered.wait(), timeout=1.0)
+        await await_until(start_entered, what="provider.start() entered")
         assert "cancelled-key" in mgr.session_keys()
 
         allocation.cancel()
@@ -3554,7 +3741,7 @@ class TestDestroy:
 
         with patch.object(mgr._allocation_boundary(), "_get_or_create_impl", completed_impl):
             claim = asyncio.create_task(mgr.get_or_create("k1"))
-            await asyncio.wait_for(impl_entered.wait(), timeout=1.0)
+            await await_until(impl_entered, what="the impl entered")
             release_impl.set()
             await asyncio.sleep(0)
 
@@ -3624,10 +3811,10 @@ class TestDestroy:
             patch.object(mgr._session_map, "delete") as mock_delete,
         ):
             destroy = asyncio.create_task(mgr.destroy("k1"))
-            await asyncio.wait_for(metric_entered.wait(), timeout=1.0)
+            await await_until(metric_entered, what="the end metric entered")
             mock_delete.assert_called_once_with("k1", reason="session_destroyed")
             release_metric.set()
-            await asyncio.wait_for(destroy, timeout=1.0)
+            await await_until(destroy, what="the destroy finishing")
 
     @pytest.mark.asyncio
     async def test_destroy_unlinks_temp_files_from_the_session_queue(self, cfg, tmp_path):
@@ -5050,7 +5237,7 @@ class TestKiroInPlaceCompaction:
         assert sess.semaphore.locked()  # queued turn would wait here
 
         gate.set()
-        await asyncio.wait_for(task, timeout=2)
+        await await_until(task, what="the compact-session task finishing")
         assert "dashboard:chat-1" in mgr._sessions
         assert not sess.semaphore.locked()
         await mgr.close_all()
@@ -5118,8 +5305,8 @@ class TestKiroInPlaceCompaction:
         assert not turn.done()
 
         gate.set()  # compact reports timeout -> recycle, semaphore still held
-        await asyncio.wait_for(compact, timeout=2)
-        await asyncio.wait_for(turn, timeout=2)
+        await await_until(compact, what="the compaction recycle finishing")
+        await await_until(turn, what="the queued turn running")
 
         # Kill first, queued turn second: the semaphore was never handed back
         # while the backend could still have been compacting.
@@ -5176,7 +5363,7 @@ class TestKiroInPlaceCompaction:
         )
 
         gate.set()  # compact fails -> recycle pops by identity
-        await asyncio.wait_for(task, timeout=2)
+        await await_until(task, what="the compact-session task finishing")
 
         # Replacement untouched; old provider reaped.
         assert mgr._sessions["k1"].provider is new_provider
@@ -5800,8 +5987,9 @@ class TestCleanupLoopResilience:
         # process), the top-of-loop is_set() check could miss it and the test
         # would hang until its own outer deadline. Letting the real wait() run
         # makes the stop deterministic regardless of prior event-loop binding.
-        # The ``timeout >= 60`` discriminator keeps this from clamping the outer
-        # ``wait_for(_cleanup_loop(), timeout=5)`` guard below.
+        # The ``timeout >= 60`` discriminator clamps ONLY the loop's own inter-sweep
+        # wait; the outer guard below is an ``await_until`` on the loop task, which
+        # never routes through this patched ``asyncio.wait_for``.
         real_wait_for = asyncio.wait_for
 
         async def _fast_wait_for(coro, *, timeout):
@@ -5827,7 +6015,10 @@ class TestCleanupLoopResilience:
             patch.object(mgr, "_expire_idle", side_effect=_expire_then_stop),
             patch("kiro_crew.session.find_orphan_mcp_candidates", return_value=[]),
         ):
-            await asyncio.wait_for(mgr._cleanup_loop(), timeout=5)
+            await await_until(
+                asyncio.ensure_future(mgr._cleanup_loop()),
+                what="the cleanup loop exiting after shutdown_event is set",
+            )
 
         assert call_count >= 2
         kiro_crew.shutdown_event.clear()
@@ -5865,7 +6056,10 @@ class TestCleanupLoopResilience:
             patch("kiro_crew.session.find_orphan_mcp_candidates", return_value=[]),
         ):
             with caplog.at_level(logging.ERROR):
-                await asyncio.wait_for(mgr._cleanup_loop(), timeout=5)
+                await await_until(
+                    asyncio.ensure_future(mgr._cleanup_loop()),
+                    what="the cleanup loop exiting after shutdown_event is set",
+                )
 
         assert "_expire_idle crashed" in caplog.text
         kiro_crew.shutdown_event.clear()
@@ -6686,7 +6880,7 @@ class TestLoadRecoveryHistoryReplay:
         # close_all flushes SessionMap before provider shutdown. Hold it at that
         # boundary and create a new manager, exactly as an update restart can.
         close_task = asyncio.create_task(mgr.close_all())
-        await asyncio.wait_for(shutdown_started.wait(), timeout=1.0)
+        await await_until(shutdown_started, what="close_all at the flush boundary")
         resumed_mgr = SessionManager(cfg, provider_factory=factory)
         assert resumed_mgr._session_map.get("thread1") == "old-full-history-sid"
         release_shutdown.set()
@@ -7534,6 +7728,140 @@ class TestParentEndCancelsItsChildren:
         assert mgr._sessions["dashboard:chat-9"].retire_on_identity_change is True
         await mgr.close_all()
 
+    @staticmethod
+    async def _identity_sweep_spares(mgr, cb, key: str, snapshotted, seen) -> None:
+        """Run the spare-children sweep over the idle *key* and assert it deferred.
+
+        A deferred parent keeps its session and its children's completion path:
+        no teardown snapshot (the step that gates a child's report away from the
+        parent), no cancel, the fence released, and the sweep incomplete and
+        waiting on the parent's sub-agents.
+        """
+        with patch(
+            "kiro_crew.session._provider_uses_kiro_identity_store",
+            return_value=True,
+        ):
+            retired, complete = await mgr.retire_kiro_identity_sessions(spare_children=True)
+
+        assert retired == []
+        assert snapshotted == []
+        assert seen == []
+        assert cb.fence_released == [key]  # type: ignore[attr-defined]
+        assert complete is False
+        assert f"{key} (subagents)" in mgr.identity_sweep_waiting_on
+        assert mgr.has_session(key)
+        assert mgr._sessions[key].retire_on_identity_change is True
+
+    @pytest.mark.asyncio
+    async def test_identity_retire_spares_a_parent_whose_child_report_is_delivering(self, cfg):
+        """A finished child whose run task is gone but whose terminal report is
+        still delivering keeps its parent through the spare-children sweep.
+
+        The child is neither live nor queued, so the sparable-child read sees
+        nothing; only the manager's unfinished-report reading does. Retiring the
+        parent here would take the teardown snapshot that drops the report before
+        it reaches the parent.
+        """
+        key = "dashboard:chat-9"
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        snapshotted, seen, cb = self._recorder({key: ()}, unfinished_reports={key: True})
+        mgr.set_child_teardown_handler(cb)
+        await mgr.get_or_create(key)
+        mgr.release(key)
+
+        await self._identity_sweep_spares(mgr, cb, key, snapshotted, seen)
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_identity_retire_spares_a_parent_with_an_unregistered_finished_child(self, cfg):
+        """A finished child whose report is not registered yet keeps its parent.
+
+        The span before the report lands in the manager's report registry is the
+        pending-work signal's (``has_pending_work_for_async``); the sweep asks it
+        off the loop alongside the sparable-child read.
+        """
+        key = "dashboard:chat-9"
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        snapshotted, seen, cb = self._recorder({key: ()}, pending_work={key: True})
+        mgr.set_child_teardown_handler(cb)
+        await mgr.get_or_create(key)
+        mgr.release(key)
+
+        await self._identity_sweep_spares(mgr, cb, key, snapshotted, seen)
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_identity_retire_spares_a_parent_whose_report_starts_during_the_read(self, cfg):
+        """A report that begins delivering while the off-loop read is suspended is
+        caught by the commit recheck under the registry lock."""
+        key = "dashboard:chat-9"
+        reporting: dict[str, bool] = {}
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        snapshotted, seen, cb = self._recorder(
+            {key: ()},
+            unfinished_reports=reporting,
+            on_store_probe=lambda k: reporting.__setitem__(k, True),
+        )
+        mgr.set_child_teardown_handler(cb)
+        await mgr.get_or_create(key)
+        mgr.release(key)
+
+        await self._identity_sweep_spares(mgr, cb, key, snapshotted, seen)
+        assert key in cb.store_probed  # type: ignore[attr-defined]
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_identity_retire_spares_a_parent_whose_pending_work_starts_during_the_read(
+        self, cfg
+    ):
+        """In-memory pending work that appears during the off-loop read keeps the
+        parent at the commit recheck, the same as for the unclaimed removal."""
+        key = "dashboard:chat-9"
+        owed: dict[str, bool] = {}
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        snapshotted, seen, cb = self._recorder(
+            {key: ()},
+            pending_work=owed,
+            on_store_probe=lambda k: owed.__setitem__(k, True),
+        )
+        mgr.set_child_teardown_handler(cb)
+        await mgr.get_or_create(key)
+        mgr.release(key)
+
+        await self._identity_sweep_spares(mgr, cb, key, snapshotted, seen)
+        await mgr.close_all()
+
+    @pytest.mark.asyncio
+    async def test_identity_retire_retires_a_deferred_parent_once_its_owed_work_ends(self, cfg):
+        """The deferral lasts only as long as the work the parent is owed.
+
+        Pending work (a live follow-up watcher, say) keeps the parent through one
+        sweep. Once that work ends, the next sweep retires the parent, so an
+        old-identity parent outlives its owed work by at most one sweep.
+        """
+        key = "dashboard:chat-9"
+        owed = {key: True}
+        mgr = SessionManager(cfg, provider_factory=_mock_provider_factory())
+        snapshotted, seen, cb = self._recorder({key: ()}, pending_work=owed)
+        mgr.set_child_teardown_handler(cb)
+        await mgr.get_or_create(key)
+        mgr.release(key)
+
+        await self._identity_sweep_spares(mgr, cb, key, snapshotted, seen)
+
+        owed[key] = False
+        with patch(
+            "kiro_crew.session._provider_uses_kiro_identity_store",
+            return_value=True,
+        ):
+            retired, complete = await mgr.retire_kiro_identity_sessions(spare_children=True)
+
+        assert retired == [key]
+        assert complete is True
+        assert not mgr.has_session(key)
+        assert mgr.identity_sweep_waiting_on == ()
+        await mgr.close_all()
+
     @pytest.mark.asyncio
     async def test_identity_retire_defers_on_a_child_admitted_during_the_teardown(self, cfg):
         """A child admitted through /api/spawn while the retire decision runs is
@@ -7891,7 +8219,7 @@ class TestParentEndCancelsItsChildren:
         ):
             task = asyncio.ensure_future(mgr.retire_kiro_identity_sessions(spare_children=True))
             # A has committed; the loop is now blocked inside B's store probe.
-            await asyncio.wait_for(entered_b.wait(), timeout=2.0)
+            await await_until(entered_b, what="the sweep blocked in B's store probe")
             task.cancel()
             proceed.set()
             with pytest.raises(asyncio.CancelledError):
@@ -7951,7 +8279,7 @@ class TestParentEndCancelsItsChildren:
             task = asyncio.ensure_future(
                 mgr.retire_kiro_identity_sessions(fingerprint=live_dropped, spare_children=True)
             )
-            await asyncio.wait_for(entered_b.wait(), timeout=2.0)
+            await await_until(entered_b, what="the sweep blocked in B's store probe")
             task.cancel()
             proceed.set()
             with pytest.raises(asyncio.CancelledError):
@@ -8173,7 +8501,7 @@ class TestParentEndCancelsItsChildren:
         with patch("kiro_crew.session_lifecycle._CHILD_CANCEL_TIMEOUT_SECS", 0.01):
             await mgr.remove("dashboard:chat-9")
 
-        await _asyncio.wait_for(finished.wait(), timeout=5)
+        await await_until(finished, what="the slow child reap settling")
         assert observed == ["completed"], (
             "the parent's wait expiring cancelled the reap itself, so a child could "
             f"outlive the teardown mid-kill: {observed}"
@@ -8597,10 +8925,16 @@ class TestParentEndCancelsItsChildren:
         """
         import ast
         import inspect
+        import sys
 
         from kiro_crew import session_lifecycle
 
-        tree = ast.parse(inspect.getsource(session_lifecycle))
+        tree = ast.parse(
+            "".join(
+                inspect.getsource(sys.modules[name])
+                for name in (session_lifecycle.__name__, *session_lifecycle._OWNERS)
+            )
+        )
         # EVERY method that reaches the teardown names itself, with no exemption: the
         # conversation-ended primitive hardcodes its own name too, so there is one rule here
         # rather than a rule plus a carve-out whose own correctness needed checking.
@@ -9235,7 +9569,10 @@ class TestParentEndCancelsItsChildren:
         root = pathlib.Path(__file__).resolve().parent.parent / "src" / "kiro_crew"
         offenders: list[str] = []
         for path in root.rglob("*.py"):
-            if path.name == "session_lifecycle.py":
+            if path.relative_to(root).as_posix() in {
+                "session_lifecycle.py",
+                "session_lifecycle_parts/teardown.py",
+            }:
                 continue  # defines both keywords; its own docstrings name them
             text = path.read_text(encoding="utf-8")
             for match in re.finditer(r"clear_conversation=True", text):
@@ -9265,7 +9602,7 @@ class TestParentEndCancelsItsChildren:
         root = pathlib.Path(__file__).resolve().parent.parent / "src" / "kiro_crew"
         # The module that DEFINES ``reset`` names the keyword in its own docstring, which
         # is not a call site.
-        defines_it = {"session_lifecycle.py"}
+        defines_it = {"session_lifecycle.py", "session_lifecycle_parts/teardown.py"}
         found = set()
         for path in root.rglob("*.py"):
             rel = path.relative_to(root).as_posix()
@@ -9278,9 +9615,9 @@ class TestParentEndCancelsItsChildren:
             # The user asked the agent to forget the conversation.
             "dashboard/handlers_channel.py",
             # A cancelled cron job's conversation is over.
-            "cron.py",
+            "cron_service/service/run_kill.py",
             # Cancel cleanup ends every step conversation of the run.
-            "taskrunner.py",
+            "taskrunner_parts/run_scope.py",
             # The pool starts a NEW conversation on a pooled key.
             "workflows/agent_pool.py",
             # ``clear_conversation`` throws the conversation away: sid cleared, replay
@@ -9343,10 +9680,16 @@ class TestParentEndCancelsItsChildren:
         """
         import ast
         import inspect
+        import sys
 
         from kiro_crew import session_lifecycle
 
-        tree = ast.parse(inspect.getsource(session_lifecycle))
+        tree = ast.parse(
+            "".join(
+                inspect.getsource(sys.modules[name])
+                for name in (session_lifecycle.__name__, *session_lifecycle._OWNERS)
+            )
+        )
         required = {"_snapshot_parent_children", "_cancel_parent_children"}
 
         def called_names(node):

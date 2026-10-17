@@ -658,7 +658,7 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
           className={`h-8 px-2 rounded-lg text-[12px] font-mono flex items-center gap-1 cursor-pointer transition-all bg-transparent border-none shrink-0 whitespace-nowrap ${
             loop?.active
               ? interrupted
-                ? 'text-warn hover:text-warn hover:bg-warn/10'
+                ? 'text-warn hover:text-warn-text hover:bg-warn/10'
                 : 'text-accent hover:text-accent hover:bg-accent/10 animate-pulse'
               : 'text-muted hover:text-text hover:bg-bg-hover'
           }`}
@@ -706,7 +706,7 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
               runsNow && !waitingOnPerson
                 ? writeDisabled ? 'border-border bg-bg text-muted' : 'border-ok/30 bg-ok-subtle text-ok-fg'
                 : finished
-                  ? 'border-info/30 bg-info-subtle text-info'
+                  ? 'border-info/30 bg-info-subtle text-info-text'
                   : 'border-warn/30 bg-warn-subtle text-warn-fg'
             }`}
           >

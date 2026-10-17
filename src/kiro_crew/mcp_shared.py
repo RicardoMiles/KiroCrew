@@ -512,7 +512,7 @@ SKIP = _Skipped()
 # call races the load window. Written through fd 1, the bytes land in
 # /dev/null: no exception, no short write, the SEL audit still records
 # ``success`` -- and the client waits forever until the ACP tool-stall watchdog
-# (``acp/client.py::_TOOL_STALL_TIMEOUT``, 600s) kills the turn.
+# (``acp/client_timeouts.py::_TOOL_STALL_TIMEOUT``, 600s) kills the turn.
 #
 # ``snapshot_stdout_fd()`` takes an ``os.dup(1)`` at server startup, BEFORE any
 # tool can run. A dup'd descriptor keeps pointing at the original pipe no
@@ -851,6 +851,13 @@ def _policy_session_key() -> str | None:
     stops short of naming a co-tenant on a shared runtime: a misresolved key
     applies one session's operator tool exclusions to another, so this lookup
     refuses there rather than guessing.
+
+    This reads the ``KIROCREW_SESSION_KEY`` rung that is skipped when
+    ``host_pid_is_shared`` is true. On a shared pid the rung resolves no key,
+    ``identity.failed`` is set, ``None`` is returned, and
+    ``_resolve_tool_policy`` raises into the ``resolution_failed`` path —
+    which is in ``_UNRESOLVED_REFUSES_CALL``, so ``tools/call`` is refused
+    rather than proceeding under a co-tenant's exclusion set.
     """
     identity = resolve_own_identity()
     return None if identity.failed else identity.session_key
@@ -1471,6 +1478,80 @@ def _resolve_excluded_tools(caller_session: str = "") -> set[str]:
 _UNRESOLVED_REFUSES_CALL = frozenset(
     {"policy_unreadable", "identity_unattested", "identity_unattestable", "resolution_failed"}
 )
+
+#: The directory this package's own code lives in. A tool handler whose code is
+#: under it belongs to a server Kiro Crew ships: its own control plane, and the
+#: builtin apps under ``apps/builtins``.
+_PACKAGE_DIR = os.path.dirname(os.path.realpath(__file__))
+
+
+def serves_managed_tools(call_tool_fn: Callable[..., Any]) -> bool:
+    """True when *call_tool_fn* is Kiro Crew's own code, so the tool policy applies.
+
+    ``managedToolPolicy`` names the tools of Kiro Crew's managed servers that a
+    session may not reach (``src/kiro_crew/docs/agent-spec-fields.md``). A user-installed app that serves its own tools through
+    :func:`run_mcp_stdio_loop` is not one of those servers, and on the shared ACP
+    runtime it is never handed a session token -- identity rides only the control
+    plane -- so reading the policy for it could only ever fail closed and refuse
+    every call it serves. Its tools are already gated where the session is: the
+    agent spec's ``tools`` / ``allowedTools`` and kiro-cli's ``disabledTools``.
+
+    The check runs inside the app's own process, so it is not a boundary an app
+    could be held to: an app that wanted to skip it could skip this loop. What it
+    must NOT do is let Kiro Crew's own servers out, so every answer it cannot
+    establish is True: a handler with no readable code location, or one outside
+    every known shape, keeps the policy.
+    """
+    target: Any = call_tool_fn
+    while isinstance(target, functools.partial):
+        target = target.func
+    target = getattr(target, "__func__", target)
+    code = getattr(target, "__code__", None)
+    if code is None:
+        code = getattr(getattr(type(target), "__call__", None), "__code__", None)
+    filename = getattr(code, "co_filename", "") if code is not None else ""
+    if not filename or filename.startswith("<"):
+        return True
+    try:
+        real = os.path.realpath(filename)
+        named = platform_compat.strip_extended_length_prefix(filename)
+        drive = os.path.splitdrive(named)[0]
+        located = bool(drive) and os.path.isabs(named) and os.path.isfile(real)
+    except (OSError, ValueError):
+        return True
+    return _path_is_under(real, _PACKAGE_DIR, os.path, located=located)
+
+
+def _path_is_under(path: str, root: str, pathmod: Any = os.path, *, located: bool = True) -> bool:
+    """Whether absolute *path* is *root* or inside it; True when that cannot be told.
+
+    A path on another Windows drive is never inside *root*, but ``commonpath``
+    raises ``ValueError`` for it rather than answering. Read that case from the
+    drives first, so code on ``C:`` is not mistaken for the package on ``D:``
+    (a GitHub-hosted Windows runner checks out on ``D:`` and keeps its temp dir on
+    ``C:``). Any other refusal keeps the fail-closed answer.
+
+    Both sides are compared without the ``\\\\?\\`` long-path prefix, which
+    Windows ``realpath`` keeps on deep paths and which only spells a path. Another
+    drive is proof only when *located* (the caller found an existing file under an
+    absolute name with a drive). A relative name, or a rooted one with no drive,
+    resolves against the cwd at call time and a missing file proves nothing, so
+    those keep the policy. Only the backslash ``\\\\?\\`` form that Windows
+    ``realpath`` produces is folded; a forward-slash or ``\\\\.\\`` spelling is
+    left alone and takes the plain comparison.
+    """
+    path = platform_compat.strip_extended_length_prefix(path)
+    root = platform_compat.strip_extended_length_prefix(root)
+    path_drive = pathmod.normcase(pathmod.splitdrive(path)[0])
+    root_drive = pathmod.normcase(pathmod.splitdrive(root)[0])
+    if path_drive != root_drive:
+        return not located
+    try:
+        common = pathmod.commonpath([path, root])
+    except ValueError:
+        return True
+    # ``commonpath`` keeps the casing of its input; Windows paths compare caseless.
+    return pathmod.normcase(common) == pathmod.normcase(root)
 
 
 def respond(req_id: Any, result: Any, error: dict | None = None) -> None:
@@ -2230,6 +2311,8 @@ def _run_stdio_dispatch_loop(
                 error={"code": JSONRPC_INTERNAL_ERROR, "message": "Internal error"},
             )
 
+    _applies_tool_policy = serves_managed_tools(call_tool_fn)
+
     def _caller_tool_policy(caller: "CallerContext | None") -> ToolPolicy:
         """This request's exclusion set AND whether the policy was readable.
 
@@ -2240,7 +2323,13 @@ def _run_stdio_dispatch_loop(
         The caller block's token rides along explicitly. This runs on the read
         loop before the worker installs the caller ContextVar, so the resolver
         cannot find the token there; a pooled backend has it nowhere else.
+
+        A server that is not Kiro Crew's own (:func:`serves_managed_tools`) has
+        no managed tools for the policy to name, so it is answered "nothing
+        excluded" without a read.
         """
+        if not _applies_tool_policy:
+            return ToolPolicy(frozenset(), "")
         return _resolve_tool_policy(
             caller.session_key if caller else "",
             caller_token=caller.session_token if caller else "",
@@ -3317,7 +3406,7 @@ def _run_stdio_dispatch_loop(
                     # their queued steps so no worker runs one for a client
                     # that is gone, then shuts the pool down.
                     if _worker_thread:
-                        _worker_thread.join(timeout=5.0)
+                        _deliver_finished_worker(5.0)
                     break
                 if isinstance(req, _Skipped):
                     # One iteration per dropped frame, so a finished worker's

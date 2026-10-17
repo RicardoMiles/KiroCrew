@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import sys
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -433,7 +434,10 @@ class TestWarmPool:
     def test_a_backend_override_skips_the_warm_pool(self):
         from kiro_crew import session_allocation
 
-        src = inspect.getsource(session_allocation)
+        src = "".join(
+            inspect.getsource(sys.modules[name])
+            for name in (session_allocation.__name__, *session_allocation._ALLOCATION_OWNERS)
+        )
         assert 'pool_decision = "bypass_backend_override"' in src
         assert 'extra_factory_kwargs.get("backend_override") is not None' in src
 
@@ -472,7 +476,10 @@ class TestSuccessorsKeepTheBackend:
     def test_registration_stamps_the_backend_the_session_started_on(self):
         from kiro_crew import session_allocation
 
-        src = inspect.getsource(session_allocation)
+        src = "".join(
+            inspect.getsource(sys.modules[name])
+            for name in (session_allocation.__name__, *session_allocation._ALLOCATION_OWNERS)
+        )
         assert 'session.backend_override = extra_factory_kwargs.get("backend_override")' in src
 
 
@@ -480,7 +487,7 @@ class TestSuccessorsKeepTheBackend:
 
 
 class TestEffortVerdict:
-    @pytest.mark.parametrize("backend", ["pi", "goose"])
+    @pytest.mark.parametrize("backend", ["pi", "goose", "opencode"])
     def test_a_backend_that_advertises_its_effort_gets_no_verdict(self, backend):
         # These report their levels at session/new (goose per model); the registry
         # cannot judge them, so neither line may be printed -- a "dropped" there
@@ -504,9 +511,9 @@ class TestEffortVerdict:
         assert kiro.endswith(".effort") and "config option" not in kiro
         assert subagent.effort_applied_note("gpt-5", "high") == kiro
 
-    @pytest.mark.parametrize("backend", ["opencode"])
+    @pytest.mark.parametrize("backend", ["some-harness-nobody-registered"])
     def test_a_backend_that_takes_no_effort_is_reported_dropped(self, monkeypatch, backend):
-        # Neither cli.json nor a config option reaches this harness: the level
+        # Neither cli.json nor a config option reaches such a harness: the level
         # is never sent, so the receipt must say dropped, not applied.
         from kiro_crew import subagent
 

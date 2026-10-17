@@ -9,7 +9,7 @@ sees only one form lists an agent kiro-cli would run, or projects onto KAS an
 agent that is not there.
 
 This is a leaf module on purpose: it imports nothing from ``kiro_crew`` except
-the leaf :mod:`kiro_crew.user_json`, so the config loader, the MCP gateway rewriter and the discovery cache can all reach it
+the leaves :mod:`kiro_crew.user_json` and :mod:`kiro_crew.yaml_safe`, so the config loader, the MCP gateway rewriter and the discovery cache can all reach it
 without an import cycle. It parses bytes it is handed and never opens a file --
 the hardened read (size cap, sensitive-symlink refusal) stays with the caller.
 
@@ -42,6 +42,7 @@ from typing import Any
 import yaml  # type: ignore[import-untyped]
 
 from kiro_crew.user_json import loads_user_json
+from kiro_crew.yaml_safe import NoAliasSafeLoader
 
 #: Suffixes an agents directory entry may carry, lower-case. ``.json`` is the
 #: kiro-cli form; ``.md`` is the markdown form.
@@ -58,12 +59,23 @@ NATIVE_SKILL_ALIAS_PREFIX = "kirocrew-skill-view-"
 #: boundary (``.github/agent-sdk-boundary-baseline.txt``) is shrink-only, and the
 #: doctor is a baselined consumer. See
 #: :data:`kiro_crew.acp.skill_projection.SKILL_VIEW_PROJECTION_CEILING`.
-SKILL_VIEW_PROJECTION_CEILING = 2000
+#:
+#: Every view is a row in the Kiro IDE's agent drop-down (it lists the same
+#: directory), so the number is sized to keep that list short, not only to keep
+#: kiro-cli's start cheap: a view is pruned as soon as its session ends, so the
+#: steady state is the live sessions' views, and this is the backstop above it.
+#: Measured before it was set: a heavily used host with 34 authored agents held
+#: 35 views (global agents share one view across workspaces; only a project
+#: agent, or a workspace with its own inheritance setting, mints more). Past the
+#: ceiling a spawn falls back to the authored agent, so it is set well above
+#: that -- a host that trips it has several workspaces' worth of distinct views
+#: live at once, or a leak the doctor names.
+SKILL_VIEW_PROJECTION_CEILING = 128
 
 _FRONTMATTER_CLOSE_RE = re.compile(r"^---[ \t]*\r?$", re.MULTILINE)
 
 
-class _FrontmatterLoader(yaml.SafeLoader):  # type: ignore[misc]
+class _FrontmatterLoader(NoAliasSafeLoader):
     """``SafeLoader`` that yields a JSON-shaped TREE and nothing else.
 
     The parsed frontmatter is re-serialized as JSON on every consuming path
@@ -72,10 +84,10 @@ class _FrontmatterLoader(yaml.SafeLoader):  # type: ignore[misc]
     YAML have no JSON form and are removed at the loader rather than detected
     afterwards:
 
-    * **Aliases** (``*name``) are refused at compose time; an ``&name`` anchor
-      nothing references parses as its plain value, the same rule the other
-      alias-refusing loaders in this package apply. An alias is a shared
-      reference, and a shared reference is what makes a document a graph: a self-reference recurses forever, and a chain of
+    * **Aliases** (``*name``) are refused at compose time by the shared base,
+      with a refusal that names the alias and says what to write instead; an
+      ``&name`` anchor nothing references parses as its plain value. An alias
+      is a shared reference, and a shared reference is what makes a document a graph: a self-reference recurses forever, and a chain of
       shared containers expands exponentially when it is serialized -- which
       every consumer does. Without aliases the loaded value is a tree whose
       size is bounded by the file's, so the validation below is one linear
@@ -91,17 +103,11 @@ class _FrontmatterLoader(yaml.SafeLoader):  # type: ignore[misc]
     after loading rather than mapped, since there is no faithful mapping.
     """
 
-    def compose_node(self, parent: Any, index: Any) -> Any:
-        if self.check_event(yaml.AliasEvent):
-            event = self.get_event()
-            raise yaml.composer.ComposerError(
-                None,
-                None,
-                f"aliases (*{event.anchor}) are not supported in agent frontmatter; "
-                "repeat the value instead",
-                event.start_mark,
-            )
-        return super().compose_node(parent, index)
+    def alias_problem(self, anchor: str) -> str:
+        return (
+            f"aliases (*{anchor}) are not supported in agent frontmatter; "
+            "repeat the value instead"
+        )
 
 
 def _construct_timestamp_as_text(loader: yaml.SafeLoader, node: yaml.Node) -> str:

@@ -105,7 +105,82 @@ that stays in the default directory. A different recorded directory remains an
 explicit override and must pass current directory policy, including after the
 pool default changes.
 
+## Composition
+
+`kiro_crew/subagent.py` is the facade and the one namespace of the subagent family:
+`kiro_crew.subagent.<name>` is the import path and the patch target for everything
+below, and every function the family defines runs on that module's globals.
+
+| Module | Owns |
+|---|---|
+| `subagent.py` | The import block (including the agent-sdk boundary edges baselined for this file), the logger, the `ClaudeCodeProvider` sentinel, the background-task registry, the re-exports and the composition tail |
+| `subagent_parts/run_limits.py` | The timeouts, limits and wire markers a run is held to (the Constants below) |
+| `subagent_parts/run_output.py` | What a run reports: redaction and truncation, exception text, the done result, the usage line, `SubagentDelivery`, `_RunCreditAccounting` |
+| `subagent_parts/agent_policy.py` | Which agent a spawn may name: reserved names and refusal codes, the roster, app ownership, governance vetting, the `availableAgents` allowlists, parent spawn policy, `validate_cwd` |
+| `subagent_parts/model_choice.py` | Which model and reasoning effort a run uses, and the effort notes |
+| `subagent_parts/host_memory.py` | Host and cgroup memory readings, process-subtree sampling, the count ceiling and `resolve_max_subagents` |
+| `subagent_parts/start_pricing.py` | What a start costs in memory, the admitted-start reserve, the one off-loop host reading |
+| `subagent_parts/run_record.py` | The run record, `SubagentInfo`, and the scope fields it carries |
+| `subagent_parts/delivery.py` | How a run's outcome reaches its parent: the callback contracts, the delivery-routing field table and `delivery_is_parked`, the teardown gate's run ids |
+| `subagent_parts/manager.py` | `SubagentManager`: its constructor, class attributes and properties, the durable task queue it opens and closes, and one binding per other method |
+| `subagent_parts/config_surface.py` | The manager's live configuration: sizing re-reads, the turn limit, the completion keep, the effective cap and its raise listener, the queue dispatch release |
+| `subagent_parts/admission_surface.py` | The spawn entry: admission (sync and async) and its spawn approval, the startup population and its clock, the run-id draw, the memory-pressure hold, the queue drain and dispatch, the queued-run and task-memory reads |
+| `subagent_parts/continuation_surface.py` | Continuable conversations: successor claims, `continue_conversation`, steering and follow-ups, conversation release and the registry rebuild |
+| `subagent_parts/monitor_surface.py` | The orphan and stall watch: the reaper loop, process probes and orphan notices, stall attribution and slow-command notes, live cost sampling, the dependency coordinator, the task-queue pump |
+| `subagent_parts/terminal_surface.py` | Terminal reports: the finalize claim and the report's await, the slot release, forced reaps and session kills, the tombstone writer, panel-dismissal settling, the injection-failure notice, the wave and batch digest |
+| `subagent_parts/run_surface.py` | The run loop glue: `_run`, `_run_inner`, the stop-recovery and dependency yields, shared-session recognition and the sharing plan, the provider seam, run lookups, the queue-depth and pending-work queries, the off-loop state and result writers |
+| `subagent_parts/cancellation_surface.py` | Cancellation: the one intentional-cancel chokepoint, queued-run stops, cancel recovery, the parent-end teardown wrappers and their fence |
+| `subagent_manager/` | The coordinators `SubagentManager` delegates to (`OrphanStallMonitor`, `TerminalCoordinator`, `SpawnAdmissionCoordinator`, `ContinuationCoordinator`, `WaveDigestCoordinator`, `RunEventCoordinator`, `CancellationCoordinator`) |
+
+**One namespace, two rebinding passes.** The shared `kiro_crew._facade_compose.compose`
+(called with `host=SubagentManager`) rebinds every function a `subagent_parts` owner
+defines (and the methods of its classes) onto `subagent.py`'s globals; `subagent_manager.bind_component_globals` does the same for the coordinators'
+`*_impl` methods, which are disjoint objects. A `patch("kiro_crew.subagent.<name>")`
+therefore reaches every reader wherever its code lives. A value an owner computes while it
+is imported -- a constant, a default argument, a class body, a dataclass field factory --
+reads the owner's own globals, as the one-module file read them once at import; so does
+`typing.get_type_hints` on an owner's class (`SubagentDelivery` resolves; `_RunCreditAccounting.info`
+names `SubagentInfo`, which `run_output` binds for type checking only). Pinned by
+`test/test_subagent_parts_composition_contract.py` (bytecode sweep, patch reach derived
+from the test trees, import graph, the moved names' BASE shapes, the class inventory).
+
+**The class binds its methods.** A `*_surface` owner holds `SubagentManager` methods as
+module functions taking the manager as `self`, and `manager.py` binds each one as the class
+attribute of the same name (`spawn = _admission_surface.spawn`, `staticmethod(...)` for a
+static one), grouped under one comment per surface. The class attribute IS that function,
+so `MagicMock(spec=SubagentManager)`, autospec, `inspect.signature` and
+`SubagentManager.<name>` patches see what the one-module class had; `compose` gives each
+bound function its `SubagentManager.<name>` qualname back. A method that needs the class
+body (zero-argument `super()`, `__class__`, a name-mangled attribute) stays in `manager.py`.
+Each surface's docstring lists the manager fields it reads and writes. The fields mypy
+reports `[has-type]` for when a `*_surface` owner or a `subagent_manager` coordinator reads
+them are declared with their types in the class body
+(`_admission: SpawnAdmissionCoordinator`): both import the class only under
+`TYPE_CHECKING`, so mypy checks them before it infers those fields from `__init__`. A moved
+class reports its owner module as its `__module__` (`SubagentManager`, `SubagentInfo`, the
+callback Protocols, `_AgingIdSet`, `_BareStateView`), because nothing reads it;
+`SpawnApprovalUnreachable` reports `kiro_crew.subagent`, because a traceback, a log line
+and a pickle name an exception by its module.
+
+**Where new code goes.** A module-level helper goes in the `subagent_parts` owner of its
+responsibility, and `subagent.py` re-exports it; a new `SubagentManager` method goes in the
+surface of its responsibility and gets its binding in `manager.py`. Nothing but
+`kiro_crew.subagent` imports a module of `subagent_parts` at runtime, except `manager.py`,
+which imports the `*_surface` modules its class binds and `run_limits` for its default
+arguments; everything else imports the name from `kiro_crew.subagent`. An owner imports
+the facade only under `TYPE_CHECKING`, and imports for real only what its own import-time
+code needs.
+
+**What stays in `subagent.py`, and why.** The `kiro_crew.acp` / `kiro_crew.providers`
+imports (`scripts/check_agent_sdk_boundary.py` lets no other module carry them; owners reach
+ACP values through `kiro_crew.agent_sdk.drivers`), the `kiro_crew.subagent` logger the
+caplog pins name, and the names the coordinators read from its globals
+(`_COMPONENT_GLOBAL_BINDINGS`; the owners' reads are `_PARTS_GLOBAL_BINDINGS`).
 ## Constants
+
+The subagent constants below are defined in `subagent_parts/run_limits.py` (the
+start-pricing ones in `subagent_parts/start_pricing.py`; a row naming another module says
+so) and re-exported by `kiro_crew.subagent`, which stays the place to read and patch them.
 
 | Constant | Value | Purpose |
 |----------|-------|---------|
@@ -118,7 +193,7 @@ pool default changes.
 | `_SHARED_START_SAVING_GB` | 0.35 | What a start that shares its parent's runtime does not launch (the kiro-cli process and its first-session warm-up, measured); a shared start is priced at the dedicated projection less this, never below `_SHARED_START_MIN_GB` (0.05). See *Memory guard* |
 | `_RSS_SAMPLES_TO_SETTLE` | 2 | Sweeps before a dedicated worker counts as settled and owes nothing |
 | `_DEDICATED_TOPUP_WAIT_SECS` | 60 | Longest a start admitted at the shared price waits for the floor before launching a dedicated process anyway (polls every `_DEDICATED_TOPUP_POLL_SECS`, 2 s) |
-| `_ON_DONE_TIMEOUT` | 1200 | Outer cap (`subagent._ON_DONE_TIMEOUT`): max total seconds for semaphore wait + injection (20 minutes), enforced by `asyncio.wait_for` around `_on_done` in `subagent_manager/terminal.py`. Inside it, a channel or no-tab parent gets up to `_MAX_INJECT_ATTEMPTS` (2, `slack/gateway.py`) injection attempts, the second only after a timeout, before the failure is queued |
+| `_ON_DONE_TIMEOUT` | 1200 | Outer cap (`subagent._ON_DONE_TIMEOUT`): max total seconds for semaphore wait + injection (20 minutes), enforced by `asyncio.wait_for` around `_on_done` in `subagent_manager/terminal.py`. Inside it, a channel or no-tab parent gets up to `_MAX_INJECT_ATTEMPTS` (2, `slack/gateway_runtime/subagent_injection.py`) injection attempts, the second only after a timeout, before the failure is queued |
 | `INJECTION_TIMEOUT` | 900 | Inner cap: max seconds for a single `stream_and_collect` call (15 minutes); default `_DEFAULT_INJECTION_TIMEOUT = 900.0`, tunable via `KIROCREW_INJECTION_TIMEOUT` (float seconds, clamped to `_ON_DONE_TIMEOUT`) |
 | `_RESET_TIMEOUT` | 30 | Max seconds for session reset in finally block |
 | `_TURN_LIMIT` | 1000 | Default tool-call budget per subagent, from `constants.DEFAULT_SUBAGENT_MAX_TURNS` (configurable via `agent.subagent_max_turns`, per-spawn via `max_turns`) |
@@ -318,7 +393,12 @@ does not start a row a stop took, whether the stop landed during a grant or a
 read. A raise in the gap (a pool that cannot start a thread, in a read or in a
 grant ahead of the dispatch) puts the row back at the front of the window, not
 eligible again until the admit wait passes (`_requeue_undispatched`), instead of
-dropping it.
+dropping it. Every read of a parent's or a wave's unstarted spawns reads the
+entries held there beside the window (`_in_memory_queued_entries`): the queued
+lookups, the queued depth and its chip, the pending-work checks, and the wave
+helpers (`_batch_pending_in_memory`, `wave_has_live_nested_spawns`,
+`_stuck_wave_candidates`). For the whole re-check the row reads as waiting to
+start, not as gone.
 
 **Prices.** Decided per start (`_spawn_memory_floor_and_cost` reads the floor and
 `subagent_cost_gb` for every caller) and carried on the row as `_start_price_gb`,
@@ -328,9 +408,14 @@ so every later admission charges a row at the price it was admitted at:
   bucket (`_cost_bucket`, `_dedicated_start_price_gb`): the bucket's learned
   settled RSS once it has three readings, capped at
   `_SETTLED_PROJECTION_CEILING_GB`, else `_UNLEARNED_DEDICATED_START_GB`; never
-  below `agent.subagent_cost_gb`. The cap exists because a bucket priced out of
-  admission runs no dedicated starts and so never relearns: a few mis-measured
-  readings would otherwise lock it out for good. A non-finite learned figure is
+  below `agent.subagent_cost_gb`. The cap and the reading horizon exist because a
+  bucket priced out of admission runs no dedicated starts and so never relearns:
+  the cap bounds how far a few mis-measured readings raise the bar, and a bucket
+  whose newest reading is older than `SETTLED_SAMPLE_MAX_AGE_SECS` (7 days) stops
+  counting, so a figure learned under a heavier roster expires on its own and the
+  bucket falls back to the unlearned price. A bucket with any reading inside the
+  horizon keeps its whole window. A stamp that is not a finite number or lies in
+  the future never shows a bucket recent. A non-finite learned figure is
   ignored. These are internal admission prices with no config key of their own.
 - **Shared.** A start that will take a session on its parent's runtime launches
   no kiro-cli process, but it does launch the agent's MCP servers: kiro-cli
@@ -414,8 +499,13 @@ dedicated run whose own children share its runtime, whose tree holds their
 per-session servers. `_record_cost` writes it as the cost record's `settled_gb`
 beside the whole-run peak `mem_gb`, which the auto cap still reads unchanged. The
 admission side reads the per-bucket p90 of dedicated `settled_gb` (at least three
-readings) from `_learned_settled_gb`, which the reaper refreshes off the loop at
-start and after every sweep; the gate never opens the cost log. A start is never
+readings, the newest no older than `SETTLED_SAMPLE_MAX_AGE_SECS`) from
+`_learned_settled_gb`, which the reaper refreshes off the loop at start, after a
+sweep in which a run recorded a settled reading, and otherwise every
+`_SETTLED_REREAD_SECS` (one hour), since readings age out with no new run; the
+gate never opens the cost log. An incomplete or failed read keeps the figures it
+could not confirm only while the map rests on a read younger than the horizon;
+past it the map is rebuilt from what the read saw. A start is never
 priced at the whole-run peak or a whole-tree p90: a run's peak RSS is its whole
 process subtree, test suites, builds and MCP servers it launched included, and
 pricing the next start at that held ordinary spawns at 10 GB+ on a laptop.
@@ -594,7 +684,8 @@ a second input: the kernel's `kern.memorystatus_vm_pressure_level`, read fresh
 on every check through `resource_status.read_memory_pressure_level()`
 (`platform_compat.memory_pressure_level()`, a `sysctlbyname` on the cached libc
 handle; it says once per process, at WARNING, when macOS cannot answer it). This
-section is the one statement of the hold's rules; the code points here.
+section is the one statement of the hold's rules; the code points here. The code is
+`subagent_manager/admission/gate_pressure.py`, and new hold work goes there.
 
 The hold applies (`_memory_pressure_hold`) while all of these are true:
 
@@ -661,9 +752,16 @@ It keeps a start (`_memory_pressure_holds`) when, in addition:
   (never inside it), counted ("1 never started — ...") and naming the panel's
   Retry failed control,
   so a mixed wave's "finished" header cannot hide it and the retry is not read
-  as automatic; the wave digest the parent reads says the same after its tally,
+  as automatic. Each note names the reason its members ended with: the card
+  tells this terminal from the low-memory expiry (`QUEUED_WAIT_EXPIRED_TEXT`)
+  by `neverStartedPressurePrefix` in the same file, and gives each its own
+  counted note. The Subagents panel heads such a run "Never started", not
+  "Error", and replaces the backend terminal (written for the parent agent,
+  Slack and the CLI, none of which has the control) with a sentence naming the
+  same reason and the Retry failed control; it still counts under Retry failed,
+  which is the way out that sentence names. The wave digest the parent reads says the same after its tally,
   "K of the ❌ never started", counting members whose error opens with
-  `QUEUED_WAIT_EXPIRED_TEXT` (a refusal is not counted, since resubmitting it
+  `NEVER_STARTED_MEMORY_PREFIX`, the opening words of both memory terminals (a refusal is not counted, since resubmitting it
   would only be refused again; a member the spent episode ended at once IS
   counted, so the line says to resubmit them "once memory eases", since a
   resubmit while that episode lasts is ended at once too), so the parent
@@ -1014,6 +1112,15 @@ Spawns a background agent. Accepted running or queued work returns a stable
 `_running_count` to prevent race conditions. `parent_session_key` tracks the
 originating session for completion injection.
 
+The spawn gate is `_GateMixin` in `subagent_manager/admission/gate.py`, which holds
+`spawn_impl` and binds its other members by name from three sibling owners:
+`gate_execution.py` (`resolve_spawn_execution`, the execution a spawn runs under),
+`gate_pressure.py` (the macOS kernel memory-pressure hold) and `gate_reporting.py`
+(the done-callback announce and the crew-log pin and entries of a dispatch, a start
+and a spawn approval prompt). Each owner's member is a module-level function taking
+`self`, so its `__qualname__` is the bare function name and its `__module__` the
+owner; nothing reads either. New work for one of those concerns goes to its owner.
+
 Admission order (`subagent_manager/admission/gate.py::spawn_impl`):
 1. Policy refusals that leave no durable trace: empty task, memory identity,
    `cwd` outside `subagent_cwd_allowed_roots`, spawn governance, and the parent
@@ -1079,6 +1186,17 @@ made; no gate reads it back. Two consumers:
 - The advisory `subagent_queued` lifecycle event (`_emit_queue_depth`) carries
   `reason` and, for the low-memory kind, `available_gb` /
   `required_gb` beside `queued`; the memory-pressure kind carries no figures.
+  A low-memory wait on an unreadable cgroup usage file carries
+  `cause: cgroup_usage_unreadable` and no `available_gb` (the 0 that usage
+  contributes is not an amount), and the chip says free memory is unknown.
+  Both memory kinds also carry `max_wait_secs`, the live
+  `agent.subagent_queue_max_wait_secs` read as the frame is published
+  through `taskq_memory_wait_bound_secs` (the reader the sweep and the
+  pressure hold use; `0` is no bound). The chip states it as how long
+  memory may stay short before the rows never start (a total,
+  not a countdown: the bound is counted as parked time, and the pressure
+  hold restarts it whenever the lane starts something). At `0` the chip
+  says they wait with no time limit; with the field absent it says neither.
   The label is remembered per parent (`_queue_wait`) so the drain's,
   the claim path's, the cancel paths' and the terminal reports' requests —
   which carry no verdict of their own — keep it. A frame at depth 0 is the
@@ -1149,11 +1267,16 @@ made; no gate reads it back. Two consumers:
   One label per parent, last writer wins: it is the verdict on the most recent
   row the gate judged for that parent, not a per-row ledger. A parent holding a
   memory-deferred row and then a capacity-queued one shows `concurrency_limit`
-  until the deferred row is re-checked — which the pump does on the next memory
-  wake, and at the latest within `admit_wait_secs` (default 30 s), re-labelling
-  it or starting it — so the label is never more than one admit wait stale. This is accepted: the
+  until the deferred row is re-checked — which the pump does on the next
+  eligible pump pass (after the admit wait, `admit_wait_secs`, default 30 s, or
+  sooner on a memory wake — but only once the pass can reach the pick:
+  `_drain_queue_sync_impl` returns before it while the cap has no free slot,
+  and while the in-startup bound `_startup_cap` is full, and the row is not
+  revisited until a slot opens or a starting child leaves startup),
+  re-labelling it or starting it. So the label has no fixed staleness bound:
+  it stays as it was until the row is picked on an eligible pass. This is accepted: the
   alternative is a per-row label reconciled on every emit, for a chip that
-  states a count, and a stale-by-one-wait label always reads as a wait that
+  states a count, and a stale label always reads as a wait that
   does exist for that parent.
   An event without `reason` (nothing labelled, or an older gateway) leaves the
   dashboard on its default "queued behind the concurrency limit" text; the
@@ -1240,7 +1363,32 @@ declaration itself (`subagent._vet_parent_available_agents`, called from
   its execution record (`read_session_execution(parent_session_key).template_id`)
   and resolved in the user-level agents directory the way `agent_spec_path`
   resolves a name (declared `name` wins, filename stem is the fallback; two
-  specs declaring the name are both applied, tightest-wins). Read with one
+  specs declaring the name are both applied, tightest-wins).
+- **Project scope.** For each project directory the parent session may run in
+  (`subagent.parent_project_dirs`, answered by the resolver the gateway installs
+  with `set_parent_project_resolver`:
+  `_shared.session_project_for_spawn_gate` returns a sub-agent parent's run
+  cwd, or for a chat parent BOTH its live session's bound cwd
+  (`provider.cwd`) and the project of the slot whose effective session key IS
+  the parent's — a `set_project` change only stages the slot's project until
+  the next cold start, so the running agent's directory is still applied —
+  never `active_project_dir`'s "the one project every slot shares" guess),
+  `<project>/.kiro/agents` is resolved by the same rules, through the
+  same hardened reader under its own SEL label (`spawn_available_agents_project`)
+  and its own `_PARENT_PROJECT_ALLOWLIST_MEMO`. Its lists are ADDED to the
+  user-level ones and the target must satisfy all of them. kiro-cli lets a
+  project spec shadow a user-level one; the gate does not pick a winner, so
+  honouring the project scope only ever narrows. Every unreadable or
+  unscannable rule below applies to the project directory too, and either
+  scope answering UNKNOWN refuses. Every entry point resolves it the same way
+  (`subagent.parent_template_allowlists(parent_session_key, template)`).
+- **Unresolved parent = surfaced.** When the project directory is unknown (no
+  resolver in this process, a session with no slot project, a sub-agent run
+  with no cwd) and no user-level spec names the parent, a project-scope
+  declaration may exist that the gate cannot see. The spawn keeps the
+  admission it had, and the gap is logged at WARNING once per name and written
+  to the SEL as a `spawn_run` tool invocation with outcome
+  `parent_spec_unresolved` on every occurrence. Read with one
   fresh walk through the hardened reader (`_scan_parent_spawn_allowlists`),
   memoized per directory in an `AgentsDirMemo` pinned to
   `agents_dir_revision` (names, mtime AND ctime, size, inode, mode, link
@@ -1313,10 +1461,11 @@ declaration itself (`subagent._vet_parent_available_agents`, called from
   and the allowed globs (grammar-checked, redacted, bounded like every rendered
   roster). `spawn_run` short-circuits the rest of a wave on this code exactly
   as it does on `agent_not_found`.
-- **Not covered yet**: a parent whose spec lives only in a project's
-  `.kiro/agents` (the gate does not know the parent session's project dir);
-  its declaration is not honoured. There is no warning when a spec declares
-  the key but the session's `tools` lack the kiro-cli `subagent` tool.
+- **Not covered yet**: a project-scope parent whose project directory the
+  gate cannot resolve (see "Unresolved parent = surfaced" above) is audited,
+  not refused. The advisory spawn-tool roster and the Slack cron default
+  substitution read the user-level scope only. There is no warning when a spec
+  declares the key but the session's `tools` lack the kiro-cli `subagent` tool.
 
 The spawn tools advertise the same view: `spawn_run`'s "Valid names right now"
 roster and `spawn_list`'s "Available agents" line drop the names the parent's
@@ -1369,7 +1518,7 @@ Spawn flow (`subagent_manager/admission/gate.py`), first matching rung wins:
 6. **Otherwise**: rejected with `spawn rejected: no approval mechanism configured`.
 
 **Channel-side approval delivery (issue #2381 item 1).** The single host-wide
-`on_spawn_approval` callback (built in `slack/gateway.py`) consults a
+`on_spawn_approval` callback (built in `slack/gateway_runtime/subagent_wiring.py`) consults a
 channel-neutral delivery seam (`messaging/spawn_approval_delivery.py`) FIRST,
 given the spawn's `parent_session_key`. A channel dispatcher registers a delivery
 hook keyed by its channel namespace (`register_channel_delivery("telegram", …)`);
@@ -1413,7 +1562,7 @@ that answers:
    return is the user's in-channel decision and is used verbatim; `None` (no hook
    for that channel, or it could not surface the prompt) falls through.
 2. **Slack owner DM / dashboard fallback** — the pre-existing gate in
-   `slack/gateway.py` (`_interactive_approval`), which races a Slack owner DM
+   `slack/gateway_runtime/turn_approvals.py` (`_interactive_approval`), which races a Slack owner DM
    against an attached dashboard client. A configured-but-unpostable Slack DM and
    an unattached dashboard both count as "no surface".
 3. **`#8914` fast-fail backstop** — reached only when neither a channel hook nor a
@@ -1512,7 +1661,23 @@ after the wire answered for an approval (an approval the transport floor turns
 into a rejection is audited as `rejected_transport_floor`). A HOST refusal (the
 spec hooks, a hook deny, the fail-closed child answer, deny by default) steers
 the in-band deny notice before the reject; an approver's no, and the reject that
-precedes a `turn_limit` / `child_escalation_limit` bail, stay bare. A refusal row
+precedes a `turn_limit` / `child_escalation_limit` / `stopped` bail, stay bare. A
+run that is being stopped (`_reap_started`, `user_stopped` or `reaped`) bails
+every request as `stopped`, so no grant, gate hit or person can approve a tool
+after a Stop: the run reads the stop when it reads the request, and the ladder
+reads the same predicate (`Policy.stopping`) live before its first stage, before
+it asks a person, and at the commit point of an approval, with no await between
+that read and the wire. A stop that lands in any await on the way (the
+diagnostics write, the `subagent_tool` event, the spec hooks, the gate, a
+person's wait) is caught at the next read. The approval hands the same predicate
+to the ACP transport (`withdraw_if`), which reads it again after the security
+floor's thread hop and under the stdin write lock right before the allow is
+written, so a stop that lands in the transport's own awaits writes no allow and
+the request is bailed as `stopped` too. The stop bail ends the run there, as
+the limit bails do: the loop breaks, and the stream's own ending arms record the
+stop (the reap's ending under a reap in flight, the neutral stop otherwise). A
+person's no that a stop's cancel caused reads on, so a stream the stop tore down
+still ends at its next read, as before. A refusal row
 the audit cannot write is logged and the request is still answered; an approver
 that raises outside the fidelity gate, or a cancelled wait, leaves the request to
 the run's teardown. An approved
@@ -1563,9 +1728,11 @@ work and is returned for cancellation.
 
 "Has the outcome reached the parent" is asked through `delivery_is_parked`, which reads
 one declared table, `DELIVERY_ROUTING_FIELDS`. The table is enumerated from the PRODUCING
-side: every `SubagentInfo` attribute written by the four modules that own terminal-outcome
+side: every `SubagentInfo` attribute written by the modules that own terminal-outcome
 routing (`subagent_manager/terminal.py`, `subagent_manager/waves.py`,
-`subagent_manager/cancellation.py`, `slack/gateway.py`), classified as `PARKS_WHEN_SET`,
+`subagent_manager/cancellation.py`, and the gateway's completion consumer in
+`slack/gateway_runtime/subagent_wiring.py`, `subagent_report.py`,
+`subagent_injection.py` and `runtime_charge.py`), classified as `PARKS_WHEN_SET`,
 `PARKS_WHEN_UNSET` or `NOT_DELIVERY_STATE`.
 
 That direction matters because the question has five representations, not one, and reading
@@ -1625,7 +1792,7 @@ the read, since the teardown's `_unqueue` drops a window entry with its row). Th
 leaves `admitted` rows out, where Stop all's includes them: the teardown refuses a
 claimed-not-started row, so naming one would only mark it in the delivery gate and
 count it in the audit line
-(`test_queue_depth_reconcile.py::test_a_parent_end_sweep_never_names_a_claimed_row`).
+(`test_queue_depth_reconcile_exits.py::test_a_parent_end_sweep_never_names_a_claimed_row`).
 The fence orders by ACCEPT, never by `created_at`: a wall clock stepped back during the teardown
 stamps the successor's row earlier than the retired conversation's, and a time cutoff
 would sweep it. It runs after the
@@ -1640,7 +1807,7 @@ each reaper sweep runs it again (`retry_owed_teardown_sweeps`, the same cancel w
 snapshot ids under the kept fence) until a read lands and the fence is released. The
 first refusal warns; a refused retry logs at DEBUG. Pinned by
 `test_subagent_queue_max_wait.py::TestARefusedTeardownSweepIsRetried`, and by
-`test_queue_depth_reconcile.py::test_after_each_exit_the_published_depth_equals_the_store_count`
+`test_queue_depth_reconcile_exits.py::test_after_each_exit_the_published_depth_equals_the_store_count`
 (`parent_end`, `session_reset`),
 `test_a_parent_end_stops_its_store_rows_without_reporting_them_home`, for a row the
 refill windows between the snapshot and the sweep,
@@ -1928,7 +2095,7 @@ store cancel raised is still waiting (the store still holds it), so its window
 entry goes back at the tail, where a refill would put it, the pass goes on and
 then raises that failure; a row whose report raised was removed and counts as
 stopped. Pinned by
-`test_queue_depth_reconcile.py::test_a_row_that_could_not_be_unqueued_fails_the_stop_and_reaps_nothing`.
+`test_queue_depth_reconcile_reads.py::test_a_row_that_could_not_be_unqueued_fails_the_stop_and_reaps_nothing`.
 
 ### `cancel_queued(agent_id, parent_session_key, *, stop_origin="") -> bool`
 The queued half of `cancel_for_parent` for ONE accepted, not-started spawn: the
@@ -1943,7 +2110,13 @@ stopped the run. Reached from `spawn_release` (REST
 is not resuming: the route answers `{"status": "cancelled"}`. It is the parent's
 one control over a run the gate is holding, which otherwise keeps the parent
 attached (`subagents_attached_async`), so a reload refuses until it starts.
-Pinned by `test_spawn_release_queued.py`.
+Pinned by `test_spawn_release_queued.py`. `DELETE /api/spawn/{id}` on the same
+id takes the same cancel before anything else and answers
+`{"ok": true, "cancelled": true, "queued": true}`; the persisted-dismissal arm
+below is for cards of FINISHED runs only, so without this a queued id was
+answered 403 (an internal caller) or 404 (the owner) by a route whose `GET`
+names it `queued`. A cancel that finds the row started meanwhile re-reads the
+run and takes the live `cancel` path. Pinned by `test_spawn_delete_queued.py`.
 
 ### `cancel_all() -> None`
 Cancels all running subagents, stops the reaper loop, and awaits their cleanup. Handles `CancelledError` gracefully — sessions released, count decremented.
@@ -2251,12 +2424,12 @@ An unmarked `CancelledError` (see intentional-cancel rule) triggers `_schedule_c
 - **An undelivered report abandoned at shutdown is made RECOVERABLE, not silently dropped.** The terminal record — including the tombstone — is written before delivery is attempted, and a tombstone is exactly what `list_orphans()` uses to EXCLUDE a folder from the next start's reconciliation. So cancelling a still-pending report at the drain deadline would leave an outcome that was never injected *and* invisible to the only path that could still inject it. `cancel_all()` therefore calls `clear_tombstone(id)` for each report it cancels, re-admitting that agent to the next start's orphan reconciliation (which finds `result.txt` and re-delivers). Extending the drain to `_ON_DONE_TIMEOUT` instead was rejected: it would hold gateway shutdown for up to 20 minutes on one wedged injection, which is the exact failure the bounded drain exists to prevent. Only reports cancelled **before** `_on_done` returned are re-admitted — `info._reported_to_parent` is set the moment the injection returns, so a cancellation in the later teardown/tombstone waits cannot cause a duplicate delivery on restart.
 - **Every reporter goes through the claim — including cancel-recovery failure.** There are more terminal paths than the two obvious ones: when a cancel-recovery respawn cannot happen, its `except` arm also finalizes the agent. That site previously fired `subagent_done` and `_on_done` directly, gated only on `done`/`reaped`, so a reaper racing a failed respawn delivered the outcome twice. It now takes `_claim_finalize` like every other reporter and reports through the shielded helper (which matters because `_force_reap` cancels that very task). `_resume_guarded`'s CancelledError arm writes only the RECORD and deliberately never reports — during shutdown the drain owns delivery.
 - **The reaped marker and the recovery cancel precede every `await` in `_force_reap`.** Both used to sit after the session teardown, which yields for up to `_RESET_TIMEOUT` (longer on the SIGKILL path). A recovery task whose bounded handshake expired inside that window observed `reaped == False` and respawned the run being killed — tools executing after a user Stop, strictly worse than a duplicate report.
-- **The reap's report exists before any point the reap can be cancelled at, and publishes only once the record is final.** A gateway shutdown runs `cancel_all()`, which cancels the reaper task while `_force_reap` awaits the reset or the fallback kill after it -- and, beside it, every reap running OUTSIDE the reaper task: a dashboard Stop or a parent-end cancel each run `_force_reap` as a task tracked in `_reap_tasks` and awaited in the caller's own task (so the caller's cancellation still reaches the reap), and `cancel_all` cancels and gathers those first, because a reap the shutdown never touched sat in its hanging reset with its report waiting on a gate nobody released until the gateway's shutdown budget (`GRACEFUL_SHUTDOWN_SECS`, 10 s, in `gateway_shutdown_budget.py`) hard-exited the process ahead of the report drain (`_REPORT_DRAIN_TIMEOUT`, 30 s, in `subagent.py`) (the tail also tolerates a gate the drain already cancelled: nothing is released, the report's ownership is dropped, and the drain's `clear_tombstone` has re-admitted the run to orphan recovery). By then the reset has usually already killed the run's runtime, so the run's reap-echo arm has written the record and the tombstone and left the report to the reap. A report the reap launched only after that window was a report no cancellation point inside it could reach: a `CancelledError` let straight out left nobody to report, and the tombstone already on disk excluded the folder from the next start's orphan recovery — the completion was gone for good. So `_force_reap` now spawns the shielded report task FIRST, before its reset and kill awaits, strongly held in `_report_tasks` (drained by `cancel_all()`, re-admitted to orphan recovery if that drain has to abandon it), gated on a future it resolves at the end: `True` once it holds the finalize claim and the record is written (the payload is built from `info` only then, so the parent is never told the run was reaped before the kill decided), `False` when the claim went to another path that reports instead (the run finished on its own inside the window) — a dismissed task is disowned from `_report_owners` before it is released, so its silent exit latches no delivery failure. The teardown awaits sit in a `try` whose `CancelledError` arm treats the kill the reap did not get to decide as a FAILURE the record names (`…; kill failed: CancelledError: the stop was cancelled before its kill decided`, audited `reaper_force_kill` = `failed`, never `reaped`: the process may well be alive), marks `reaped`, cancels the run task, writes the record and the tombstone, releases the report, and only then re-raises — without awaiting the report, since the caller is inside `cancel_all()`'s own gather and a shielded await there would hold shutdown for the injection cap the drain exists to bound. Pinned by `test_subagent_force_stop_audit.py::TestAStopCancelledMidTeardownStillReports` (a cancel inside the reset, one inside the kill, and one landing before the run's own stream has died).
+- **The reap's report exists before any point the reap can be cancelled at, and publishes only once the record is final.** A gateway shutdown runs `cancel_all()`, which cancels the reaper task while `_force_reap` awaits the reset or the fallback kill after it -- and, beside it, every reap running OUTSIDE the reaper task: a dashboard Stop or a parent-end cancel each run `_force_reap` as a task tracked in `_reap_tasks` and awaited in the caller's own task (so the caller's cancellation still reaches the reap), and `cancel_all` cancels and gathers those first, because a reap the shutdown never touched sat in its hanging reset with its report waiting on a gate nobody released until the gateway's shutdown budget (`GRACEFUL_SHUTDOWN_SECS`, 10 s, in `gateway_shutdown_budget.py`) hard-exited the process ahead of the report drain (`_REPORT_DRAIN_TIMEOUT`, 30 s, in `subagent_parts/run_limits.py`) (the tail also tolerates a gate the drain already cancelled: nothing is released, the report's ownership is dropped, and the drain's `clear_tombstone` has re-admitted the run to orphan recovery). By then the reset has usually already killed the run's runtime, so the run's reap-echo arm has written the record and the tombstone and left the report to the reap. A report the reap launched only after that window was a report no cancellation point inside it could reach: a `CancelledError` let straight out left nobody to report, and the tombstone already on disk excluded the folder from the next start's orphan recovery — the completion was gone for good. So `_force_reap` now spawns the shielded report task FIRST, before its reset and kill awaits, strongly held in `_report_tasks` (drained by `cancel_all()`, re-admitted to orphan recovery if that drain has to abandon it), gated on a future it resolves at the end: `True` once it holds the finalize claim and the record is written (the payload is built from `info` only then, so the parent is never told the run was reaped before the kill decided), `False` when the claim went to another path that reports instead (the run finished on its own inside the window) — a dismissed task is disowned from `_report_owners` before it is released, so its silent exit latches no delivery failure. The teardown awaits sit in a `try` whose `CancelledError` arm treats the kill the reap did not get to decide as a FAILURE the record names (`…; kill failed: CancelledError: the stop was cancelled before its kill decided`, audited `reaper_force_kill` = `failed`, never `reaped`: the process may well be alive), marks `reaped`, cancels the run task, writes the record and the tombstone, releases the report, and only then re-raises — without awaiting the report, since the caller is inside `cancel_all()`'s own gather and a shielded await there would hold shutdown for the injection cap the drain exists to bound. Pinned by `test_subagent_force_stop_audit_reports.py::TestAStopCancelledMidTeardownStillReports` (a cancel inside the reset, one inside the kill, and one landing before the run's own stream has died).
 - **The report trails teardown.** Spawning the report ahead of teardown opens a window the older ordering did not have: publishing before the session is torn down handed the parent a completion that could not name a process the teardown's kill then failed to end, and writing the "delivered" tombstone before then hid that survivor from orphan reconciliation. The report therefore waits on a `teardown_done` event (set in `_run`'s `finally`, so it fires even under cancellation, and bounded so the report can never wedge) BEFORE it builds its payload: the `subagent_done` event, the parent's completion and the delivered-or-not decision all see the teardown's outcome (a kill the run's `finally` could not deliver sits in `info.error` by then, and such a run is not marked delivered). A reaped or recovery-failed member still settles its **siblings'** digest holds, since those siblings' results did reach the parent even though this member's did not. On the dashboard routes the report's own settle and `mark_delivered` are no-ops by design: `_subagent_done` defers the delivery bookkeeping — the completed member's own tombstone AND any held wave siblings — to the parent's CONSUMPTION of the announce via `_defer_queued_delivery` (the #4839 content-keyed slot ledger + `_delivery_queued`), on the queue branch settled by the drain and on the direct-injection branch by `_arm_queued_delivery_settlement` armed on the injection task (#2233). A bare `_on_done` return is a local routing success, not evidence the parent received anything; an unconfirmed hand-off leaves the debt parked and orphan-recoverable rather than tombstoned.
 - **A synthesized reap error names only the cause the observed state supports.** The wall clock fires at the configured deadline, but a run parked on a never-answered spawn approval has reached no execution deadline: `turns == 0`, `_pid is None`, `_exec_started is None`, and the dashboard's approval window is still open. So `_force_reap`'s error synthesis tests `_awaiting_approval and _exec_started is None` **first** and reports the unanswered spawn approval, before the `startup_timeout` and generic-deadline arms. The predicate is captured **above** the intentional cancel, because the flag's owner clears it in a `finally` the cancel schedules; reading it at the record site would hold only while no `await` sits in between.
 - `_sigkill_session(session_key, handle)`: best-effort SIGKILL when graceful reset hangs or did not end the process; acts on one pre-reset handle only (`_sigkill_sessions` runs it per candidate and joins the failures), returns the failure it hit instead of swallowing it (contract in the `_force_reap` bullet above). It releases the run's own lease first, then passes the runtime-ownership gate (`authorize_runtime_kill`) and the teardown barrier ([runtime ownership](runtime-ownership.md)); a gate refusal (another session's lease or a tenancy) or a barrier refusal (a tenant arrived after the gate allowed) sends no signal and is returned as a kill failure, so the record never says the run was reaped
 - After decrementing `_running_count`, `_force_reap` calls `_drain_queue()` so the freed slot immediately starts a queued spawn. Normal completion pumps the queue via its `finally` block, but that block is gated on `not info.reaped`; a reap sets `reaped=True` and decrements the count itself, so without this explicit drain a queued spawn would sit stranded until an unrelated agent finished or a new spawn arrived.
-- Wired up in `slack/gateway.py` after `SubagentManager` init
+- Wired up in `slack/gateway_runtime/subagent_wiring.py` after `SubagentManager` init
 
 ### Idle-Stall Detection
 
@@ -2307,6 +2480,51 @@ An incremental progress frame **creates** the panel entry when the client holds 
 
 **Tool-call timeline (#13628).** `sseSubagentTool` and `sseSubagentBatchUpdate` also append each frame's `tool` to the card's `toolCalls` list (`recordToolCall`, newest last, capped at `SUBAGENT_TOOL_CALLS_CAP` = 50), and the Subagents panel renders it as a "Tool calls" list beside the output instead of the single overwritten `lastTool` line. Both `subagent_tool` fire sites in `subagent_manager/run.py` carry the call's redacted `tool_call_id`. A gated call fires twice with the same id (once from `EVENT_TOOL_CALL`, once from the permission request), so a frame naming the newest entry's id replaces that entry rather than listing the call twice; a frame with a different id is a new call even when `tool_count` did not move, which is the case for a backend child's permission request (counted only at approval). A frame with an id that follows an entry with none (the row a replay seeds from `last_tool`) is likewise a new call. A frame with no id falls back to the count (an unmoved count is the newest call's second frame). The list is client-side and live only: it holds what this browser saw since its last connect: a reconnect runs `clearSubagentsForSnapshot` before the replay, so a running card's timeline restarts from the snapshot's `last_tool`, and a card read back from disk after the run has none. A frame with neither id nor `tool_count` (native kiro-cli cards, which `_native_subagent_sync` re-broadcasts on every `list_update`) whose title equals the newest entry is the same activity and is not listed again. It can also be incomplete, because the cap drops old calls and the scale coalescer (`subagent_scale.py`) merges frames latest-wins above its threshold; the card states `toolCount − toolCalls.length` as "N earlier calls not shown" rather than implying the list is the whole run. That count sits in the "Tool calls" heading, outside the scrolling list, because the list follows the newest call and a row at its top would scroll out of view on exactly the long, capped runs it describes; the key is a registered plural (`pluralKeys.json`), so languages that inflect for one take their singular form. Every row drops kiro-cli's `Running: ` title prefix: it is false on a finished call, and the live row is already marked by its spinner, accent colour and `aria-current`. Once rows sit above the scroll box the inner scroller's top edge fades (a `mask-image` gradient on the bare `<ol>`, inside the solid box, so the box itself never fades) and the clipped row reads as more content rather than a fault. Persisting the timeline, expandable per-call input/result, and per-card token figures are not part of this; the Usage page's exclusion of subagent rows is the metrics spec's recorded rule.
 
+A dashboard approval refusal and process liveness are separate facts. A terminal
+approval response (expired/already decided) immediately removes decision controls,
+but remains conservatively active because another browser may already have approved
+and launched the same id. A reconnect that finds a spawn approval gone with no known
+outcome records the same verdict. The client immediately reconciles against
+`GET /api/spawn`, matching the record by run id alone (a nested, cron- or channel-born
+run's `parent` is not its tab key): a non-terminal record promotes the card to
+running/tool once `awaiting_approval` is false, a terminal record adopts its `outcome`,
+and an absent record retires the card as stopped. A row
+still marked `awaiting_approval` is the manager's cleanup race, not proof of execution,
+so it remains unresolved for the next poll. The progress bar's 30-second sweep that
+ends phantom cards (a live card with no live inventory row) matches live rows by run id
+too, never by `parent`: a parent filter would mark a launched nested or cron-born run
+failed on the poll after it was settled, and "Dismiss done" would then DELETE, which
+cancels the still-running task. The reducer compares the slot, subagent id,
+and refused approval id before applying the response, so a live spawn frame or a fresh
+approval id that arrives during the request cannot be overwritten. A failed inventory
+read leaves liveness unresolved and the existing progress-bar poll retries it; the
+failure is reported as an error notice in the composer and on the progress bar, never
+swallowed. The composer's is a notice of its own beside the refusal, never in its
+place: the read fails just after the refusal is shown, and one shared notice would
+leave no surface reporting the refusal. The composer drops it after the 8s its
+other notices last, or sooner once that card settles; the progress bar clears its own on the next successful
+read, or once no gone approval is left, however it settled. A refused poll with no
+gone card waiting stays silent, as #8743 decided for the phantom-card sweep. Concurrent
+reads for several gone cards (a batch refusal, a reconnect, the Subagents tab opening)
+share the one `GET /api/spawn` in flight. Pending
+approval counts remain cleared while composer busy state, running counts, tip
+suppression, and Reload blocking stay conservative until reconciliation.
+The gone verdict belongs to the pending phase only: a real `subagent_spawn` or tool
+frame moves the card to running/tool without clearing the marker, so neither it nor
+the retired verdict (terminal `stopped` only) may classify a live card; a tool frame
+also clears the retired marker, so a launched run that later ends `stopped` reads as
+stopped, never as retired. The failed
+approval request is reported once, as an error notice on the surface that sent it: the
+composer, or the activity card whose button was pressed. Every other surface shows only
+neutral status: the progress bar states each unresolved row as a liveness check, and a
+gone approval found on reconnect was never pressed, so no surface reports an error for
+it. The activity card of an unresolved gone approval reads "Checking whether it
+started…"; a retired card reads "No record". An absent inventory row proves only that
+the gateway holds no record of the id: the run never launched, or it is no longer
+retained (`evict_completed_agents` past `MAX_RETAINED_AGENTS` finished runs, a panel
+dismissal, a gateway restart). A retired card is not tallied as stopped, shows no run
+usage, and "Dismiss done" clears it locally without a DELETE.
+
 
 ### Model Provenance (#3582)
 
@@ -2354,15 +2572,15 @@ display context before it enters the broadcast digest text.
 ## Completion Injection
 
 Subagent results are routed back to the **originating session** via
-`_subagent_done` in `slack/gateway.py`. The `parent_session_key` on `SubagentInfo`
+`_subagent_done` in `slack/gateway_runtime/subagent_wiring.py`. The `parent_session_key` on `SubagentInfo`
 tracks which session spawned the subagent.
 
 ### Two-Level Timeout
 
 | Timeout | Location | Duration | Scope |
 |---|---|---|---|
-| Outer cap | `subagent.py _run()` | 1200s (20 min) | Semaphore wait + injection combined |
-| Inner cap | `slack/gateway.py _subagent_done()` | 900s (`INJECTION_TIMEOUT`, tunable via `KIROCREW_INJECTION_TIMEOUT`) | Single `stream_and_collect` call |
+| Outer cap | `subagent_parts/run_surface.py _run()` | 1200s (20 min) | Semaphore wait + injection combined |
+| Inner cap | `slack/gateway_runtime/subagent_injection.py` (the channel and cron injections) | 900s (`INJECTION_TIMEOUT`, tunable via `KIROCREW_INJECTION_TIMEOUT`) | Single `stream_and_collect` call |
 
 On timeout (inner or outer):
 1. Kill stuck kiro-cli process via `sessions.reset()`
@@ -2372,7 +2590,7 @@ On timeout (inner or outer):
 
 ### Prompt-Busy Recovery
 
-`_inject_with_retry()` in `slack/gateway.py` makes up to 3 attempts (1 initial + 2 retries) of `stream_and_collect` on AcpError. Between retries: cancels orphaned prompt, exponential backoff. On `PromptBusyExhaustedError` or `AcpProcessDied`: resets the parent session only when `runtime_death.caused_by_this_session(client)` says the death was the parent's own runtime; on a shared runtime the parent is left to re-acquire on its next turn, so co-tenant sessions survive a death they did not cause. Either way the failure event is queued (`notify_injection_failed`). Note: the 1200s outer cap (`_ON_DONE_TIMEOUT`) bounds total wall-clock time, so not all retries may fire if earlier attempts consume the budget.
+`_inject_with_retry()` in `slack/gateway_runtime/runtime_charge.py` makes up to 3 attempts (1 initial + 2 retries) of `stream_and_collect` on AcpError. Between retries: cancels orphaned prompt, exponential backoff. On `PromptBusyExhaustedError` or `AcpProcessDied`: resets the parent session only when `runtime_death.caused_by_this_session(client)` says the death was the parent's own runtime; on a shared runtime the parent is left to re-acquire on its next turn, so co-tenant sessions survive a death they did not cause. Either way the failure event is queued (`notify_injection_failed`). Note: the 1200s outer cap (`_ON_DONE_TIMEOUT`) bounds total wall-clock time, so not all retries may fire if earlier attempts consume the budget.
 
 **Reconnect recovery**: `subscribe_subagents` in `ws.py` restores both managed and native subagent cards. Managed subagents are authoritative in `SubagentManager` while the gateway that ran them is alive: running records replay as `subagent_snapshot`, and recently completed records replay as `subagent_done`, including terminal `elapsed` and cumulative `credits`. Managed results remain disk-backed and are not copied into inline Redux card payloads.
 
@@ -2910,7 +3128,7 @@ Specified in [taskq.md](taskq.md); this section is the manager's side of it.
   spends eligible waiting for its re-check is not counted either. Live runs,
   accepts in flight and rows the pump has popped are excluded. Each failed row is reported
   through `_report_queued_stop(params, error=QUEUED_WAIT_EXPIRED_TEXT)`: the
-  queued-stop report with `never started: waiting for memory` as its `error`
+  queued-stop report with `never started: waiting for memory (not enough memory freed up in time); retry once memory frees up` as its `error`
   (outcome `failed`), so batch accounting, the digest and a waiting parent's wake
   are the stop's, and so is the depth: `_report_queued_stop` re-publishes the
   parent's queued depth itself, once per row and before the terminal record is
@@ -2924,13 +3142,18 @@ Specified in [taskq.md](taskq.md); this section is the manager's side of it.
   transaction; once the report has reached the parent the mark is cleared
   (`taskq_clear_owed_reports` posts `TaskStore.mark_reported`). For a report
   the gateway delivered directly that is when the report task has returned
-  True; one that returned False (the injection timed out, or `_on_done`
+  True AND the route acknowledged delivery: `_report_delivered`, set where the
+  report lands (`_inject_with_retry` once the parent's turn consumed it, a
+  blocking tool's inline collection, a route with no conversation whose
+  notification is its whole delivery, the reporter's own no-consumer and
+  retired-parent skips). `taskq_clear_owed_report_if_delivered` clears on that
+  acknowledgement and on nothing else, so a route that parks or swallows the
+  report without saying so (including one added later) leaves it owed for the
+  replay. One that returned False (the injection timed out, or `_on_done`
   raised), raised or was cancelled stays owed. So does one whose task returned
   True although the gateway gave up on the injection: a channel or cron
-  parent's failed attempts are swallowed inside `_on_done`, so
-  `notify_injection_failed` (and the cron arm that swallows a failure without
-  a notice) marks the record `_report_undelivered`, and
-  `taskq_clear_owed_report_if_delivered` leaves the mark. A report it PARKED is not
+  parent's failed attempts are swallowed inside `_on_done` and never
+  acknowledge. A report it PARKED is not
   delivered when its task returns: a wave member held for its digest
   (`_digest_held`), an announce queued behind a busy slot
   (`_delivery_queued`) or one handed to an idle slot's turn is then only in
@@ -2940,10 +3163,11 @@ Specified in [taskq.md](taskq.md); this section is the manager's side of it.
   or the announce's ledger entry, and the settle that delivers it
   (`_settle_digest_holds`, `settle_queued_delivery`) clears the mark instead of
   writing a `delivered` tombstone (the row has no run folder). The digest settle
-  clears it only on delivery: it runs whenever `_on_done` returns, so when the
-  gateway gave up on the digest's channel or cron injection (the flusher, the
-  last member or the reaper's forced flush, carries `_report_undelivered`) it
-  detaches the held expiries without clearing them, and they stay owed. A
+  clears it only on the flusher's acknowledgement: it runs whenever `_on_done`
+  returns, so when the gateway gave up on the digest's channel or cron
+  injection (the flusher, the last member or the reaper's forced flush, never
+  sets `_report_delivered`) it detaches the held expiries without clearing
+  them, and they stay owed. A
   digest whose flusher reports to a parent a teardown retired clears the held
   expiry's mark, since its parent is gone. A process lost in between, or a report the
   shutdown drain cancelled, leaves the row owed, and the next start reports it:
@@ -3217,7 +3441,12 @@ Delegation guidance is injected from `src/kiro_crew/config/prompt.md`; no dedica
 
 Posts to the dashboard API on the configured `--port`. By default it polls until
 the run finishes and prints the result; `--async` returns immediately with the
-subagent ID. `kirocrew spawn list` lists current runs.
+subagent ID. `--crew NAME` runs the task as that crew member (its memory store and
+template) and `--agent NAME` under that agent template; they are sent as the same
+`crew` / `agent` request fields `spawn_run` uses, so an unknown name is refused by
+the gateway (`unknown_member`, `agent_not_found`) and the CLI exits 1 rather than
+running the default. A blank name is refused before any request. `kirocrew spawn
+list` lists current runs.
 
 ### MCP Tool: `spawn_run`
 
@@ -3293,7 +3522,7 @@ inside the manager.
 |---|---|
 | `dashboard/handlers/messaging.py::parent_work_supported`, `dashboard/messaging_api/spawn.py::api_spawn` | Resolves the actual parent slot and reports delivery capability in the receipt. |
 | `subagent_manager/admission`, `subagent_persistence.py` | Existing capacity/queue/depth/cleanup rules remain authoritative; delegation metadata follows the run. |
-| `slack/gateway.py::_subagent_done` | Busy dashboard turns are awaited through `asyncio.shield`, then completion is injected or queued; the parent edit is not interrupted. Delivery retention starts on consumption. |
+| `slack/gateway_runtime/subagent_injection.py::_route_subagent_to_tab` | Busy dashboard turns are awaited through `asyncio.shield`, then completion is injected or queued; the parent edit is not interrupted. Delivery retention starts on consumption. |
 
 The existing full-batch barrier remains: collect all terminal outcomes before
 new dispatch. A failed/cancelled child is terminal for the barrier, not a
@@ -3859,12 +4088,12 @@ behavior. `tail` is appropriate for agents that summarize at the end
 each end with a middle elision marker.
 
 Unknown `agent.completion_keep` values cause `kirocrew gateway` to fail
-at startup via `_validated_completion_keep` in `config/sections.py`. The
+at startup via `_validated_completion_keep` in `config/sections_agent_fields.py`. The
 dashboard PATCH endpoint enforces the same enum via
 `_EDITABLE_CONFIG["agent.completion_keep"]`.
 
 The values are threaded into `SubagentManager.__init__` from
-`slack/gateway.py` (`completion_keep=`, `completion_keep_chars=` constructor
+`slack/gateway_runtime/subagent_wiring.py` (`completion_keep=`, `completion_keep_chars=` constructor
 kwargs sourced from `cfg.agent.*`), and a later write to either field is
 adopted live by `reconfigure` through `update_completion_keep`. User-facing docs:
 [`src/kiro_crew/docs/configuration.md`](../../../src/kiro_crew/docs/configuration.md),
@@ -4072,7 +4301,10 @@ The mechanism is one extra window plus one env value, applied at three seams:
   `subagent_manager/run.py`, which adds `shared_scratch` to the `get_or_create`
   kwargs (and which is also the signal that skips the warm pool —
   `pool_decision = "bypass_shared_scratch"` — because a pooled child's mounts were
-  fixed when it was pre-spawned with no parent); a shared-session subagent needs
+  fixed when it was pre-spawned with no parent; the
+  `kirocrew.session.pool.decision` counter reports it under its own `outcome`, so
+  the warm hits it costs can be read against the other bypass reasons
+  ([metrics](metrics.md)); a shared-session subagent needs
   nothing, it already runs in the parent's process. The `_bg` runtime's
   replacement in `session_background.get_bg_session` inherits its predecessor's
   `work_scratch_dir`, recorded on `BackgroundRuntimeState.inherited_scratch` from
@@ -4155,6 +4387,21 @@ directory is reclaimed by the ordinary liveness sweep once the gateway and its
 runtimes are gone, and a gateway restart starts a fresh one. Siblings from OTHER trees stay masked either way: the mask is a
 per-tree boundary, and this widens the window to the tree, never lifts the
 mask. Pinned by `test/test_subagent_shared_scratch.py`.
+
+Host runs of the shared window, with what each one did and did not show (the
+check: stage a file under the parent's `$KIROCREW_SCRATCH`, spawn a dedicated
+sub-agent, read the file back from it):
+
+| Host | What the run showed | Not verified |
+|---|---|---|
+| Linux, namespace sandbox | The shared window is mounted and the sub-agent reads the parent's staged file (the path #12782 was built and tested on). | — |
+| macOS 26.7.1, arm64 | The sub-agent got the same `$KIROCREW_SCRATCH` path, read the parent's staged file, and wrote a new file there. | Which sandbox layer the sub-agent ran in. The helper ran under kiro-cli's agent server and no Kiro Crew sandbox was seen above it, which fits the delegated path leaving private windows out. The Seatbelt profile carve-out is pinned at profile-text level by tests only; no `sandbox-exec` run has shown it. |
+| Windows | The sub-agent got the same `$KIROCREW_SCRATCH` value and read a staged marker back by that path. | The sandbox layer the spawn got (not surfaced in the run's output). Isolation differs on Windows (#19601). |
+
+So on all three hosts a dedicated sub-agent reached the parent's staged file.
+Only on Linux is the sandbox layer known. On macOS and Windows the runs do not
+show the sub-agent was sandboxed at all, so they say the path works, not that
+it works inside a Kiro Crew sandbox; that question is tracked in #19601.
 
 ### Parent end ends the children, on every backend
 

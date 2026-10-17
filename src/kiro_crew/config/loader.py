@@ -71,7 +71,7 @@ from kiro_crew.config import sections as _sections
 # Section DTOs and their field-level coercion live in a one-way sibling module.
 # Re-export every historical loader name so existing imports keep working while
 # KiroCrewConfig remains the compatibility facade and owns read/merge/save.
-from kiro_crew.config.fields import _coerce_bool
+from kiro_crew.config.fields import _coerce_bool, _safe_str
 
 # Historical loader names no builder reads any more (a section's defaults are its
 # DTO fields'), kept bound from their owners for the facade.
@@ -88,6 +88,7 @@ from kiro_crew.config.integration_sections import (  # noqa: F401
     _DEFAULT_SSH_COMPRESSION,
     _DEFAULT_TUNNEL_BASE_PORT,
     _DEFAULT_WARM_SET_CAP,
+    AppSettingsConfig,
     AwsConfig,
 )
 from kiro_crew.config.migration import (  # noqa: F401
@@ -1651,15 +1652,54 @@ def unsandboxed_exec_declared() -> bool:
     An unreadable or non-object document contributes nothing: a corrupt config is
     not a declaration.
     """
-    for path in (config_path(), config_local_path()):
-        try:
-            doc = json.loads(read_config_text(path))
-        except (OSError, ValueError):
-            continue
-        agent = doc.get("agent") if isinstance(doc, dict) else None
-        if isinstance(agent, dict) and "sandbox_allow_unsandboxed_exec" in agent:
-            return True
-    return False
+    return _agent_key_declared("sandbox_allow_unsandboxed_exec")
+
+
+def acp_backend_declared() -> bool:
+    """Whether the config documents hold a harness CHOICE in ``agent.acp_backend``.
+
+    The value that counts is the one a load would read: the ``config.local.json``
+    overlay's when it names the key, else ``config.json``'s. Absent and ``""`` are
+    "no choice" and resolve to the product default; any other stored value, valid
+    or not, is a choice. Read from disk, like :func:`unsandboxed_exec_declared`,
+    so every caller answers the same question about one host instead of trusting
+    an in-memory value that already holds the RESOLVED harness.
+    """
+    value = _stored_agent_value("acp_backend")
+    return value is not _ABSENT_AGENT_KEY and value != ""
+
+
+#: What :func:`_stored_agent_value` returns for a key neither document names, so a
+#: stored JSON ``null`` (a malformed choice) stays distinct from "absent".
+_ABSENT_AGENT_KEY = object()
+
+
+def _raw_agent_section(path: Path) -> dict | None:
+    """The raw ``agent`` object of the config document at *path*, or ``None``.
+
+    An unreadable or non-object document contributes nothing: a corrupt config is
+    not a declaration.
+    """
+    try:
+        doc = json.loads(read_config_text(path))
+    except (OSError, ValueError):
+        return None
+    agent = doc.get("agent") if isinstance(doc, dict) else None
+    return agent if isinstance(agent, dict) else None
+
+
+def _stored_agent_value(key: str) -> object:
+    """The raw stored ``agent.<key>`` a load would read: overlay first, then base."""
+    for path in (config_local_path(), config_path()):
+        agent = _raw_agent_section(path)
+        if agent is not None and key in agent:
+            return agent[key]
+    return _ABSENT_AGENT_KEY
+
+
+def _agent_key_declared(key: str) -> bool:
+    """Whether ``config.json`` or the ``config.local.json`` overlay names ``agent.<key>``."""
+    return _stored_agent_value(key) is not _ABSENT_AGENT_KEY
 
 
 # ---------------------------------------------------------------------------
@@ -1702,10 +1742,11 @@ class ConfigWriteRefused(ValueError):
     """A config document was refused at the publish floor and nothing was written.
 
     Raised by :func:`write_config_atomically` before any byte reaches disk, for
-    content that must never be persisted: today, a provider key in plaintext under
+    content that must never be persisted: a provider key in plaintext under
     ``agent.deepseek_env``, where the only admissible value is a
     ``secret://<vault name>`` reference (``sections.deepseek_env_plaintext_keys``),
-    and an ``aws.project_profiles`` entry the load would ignore.
+    an ``aws.project_profiles`` entry the load would ignore, and an ``agent.env``
+    entry no agent process would receive (``sections.agent_env_write_refusals``).
     The message names env-var KEYS only, never the value, so it is safe to print
     on a terminal and to log. A ``ValueError`` so the CLI's existing refusal shape
     applies, and so a caller cannot mistake it for the unreadable-file case
@@ -1773,12 +1814,22 @@ def _refuse_unpublishable(data: dict, path: Path) -> None:
     The publish floor for every writer that lands a config document -- the locked
     read-modify-write (``update_config_locked``, behind ``config set`` and every
     dashboard PUT) and the whole-document :meth:`KiroCrewConfig.save` alike -- so
-    the rule holds however a value arrived. One rule today: a provider key typed
-    in plaintext under ``agent.deepseek_env`` is refused, because that mapping
-    takes ``secret://`` references only and a plaintext that reaches disk is
-    already the defect the spawn-time validator would later name. Keyed on the
-    document's SHAPE rather than on the path, so an agent spec written through the
-    same function is untouched -- it has no ``agent.deepseek_env`` to refuse.
+    each rule holds however a value arrived. Two rules, both on mappings of
+    environment variables an agent process receives: a provider key in plaintext
+    under ``agent.deepseek_env`` (:func:`_refuse_deepseek_env_plaintext`), and an
+    ``agent.env`` entry no spawn would ever apply (:func:`_refuse_agent_env_entries`).
+    Keyed on the document's SHAPE rather than on the path, so an agent spec written
+    through the same function is untouched -- it has neither mapping.
+    """
+    _refuse_deepseek_env_plaintext(data, path)
+    _refuse_agent_env_entries(data, path)
+
+
+def _refuse_deepseek_env_plaintext(data: dict, path: Path) -> None:
+    """Refuse a plaintext provider key under ``agent.deepseek_env``.
+
+    That mapping takes ``secret://`` references only, and a plaintext that reaches
+    disk is already the defect the spawn-time validator would later name.
 
     What is refused is what THIS write does: a plaintext it introduces, or a
     mapping it changes while a plaintext entry stays in it. A plaintext an older
@@ -1821,17 +1872,66 @@ def _refuse_unpublishable(data: dict, path: Path) -> None:
 def _deepseek_env_on_disk(path: Path) -> object:
     """The ``agent.deepseek_env`` value the document at *path* holds, or ``None``.
 
-    Read for :func:`_refuse_unpublishable` alone, to tell a plaintext this write
-    introduces from one it merely re-writes unchanged. ``None`` for an absent,
+    Read for :func:`_refuse_deepseek_env_plaintext` alone, to tell a plaintext this
+    write introduces from one it merely re-writes unchanged. ``None`` for an absent,
     unreadable or unparseable file -- and for a document with no such mapping --
     which the caller treats as "not shown pre-existing".
+    """
+    return _agent_key_on_disk(path, "deepseek_env")
+
+
+def _agent_key_on_disk(path: Path, key: str) -> object:
+    """The ``agent.<key>`` value the document at *path* holds, or ``None``.
+
+    ``None`` for an absent, unreadable or unparseable file and for a document
+    without that key, which every caller treats as "not shown pre-existing".
     """
     try:
         document = json.loads(read_config_text(path))
     except (OSError, ValueError):
         return None
     agent = document.get("agent") if isinstance(document, dict) else None
-    return agent.get("deepseek_env") if isinstance(agent, dict) else None
+    return agent.get(key) if isinstance(agent, dict) else None
+
+
+def _refuse_agent_env_entries(data: dict, path: Path) -> None:
+    """Refuse an ``agent.env`` entry that no agent spawn would ever apply.
+
+    ``agent.env`` drops such an entry at load (``sections.coerce_agent_env``) and
+    at spawn (``acp.agent_env``) with only a gateway-log line, so a write that
+    stored it would succeed, the entry would sit in the file, and the variable
+    would never reach the agent. Refusing it here names the key and the reason at
+    the moment it is saved -- ``kirocrew config set`` prints it, a dashboard write
+    answers 400 with it -- and nothing is written. The rule is
+    ``sections.agent_env_write_refusals``; the message carries keys and reasons
+    only, never a value.
+
+    Scoped to what THIS write does, exactly like
+    :func:`_refuse_deepseek_env_plaintext`: a refused entry a hand edit or an older
+    build already landed, in a mapping this write leaves exactly as it found it,
+    publishes with a warning naming the key, because every writer in the product
+    reaches this function and most of them have nothing to do with ``agent.env``.
+    A write that changes the mapping has to leave it with no refused entry. An
+    unreadable prior file cannot show the entry pre-existing, so it is refused.
+    """
+    agent = data.get("agent") if isinstance(data, dict) else None
+    mapping = agent.get("env") if isinstance(agent, dict) else None
+    refusals = _sections.agent_env_write_refusals(mapping)
+    if not refusals:
+        return
+    detail = "; ".join(refusals)
+    if _agent_key_on_disk(path, "env") == mapping:
+        logger.warning(
+            "config.json already holds agent.env entries no agent process will receive "
+            "(%s); this write left that mapping as it found it.",
+            detail,
+        )
+        return
+    raise ConfigWriteRefused(
+        f"agent.env refuses {detail}. Nothing was written, because an agent "
+        "process would never receive that variable: remove or rename the entry, "
+        "and keep credentials under Settings > Secrets."
+    )
 
 
 def _refuse_aws_project_profiles(data: dict, path: Path) -> None:
@@ -3044,6 +3144,18 @@ def _folder_sort_from(raw: object, default: str) -> str:
     return default
 
 
+def _session_sort_from(raw: object, default: str) -> str:
+    """Normalize the sidebar session sort key; anything unknown is *default*, ``date-desc``.
+
+    ``date-desc`` (latest activity first) is the order the sidebar draws with no
+    stored choice, so a missing or hand-edited value changes nothing the person
+    sees. The sidebar's own reader makes the same choice.
+    """
+    if isinstance(raw, str) and raw in _sections.SESSION_SORT_MODES:
+        return raw
+    return default
+
+
 # (section, key, min, max) for each bounded field clamped at load time. The
 # mins match the runtime floors: subagent_auto_max has a floor of 3
 # (``subagent._LEGACY_DEFAULT_MAX`` — the auto-size minimum), so a value < 3 is
@@ -3281,6 +3393,72 @@ def _session_start_concurrency(raw: object, ceiling: int = 64) -> int | str:
     return max(1, min(ceiling, value))
 
 
+def _read_backend_choice(section: _sections.SectionReader, agent_data: dict, key: str) -> str:
+    """Resolve a stored harness field to a runtime backend id at the one gate.
+
+    The config-file vocabulary is translated first
+    (:func:`~kiro_crew.acp_backends.backend_from_stored`): ``"kiro"`` is the Kiro
+    CLI choice, while absent and ``""`` are "no choice" and read the field default.
+    A default is not a pick, so when the registry does not serve it (a policy
+    denies KAS) the gate gets ``None`` and takes the floor silently instead of
+    warning on every load about a value nobody wrote. Any other stored value goes
+    to the gate as is, so an unusable explicit pick still degrades with its
+    warning (harness-parity H3). ``validate_config_data`` replaces a present
+    non-string with the stored floor before this runs.
+    """
+    from kiro_crew.acp_backends import backend_from_stored, selectable_backends
+
+    value = backend_from_stored(agent_data.get(key))
+    if value is None:
+        default = section.default(key)
+        value = default if default in selectable_backends() else None
+    return _normalize_acp_backend(value)
+
+
+#: The ``agent`` fields that hold a harness id, spelled in the config-file
+#: vocabulary on disk and in ``to_dict()`` and as runtime ids on the dataclass.
+_HARNESS_CHOICE_KEYS: tuple[str, ...] = ("acp_backend", "member_acp_backend")
+
+
+def _stored_agent_dict(agent: AgentConfig) -> dict:
+    """``asdict(agent)`` with each harness field in the config-file vocabulary.
+
+    ``to_dict()`` is what ``config get``, the dashboard config response and every
+    full-document write read, so a resolved Kiro CLI harness reads back as
+    ``"kiro"`` rather than the runtime id ``""``, which on disk means "no choice".
+    """
+    from dataclasses import asdict
+
+    from kiro_crew.acp_backends import backend_to_stored
+
+    d = asdict(agent)
+    for key in _HARNESS_CHOICE_KEYS:
+        if isinstance(d.get(key), str):
+            d[key] = backend_to_stored(d[key])
+    return d
+
+
+def _restore_stored_harness_fields(doc: dict) -> None:
+    """In place: set *doc*'s harness fields to the raw ``config.json`` values.
+
+    A key the base file does not hold is removed, so a full-document write never
+    invents a choice; a key it holds is written back verbatim, so a resolved
+    floor never replaces a stored pick. Read from disk for the same reason as
+    :func:`unsandboxed_exec_declared`.
+    """
+    stored_agent = _raw_agent_section(config_path()) or {}
+    agent_section = doc.get("agent")
+    if not isinstance(agent_section, dict):
+        if not any(key in stored_agent for key in _HARNESS_CHOICE_KEYS):
+            return
+        agent_section = doc["agent"] = {}
+    for key in _HARNESS_CHOICE_KEYS:
+        if key in stored_agent:
+            agent_section[key] = stored_agent[key]
+        else:
+            agent_section.pop(key, None)
+
+
 # Build each section in its own frame: the large inline constructor amplifies
 # line-tracing cost on every load. These helpers create fresh values, never
 # cache configuration, and leave resolution and admission checks unchanged.
@@ -3301,8 +3479,10 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
         provider=section.get("provider"),
         mcp_registry_mode=section.read("mcp_registry_mode", _safe_bool),
         mcp_quarantine_after_failures=section.read("mcp_quarantine_after_failures", _safe_int),
-        acp_backend=_normalize_acp_backend(section.get("acp_backend")),
-        member_acp_backend=_normalize_acp_backend(section.get("member_acp_backend")),
+        acp_backend=_read_backend_choice(section, agent_data, "acp_backend"),
+        member_acp_backend=_read_backend_choice(section, agent_data, "member_acp_backend"),
+        kas_bundle=section.read("kas_bundle", _safe_bool),
+        kas_bundle_url=_sections.coerce_kas_bundle_url(section.get("kas_bundle_url")),
         default_agent=section.get("default_agent"),
         # Through the module alias rather than a new top-level import: the loader's
         # ``from ... import`` list is a FROZEN pre-split compatibility snapshot
@@ -3454,6 +3634,8 @@ def _build_agent_config(agent_data: dict) -> AgentConfig:
         # Env defaults for spawned kiro-cli children (acp/child_env_defaults.py).
         # Through the module alias: the loader's import list is a frozen snapshot.
         child_env_defaults=_sections.coerce_child_env_defaults(section.get("child_env_defaults")),
+        # Operator env for every agent child (acp/agent_env.py), same alias reason.
+        env=_sections.coerce_agent_env(section.get("env")),
         # Cold-start queues (session_allocation _start_sem, acp/runtime_start
         # spawn admission); resolved by cold_start_sizing.
         cold_start_concurrency=_session_start_concurrency(
@@ -3670,6 +3852,9 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
     section = _sections.SectionReader(DashboardConfig, dashboard_data)
     gitlab_hosts = _coerce_gitlab_hosts(section.get("gitlab_hosts"))
     jira_hosts = _coerce_jira_hosts(section.get("jira_hosts"))
+    github_hosts = _sections._coerce_github_hosts(
+        section.get("github_hosts"), claimed=(*gitlab_hosts, *jira_hosts)
+    )
     return DashboardConfig(
         url=section.get("url"),
         tailscale=_tailscale_config_from(
@@ -3770,6 +3955,7 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
             "recent_tint_count", _safe_int, RECENT_TINT_COUNT_MIN, RECENT_TINT_COUNT_MAX
         ),
         folder_sort=section.read("folder_sort", _folder_sort_from),
+        session_sort=section.read("session_sort", _session_sort_from),
         update_nudge=(
             nudge
             if isinstance(nudge := section.get("update_nudge"), dict)
@@ -3804,11 +3990,13 @@ def _build_dashboard_config(_degraded: set[str], dashboard_data: dict) -> Dashbo
         tips_recency_decay=section.read("tips_recency_decay", _safe_float, lo=0.0, hi=1.0),
         tips_model=str(section.get("tips_model")),
         tips_explore_ratio=section.read("tips_explore_ratio", _safe_float, lo=0.0, hi=1.0),
-        github_hosts=_sections._coerce_github_hosts(
-            section.get("github_hosts"), claimed=(*gitlab_hosts, *jira_hosts)
-        ),
+        github_hosts=github_hosts,
         gitlab_hosts=gitlab_hosts,
         jira_hosts=jira_hosts,
+        bitbucket_server_hosts=_sections._coerce_bitbucket_server_hosts(
+            section.get("bitbucket_server_hosts"),
+            claimed=(*gitlab_hosts, *jira_hosts, *github_hosts),
+        ),
         # These two parse raw JSON entries into DTOs, so they are handed only a
         # stored value; an omitted key is the field default as built.
         link_patterns=(
@@ -4131,6 +4319,10 @@ class KiroCrewConfig:
         default="default",
         metadata=_meta("Default Memory Store", "Fallback memory store name."),
     )
+    apps: dict[str, AppSettingsConfig] = field(
+        default_factory=dict,
+        metadata=_meta("Apps", "Per-app user settings, keyed by the app's manifest name."),
+    )
     auto_update: bool = field(
         default=True,
         metadata=_meta(
@@ -4366,7 +4558,7 @@ class KiroCrewConfig:
         from dataclasses import asdict
 
         d: dict = {
-            "agent": asdict(self.agent),
+            "agent": _stored_agent_dict(self.agent),
             "session": asdict(self.session),
             "memory": asdict(self.memory),
             "slack": asdict(self.slack),
@@ -4390,6 +4582,7 @@ class KiroCrewConfig:
             "default_workspace": self.default_workspace,
             "memory_stores": {name: asdict(ms_cfg) for name, ms_cfg in self.memory_stores.items()},
             "default_memory_store": self.default_memory_store,
+            "apps": {name: asdict(app_cfg) for name, app_cfg in self.apps.items()},
             "stt": asdict(self.stt),
             "computer_use": asdict(self.computer_use),
             "aws": asdict(self.aws),
@@ -4539,6 +4732,16 @@ class KiroCrewConfig:
             agent_section = d.get("agent")
             if isinstance(agent_section, dict):
                 agent_section.pop("sandbox_allow_unsandboxed_exec", None)
+        # The harness fields go back to disk exactly as ``config.json`` stores
+        # them, never from the in-memory value, which is RESOLVED: "no choice"
+        # (absent or "") reads as today's default, and a pick this deployment
+        # cannot serve (a policy-denied ``kas``) reads as the Kiro CLI floor.
+        # Publishing it would turn no choice into a choice, or overwrite the
+        # user's pick with the floor. ``to_dict()`` keeps the resolved value for
+        # every reader (``config get``, the dashboard response, the live
+        # watcher); a pick reaches disk through the delta writers (``config
+        # set``, the dashboard PATCH).
+        _restore_stored_harness_fields(d)
         # Strip overlay-owned values so they don't leak into config.json
         local_path = config_local_path()
         if local_path.is_file():
@@ -4567,6 +4770,8 @@ class KiroCrewConfig:
                     d = _subtract_overlay(d, raw_local)
             except (json.JSONDecodeError, OSError):
                 pass
+        # An equal overlay value must not erase a choice the base file owns.
+        _restore_stored_harness_fields(d)
 
         # Atomic + mode-preserving: a concurrent reader must never observe a
         # half-written config, and the write must not widen who can read a file
@@ -5029,6 +5234,10 @@ class KiroCrewConfig:
             # watchdog, which is the exact defect the callback exists to end.
             on_gate_acquired: Callable[..., None] | None = None,
             on_gate_queued: Callable[..., None] | None = None,
+            # A Side Chat session allowed read-only tools. NAMED for the same
+            # reason: swallowed by the catch-all, a claude side session would
+            # start with the user's full tool set under READ_ONLY.
+            side_read_only: bool = False,
             **_kwargs: object,
         ) -> AcpProvider:
             wdir = Path(cwd) if cwd else _session_work_dir(session_key)
@@ -5178,6 +5387,7 @@ class KiroCrewConfig:
                 shared_scratch=shared_scratch,
                 on_gate_acquired=on_gate_acquired,
                 on_gate_queued=on_gate_queued,
+                side_read_only=side_read_only,
                 # Only a work dir DERIVED from a one-run key is the provider's
                 # to reclaim at shutdown; an explicit ``cwd`` is the caller's
                 # directory whatever the key says (session_work_dir).
@@ -5555,6 +5765,30 @@ def read_config_document() -> ConfigDocument:
 _TOP_LEVEL_DEFAULTS: type[KiroCrewConfig] = KiroCrewConfig
 
 
+def _parse_app_settings(raw: Any) -> dict[str, AppSettingsConfig]:
+    """The ``apps`` table: one :class:`AppSettingsConfig` per app name.
+
+    A section that is not an object, a non-string name, or an entry that is not an
+    object reads as absent, which means every app inherits. A ``model`` that is not
+    a string reads as the empty INHERIT value. Names are kept as written: the
+    resolver looks an app up by its exact manifest name, so an entry for an app
+    that is not installed simply matches nothing.
+    """
+    if not isinstance(raw, dict):
+        logger.warning(
+            "Config 'apps' is not a JSON object (got %s); every app inherits its model",
+            type(raw).__name__,
+        )
+        return {}
+    apps: dict[str, AppSettingsConfig] = {}
+    for name, entry in raw.items():
+        if not isinstance(name, str) or not name or not isinstance(entry, dict):
+            continue
+        model = _sections.SectionReader(AppSettingsConfig, entry).get("model")
+        apps[name] = AppSettingsConfig(model=model if isinstance(model, str) else "")
+    return apps
+
+
 def build_config(
     doc: ConfigDocument, config_cls: type[KiroCrewConfig] = KiroCrewConfig
 ) -> KiroCrewConfig:
@@ -5596,6 +5830,11 @@ def build_config(
         # could not read what they configured". Carry the observation
         # through so the caller can tell them apart.
         cfg = config_cls(_degraded_sections=frozenset(_OBSERVED_DEGRADED_SECTIONS))
+        agent_defaults = _sections.SectionReader(AgentConfig, {})
+        cfg.agent.acp_backend = _read_backend_choice(agent_defaults, {}, "acp_backend")
+        cfg.agent.member_acp_backend = _read_backend_choice(
+            agent_defaults, {}, "member_acp_backend"
+        )
         cfg._base_unreadable = doc.base_unreadable
         cfg._overlay_unreadable = doc.overlay_unreadable
         if (
@@ -5750,27 +5989,57 @@ def build_config(
                 # roster surface, so a non-string collapses to "" (show the
                 # name) rather than reaching the wire.
                 raw_display_name = crew.get("display_name")
+                # Every other declared-``str`` field except the two identity
+                # fields joins the same guard family through ``_safe_str``: a
+                # null, number, list or object stored under a string key reads
+                # as the field's declared default, so a wrong-typed key behaves
+                # like an absent one. ``kirocrew agent list`` width-formats
+                # ``kiro_agent`` / ``workspace`` / ``source``, and a stored
+                # null or container reaching that f-string raises TypeError
+                # from ``__format__``. The roster and config views still mask
+                # a non-string on their own side as defence in depth.
+                #
+                # ``memory_store`` and ``member_id`` are deliberately NOT
+                # pinned. The ``memory_store`` default names the shared store,
+                # so collapsing a malformed binding would silently attach this
+                # member to it. The ``member_id`` default ``""`` reads as "no
+                # identity yet", which would switch off two fail-closed checks
+                # in ``memory_stores.py`` (``require_member_memory_store`` and
+                # the legacy upgrade) and let the upgrade mint a new identity.
+                # Both stay as written and the resolvers refuse them;
+                # ``agent list`` renders a malformed ``memory_store``.
+                raw_worker_model = crew.get("worker_model")
                 agents[name] = KiroCrewAgentConfig(
                     member_id=crew.get("member_id"),
-                    kiro_agent=crew.get("kiro_agent"),
-                    workspace=crew.get("workspace"),
+                    kiro_agent=crew.read("kiro_agent", _safe_str),
+                    workspace=crew.read("workspace", _safe_str),
                     memory_store=crew.get("memory_store"),
                     model=raw_model if isinstance(raw_model, str) else crew.default("model"),
                     # Same hand-editable-config guard: an unknown level must
                     # collapse to "" (inherit) rather than travel to the
                     # provider, where kiro-cli rejects the whole overlay.
                     reasoning_effort=coerce_effort(crew.get("reasoning_effort")),
+                    # The dispatched-worker pair: the model keeps its raw
+                    # spelling because "auto" is a REAL pin here (see the
+                    # field), so only the non-string guard applies; the
+                    # effort takes the same coercion as the crew's own.
+                    worker_model=(
+                        raw_worker_model.strip()
+                        if isinstance(raw_worker_model, str)
+                        else crew.default("worker_model")
+                    ),
+                    worker_reasoning_effort=coerce_effort(crew.get("worker_reasoning_effort")),
                     approval_mode=_sections.coerce_member_approval_mode(crew.get("approval_mode")),
                     display_name=(
                         raw_display_name
                         if isinstance(raw_display_name, str)
                         else crew.default("display_name")
                     ),
-                    description=crew.get("description"),
+                    description=crew.read("description", _safe_str),
                     triggers=(
                         raw_triggers if isinstance(raw_triggers, str) else crew.default("triggers")
                     ),
-                    source=crew.get("source"),
+                    source=crew.read("source", _safe_str),
                     # Hand-editable config: a quoted "true" or a stray int
                     # must not become a truthy star, so only a real bool
                     # is honoured and anything else reads as un-starred.
@@ -5787,7 +6056,7 @@ def build_config(
                         "watchdog_tool_stall_hard_cap_secs", _safe_float, lo=0.0
                     ),
                     autocompact_pct=_crew_autocompact_pct(crew),
-                    telegram_account=crew.get("telegram_account"),
+                    telegram_account=crew.read("telegram_account", _safe_str),
                     session_color=_safe_color(crew.get("session_color")),
                     # Module-qualified on purpose: the facade's `from
                     # sections import` list is a frozen pre-split snapshot
@@ -5854,6 +6123,8 @@ def build_config(
             )
     if not memory_stores:
         memory_stores[DEFAULT_MEMORY_STORE] = MemoryStoreConfig()
+
+    apps = _parse_app_settings(data.get("apps", {}))
 
     # The top-level keys read against KiroCrewConfig's own fields, and the slack
     # keys that land on top-level fields under the same names. Against the base
@@ -5935,6 +6206,7 @@ def build_config(
         default_workspace=top.get("default_workspace"),
         memory_stores=memory_stores,
         default_memory_store=default_memory_store_val,
+        apps=apps,
         stt=_build_stt_config(stt_data),
         # Every numeric knob is clamped to the same ceiling the MCP tool
         # schemas enforce, so a hand-edited config.json cannot ask for an
@@ -7693,11 +7965,80 @@ def resolve_agent_bindings(
     )
 
 
+def app_model_pin(config: KiroCrewConfig, app_name: str | None) -> str:
+    """The user's model for the app *app_name* (``apps.<name>.model``), or ``""``.
+
+    ``""`` and ``"auto"`` both INHERIT, as for every other model tier. Total: a
+    config without the table, an unknown app, or a malformed entry reads ``""``.
+    """
+    if not app_name:
+        return ""
+    apps = getattr(config, "apps", None)
+    entry = apps.get(app_name) if isinstance(apps, dict) else None
+    return normalize_agent_model(getattr(entry, "model", ""))
+
+
+def _agent_tier_model(
+    config: KiroCrewConfig,
+    agent_name: str | None,
+    in_scope: Callable[[str], str],
+    *,
+    selection_kind: str = "",
+) -> str:
+    """The model the agent itself pins: its crew's ``model``, else its template's.
+
+    Tiers 1 and 2 of :func:`resolve_effective_model`. ``""`` when neither pins a
+    model the active harness can claim.
+    """
+    _, kiro_agent, model_pin = resolve_agent_identity(
+        config, agent_name, selection_kind=selection_kind
+    )
+    if in_scope(model_pin):
+        return model_pin
+    if kiro_agent and kiro_agent != "kirocrew":
+        pinned = normalize_agent_model(config._resolve_named_agent_model(kiro_agent))
+        if in_scope(pinned):
+            return pinned
+    return ""
+
+
+def _model_scope_filter(config: KiroCrewConfig) -> Callable[[str], str]:
+    namespace = capabilities_for(config.agent.acp_backend).model_id_namespace
+
+    def _in_scope(pin: str) -> str:
+        return model_scope.scoped_pin(
+            pin, namespace, source="resolve_effective_model", log_level=logging.DEBUG
+        )
+
+    return _in_scope
+
+
+def resolve_app_spawn_model(config: KiroCrewConfig, app_name: str, agent_name: str) -> str:
+    """The model an app's background spawn of *agent_name* runs on, or ``""``.
+
+    The app's own ``apps.<name>.model`` when the user set one, unless the spawned
+    template itself pins a model, which wins as it does for an app session. That
+    pin is the spawn's whole agent tier: an app spawn is a template spawn, which
+    allocates with ``crew_agent=""``, so its session (``session._session_model``)
+    never reads a crew's pin, not even one of a crew that shares the template's
+    name. ``""`` leaves the spawn exactly as it is without the setting.
+    """
+    in_scope = _model_scope_filter(config)
+    app_pin = in_scope(app_model_pin(config, app_name))
+    if not app_pin:
+        return ""
+    if agent_name and agent_name != "kirocrew":
+        if in_scope(normalize_agent_model(config._resolve_named_agent_model(agent_name))):
+            return ""
+    return app_pin
+
+
 def resolve_effective_model(
     config: KiroCrewConfig,
     agent_name: str | None = None,
     *,
     selection_kind: str = "",
+    app_name: str = "",
 ) -> str:
     """Return the model a new session on *agent_name* would start with.
 
@@ -7708,8 +8049,9 @@ def resolve_effective_model(
     1. the KiroCrew agent's own ``model``
     2. the bound kiro agent's pinned ``model`` (skipped for the built-in
        ``kirocrew`` agent, which tracks the global by design)
-    3. the global ``agent.model`` default
-    4. the installed ``kirocrew.json`` / bundled ``defaults.json`` model
+    3. for a session an app owns (*app_name*), the user's ``apps.<name>.model``
+    4. the global ``agent.model`` default
+    5. the installed ``kirocrew.json`` / bundled ``defaults.json`` model
 
     A per-session pick outranks all of these and is NOT considered here — the
     caller holds it. Returns ``""`` when every tier defers, meaning the backend
@@ -7723,22 +8065,14 @@ def resolve_effective_model(
     pin the active harness cannot claim is skipped, so the next tier down answers
     -- exactly as if that tier were unset.
     """
-    namespace = capabilities_for(config.agent.acp_backend).model_id_namespace
+    _in_scope = _model_scope_filter(config)
 
-    def _in_scope(pin: str) -> str:
-        return model_scope.scoped_pin(
-            pin, namespace, source="resolve_effective_model", log_level=logging.DEBUG
-        )
-
-    _, kiro_agent, model_pin = resolve_agent_identity(
-        config, agent_name, selection_kind=selection_kind
-    )
-    if _in_scope(model_pin):
-        return model_pin
-    if kiro_agent and kiro_agent != "kirocrew":
-        pinned = normalize_agent_model(config._resolve_named_agent_model(kiro_agent))
-        if _in_scope(pinned):
-            return pinned
+    agent_pin = _agent_tier_model(config, agent_name, _in_scope, selection_kind=selection_kind)
+    if agent_pin:
+        return agent_pin
+    app_pin = _in_scope(app_model_pin(config, app_name))
+    if app_pin:
+        return app_pin
 
     configured = normalize_agent_model(config.agent.model)
     if _in_scope(configured):

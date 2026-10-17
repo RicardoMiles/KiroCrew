@@ -170,7 +170,7 @@ grows only while backends keep initializing cleanly.
 | `agent.subagent_cost_gb` | `0.5` | Minimum price of a warming dedicated start in the admission gate (the measured or learned projection applies when higher); also the TaskRunner figure's fallback (GB/agent) until a learned cost exists, and the sub-agent auto cap's while `spawn_min_memory_gb <= 0` |
 | `agent.subagent_cpu_cost_cores` | `1.0` | **Deprecated, inert.** CPU no longer sizes anything; kept so an existing config is not rewritten |
 | `agent.subagent_auto_max` | `32` | The sub-agent count ceiling when `max_subagents=0` (provider-concurrency and fd/PID stand-in); memory binds below it on most hosts. With the floor disabled it caps the memory-sized figure instead |
-| `agent.spawn_min_memory_gb` | `2.0` | Free memory (GB) that must remain after admitting a start; a spawn that does not fit waits in the queue, never refused (one in temporary or incognito memory mode, or with `agent.task_queue_enabled` off, is lost if the gateway restarts), for at most `agent.subagent_queue_max_wait_secs` before it ends as `never started: waiting for memory`. `0` disables the gate, and the sub-agent auto cap is then sized from memory like the TaskRunner figure |
+| `agent.spawn_min_memory_gb` | `2.0` | Free memory (GB) that must remain after admitting a start; a spawn that does not fit waits in the queue, never refused (one in temporary or incognito memory mode, or with `agent.task_queue_enabled` off, is lost if the gateway restarts), for at most `agent.subagent_queue_max_wait_secs` before it ends as `never started: waiting for memory (not enough memory freed up in time); retry once memory frees up`. `0` disables the gate, and the sub-agent auto cap is then sized from memory like the TaskRunner figure |
 | `agent.subagent_spawn_stagger_secs` | `0.25` | Delay between successive spawns (initial fill and queued drain), so a high cap never bursts on cold start |
 | `session.pool_size` | `0` | Warm-pool size; reserved in the TaskRunner figure's memory term when > 0 (and in the sub-agent auto cap's while the floor is disabled) |
 
@@ -293,7 +293,11 @@ session first answered); a settled worker owes nothing, because its memory is
 already in the free-memory reading. A dedicated start is priced at what such a runtime
 settles at: the learned settled RSS of its agent once three runs have measured
 it (capped at 2 GB), else the measured default of about 1 GB, and never less than
-`subagent_cost_gb`. A start that will share its parent's runtime skips the
+`subagent_cost_gb`. An agent whose newest reading is more than seven days old is
+unlearned again, so a figure learned under a heavier MCP roster or another
+backend expires on its own even when it holds every dedicated start back and no
+new reading arrives; an agent with any reading inside the seven days keeps its
+figure. A start that will share its parent's runtime skips the
 process but still starts the agent's MCP servers, so it is priced at that less
 about 0.35 GB. Parents waiting without a slot retain their reservation; a shared session
 owes its price until it settles too, because its MCP servers start after it

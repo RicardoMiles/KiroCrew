@@ -3,7 +3,7 @@
 ``kiro_crew.dashboard.handlers.agents`` is the agents handlers' import path and their
 patch surface. Most of what it defined now lives in the modules of
 ``kiro_crew.dashboard.agent_admin``, one responsibility each, and
-``agent_admin.compose`` runs every function they define on the facade's globals.
+``_facade_compose.compose`` runs every function they define on the facade's globals.
 These tests pin:
 
 * the surface: every name the facade bound before the split still resolves on it,
@@ -44,6 +44,7 @@ from source_corpus import repo_files_named, repo_root
 
 import kiro_crew.dashboard.handlers as handlers_pkg
 import kiro_crew.dashboard.handlers.agents as agents
+from kiro_crew._facade_compose import compose as facade_compose
 from kiro_crew.dashboard import agent_admin
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
@@ -627,15 +628,20 @@ def test_a_moved_function_reads_its_source_from_its_owner() -> None:
     assert inspect.getsourcefile(agents.api_agent_fork) == _owner("fork_publish").__file__
 
 
-def test_the_compose_copy_matches_its_siblings() -> None:
-    """The three dashboard compositions share one technique; each package keeps its
-    own copy so no package imports another's, and the copies stay identical."""
-
-    def body(package: str) -> str:
-        text = (_SRC / "kiro_crew/dashboard" / package / "__init__.py").read_text(encoding="utf-8")
-        return text[text.index("def compose(") :]
-
-    assert body("agent_admin") == body("file_api") == body("messaging_api")
+def test_the_facade_composes_through_the_shared_helper() -> None:
+    """The facade composes its owners with the one shared helper,
+    ``kiro_crew._facade_compose.compose``, calling it exactly once, and the owner
+    package keeps no copy of its own: its ``__init__`` defines no function."""
+    assert agents._facade_compose is facade_compose
+    source = Path(agents.__file__).read_text(encoding="utf-8")
+    assert source.count("\n_facade_compose(\n") == 1
+    package = ast.parse(Path(agent_admin.__file__).read_text(encoding="utf-8"))
+    defined = [
+        node.name
+        for node in package.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    ]
+    assert defined == []
 
 
 # ── one edge ──────────────────────────────────────────────────────────────────
@@ -1630,7 +1636,7 @@ def test_compose_rebinds_functions_and_class_members(tmp_path: Path) -> None:
     )
     namespace = {"__name__": "agent_admin_compose_host_probe", "VALUE": "host"}
     namespace["helper"] = owner.helper
-    agent_admin.compose(namespace, (owner,))
+    facade_compose(namespace, (owner,))
 
     assert namespace["helper"]() == "host" and owner.helper is namespace["helper"]
     assert owner.outer()() == "host"
@@ -1644,7 +1650,7 @@ def test_compose_rebinds_functions_and_class_members(tmp_path: Path) -> None:
     assert namespace["helper"]() == "patched"
 
     fresh = {"__name__": "agent_admin_compose_host_probe", "VALUE": "fresh"}
-    agent_admin.compose(fresh, (owner,))
+    facade_compose(fresh, (owner,))
     assert owner.helper() == "fresh"
 
 
@@ -1696,15 +1702,52 @@ async def test_a_skill_package_mutation_rebuilds_the_agent_config(
     manager = _FakeManager()
     monkeypatch.setattr(agents, "_require_owner", AsyncMock(return_value=None))
     monkeypatch.setattr(agents, "_capability_manager", lambda: manager)
-    rebuild = MagicMock()
-    monkeypatch.setattr(agents, "install_agent", rebuild)
+    # The handler now reports the rebuild VERDICT: a confirmed rewrite returns
+    # True, which rides back as ``agent_spec_rewritten`` so the UI can tell the
+    # user the package actually reached the agent spec.
+    rebuild = MagicMock(return_value=True)
+    monkeypatch.setattr(agents, "rebuild_agent_spec", rebuild)
     request = _post({"package": " pkg-1 "})
     response = await getattr(agents, handler)(request)
     assert response.status == 200
-    assert json.loads(response.body) == {"ok": True, "package": "pkg-1"}
+    assert json.loads(response.body) == {
+        "ok": True,
+        "package": "pkg-1",
+        "agent_spec_rewritten": True,
+    }
     assert manager.calls == [(op, "pkg-1")]
-    rebuild.assert_called_once_with()
+    rebuild.assert_called_once()
     request.app["state"].push_refresh.assert_called_once_with("agents")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("handler", "op"),
+    [
+        ("api_capability_skills_install", "install_skill"),
+        ("api_capability_skills_uninstall", "uninstall_skill"),
+    ],
+)
+async def test_a_skill_package_mutation_reports_a_declined_rewrite(
+    handler: str, op: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A declined rewrite is reported, not hidden: when the skill package op
+    succeeds but the shared-home guard declines to rewrite the spec, the response
+    says ``agent_spec_rewritten: False`` with a 200 — the package landed, the spec
+    did not — rather than an unqualified success."""
+    manager = _FakeManager()
+    monkeypatch.setattr(agents, "_require_owner", AsyncMock(return_value=None))
+    monkeypatch.setattr(agents, "_capability_manager", lambda: manager)
+    rebuild = MagicMock(return_value=False)
+    monkeypatch.setattr(agents, "rebuild_agent_spec", rebuild)
+    response = await getattr(agents, handler)(_post({"package": "pkg-1"}))
+    assert response.status == 200
+    assert json.loads(response.body) == {
+        "ok": True,
+        "package": "pkg-1",
+        "agent_spec_rewritten": False,
+    }
+    assert manager.calls == [(op, "pkg-1")]
 
 
 @pytest.mark.asyncio
@@ -1715,8 +1758,8 @@ async def test_a_skill_package_mutation_refuses_before_and_after_the_seam(
     handler: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(agents, "_require_owner", AsyncMock(return_value=None))
-    rebuild = MagicMock()
-    monkeypatch.setattr(agents, "install_agent", rebuild)
+    rebuild = MagicMock(return_value=True)
+    monkeypatch.setattr(agents, "rebuild_agent_spec", rebuild)
     route = getattr(agents, handler)
 
     missing = await route(_post({"package": "  "}))

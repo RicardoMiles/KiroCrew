@@ -32,7 +32,8 @@ const {
 } = require("./host-config");
 const { isLocalGatewayEnabled } = require("./local-gateway");
 const { seedRenamedStore } = require("./store-rename");
-const { resolveHome, secretCandidates } = require("./home-dir");
+const { resolveHome } = require("./home-dir");
+const { internalSecretFor } = require("./local-token");
 const { identityFamily } = require("./instance-guard");
 const { describeSingletonLock } = require("./singleton-lock");
 const { initNativeLogging } = require("./native-logging");
@@ -217,23 +218,34 @@ function gerror(line) {
   console.error("[gateway-launch] " + line);
 }
 
-function readInternalSecret() {
-  // Re-read on every call. The gateway rotates this secret across restarts, so
-  // caching turns a successful recovery into a stream of spurious 403s.
-  for (const candidate of secretCandidates()) {
-    try {
-      const value = fs.readFileSync(candidate, "utf8").trim();
-      if (value) return value;
-    } catch {
-      // Try the next platform-compatible home candidate.
-    }
-  }
-  return "";
+/**
+ * The X-Internal-Secret to send to `gatewayUrl`, or "" to send none.
+ *
+ * Only the entry the gateway published for the dialed listener counts
+ * (`internalSecretFor`), so the secret can authenticate only against the
+ * listener it is sent to. The home-wide `.local_secret` is never read here: it
+ * is a last-writer-wins slot, and a loopback port can be a tunnel's local end
+ * or another gateway, so sending it there could hand over a credential minted
+ * elsewhere.
+ *
+ * Re-read on every call. The gateway rotates this secret across restarts, so
+ * caching turns a successful recovery into a stream of spurious 403s.
+ *
+ * @param {string} gatewayUrl the URL the request is about to dial
+ * @returns {string}
+ */
+function readInternalSecret(gatewayUrl) {
+  return internalSecretFor({ gatewayUrl, home: resolveHome(), path, fs });
 }
 
 let isQuitting = false;
 let desktopMetricsRecorder = null;
 let windows = null;
+// Whether a dashboard document has finished loading in this run, owned by the
+// GPU-crash fallback (the single-instance winner arms it below). The dead-
+// renderer dialog reads it to tell a renderer that never started from one
+// that crashed later.
+let dashboardLoaded = () => false;
 
 // The native-logging result, kept because its `tightenLiveLog` can only run once
 // Chromium has opened `--log-file` — which is after `app.whenReady`, in a
@@ -369,7 +381,7 @@ if (!app.requestSingleInstanceLock()) {
   // `child-process-gone` listener that makes that decision, so a GPU process
   // that dies before the dashboard loads relaunches the app once in software
   // mode instead of letting Chromium abort it with no window and no log.
-  initGpuCrashFallback({
+  const gpuFallback = initGpuCrashFallback({
     app,
     store,
     backendUrl: BACKEND_URL,
@@ -377,6 +389,7 @@ if (!app.requestSingleInstanceLock()) {
     requestQuit,
     log: glog,
   });
+  dashboardLoaded = gpuFallback.dashboardLoaded;
 
   app.on("second-instance", () => {
     // Relaunch is explicit intent to see the existing window. The window owner
@@ -432,6 +445,8 @@ windows = createWindowLifecycle({
   backendUrl: BACKEND_URL,
   port: PORT,
   glog,
+  logPath: gatewayLogPath,
+  dashboardLoaded: () => dashboardLoaded(),
   readInternalSecret,
   mintLocalToken: (...args) => gateway.mintLocalToken(...args),
   fetchRemoteToken: (...args) => gateway.fetchRemoteToken(...args),
@@ -454,6 +469,7 @@ const ipcRegistrar = createIpcRegistrar({
   reopenCrewCompanionAfterUpdate,
   crashScan: scanCrashArtifacts,
   downloadExpectations,
+  readInternalSecret,
 });
 
 /**

@@ -14,7 +14,7 @@ warning and does not fail the model change.
 ## Configuration
 
 `AgentConfig.fallback_model` is normalized by
-`config/sections.py:coerce_fallback_model`. `llm_helpers.configured_fallback_chain`
+`config/sections_agent.py:coerce_fallback_model`. `llm_helpers.configured_fallback_chain`
 is the shared derivation used by the fallback callers:
 
 - The automatic-routing sentinel is the field default; its configured value
@@ -121,8 +121,9 @@ override an explicit user choice. When automatic provider backfill changes
 activation snapshot before clearing fallback state. This prevents an automatic
 fallback selection from becoming a persistent user pin.
 
-`TestRunChatModelFallback` and `TestSlotProbeWrapsSharedRestoreBody` in
-`test/test_dashboard_chat.py`, together with the restore tests in
+`TestRunChatModelFallback` in `test/test_dashboard_chat.py` and
+`TestSlotProbeWrapsSharedRestoreBody` in `test/test_dashboard_chat_model_pick.py`,
+together with the restore tests in
 `test/test_llm_helpers.py`, pin the stale-record, explicit-pick, and backfill
 invariants.
 
@@ -136,7 +137,7 @@ families — a different model routinely accepts what another's filter declined
 — so the dashboard retries the declined message once on a configured model.
 
 - `AgentConfig.refusal_fallback_model` is normalized by
-  `config/sections.py:coerce_refusal_fallback_model`: the empty default
+  `config/sections_agent_fields.py:coerce_refusal_fallback_model`: the empty default
   disables the feature (junk input collapses to disabled, never to enabled);
   the automatic sentinel defers to the `recommended_model` the provider's
   refusal envelope names, resolving to disabled when it names none; a concrete
@@ -180,7 +181,8 @@ families — a different model routinely accepts what another's filter declined
   preserves that recorded primary instead of overwriting it with the stale
   fallback the session is stranded on, so the eventual restore returns to the
   user's real model rather than to fallback A. While the record is live,
-  both `slot.model` backfill sites treat the
+  both `slot.model` backfill sites (which run only for a slot that inherits
+  no resolved default, see model-selection.md) treat the
   session like an active throttle fallback: the provider's resolved model is
   the temporary candidate and must never be persisted into the durable pin,
   and usage rows attribute to the model that actually served the turn.
@@ -340,7 +342,7 @@ sub-agents) keep the terminal refusal behavior.
 `test/test_llm_helpers.py` covers chain derivation, candidate selection, retry
 state, story handling, and unattended restore. `test/test_dashboard_chat.py`
 covers dashboard fallback and slot restore. `test/test_subagent_turn_resilience.py`
-and `test/test_cron_gateway_integration.py` cover sub-agent and gateway wiring.
+and `test/test_cron_gateway_integration_llm.py` cover sub-agent and gateway wiring.
 `test/test_config_loader.py`, `test/test_role_models.py`, and
-`test/test_dashboard_handlers_core_coverage.py` cover configuration loading and
-PATCH validation.
+`test/test_dashboard_handlers_core_coverage_agent_settings.py` cover configuration
+loading and PATCH validation.

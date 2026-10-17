@@ -40,7 +40,7 @@ import pytest
 from kiro_crew.mcp_gateway import rewriter, stub
 from kiro_crew.mcp_gateway.pool import PoolKey
 
-_STUB_PYTHON_PREFIX = ["-s", "-m", rewriter._STUB_MODULE]
+_STUB_PYTHON_PREFIX = ["-s", "-P", "-m", rewriter._STUB_MODULE]
 
 #: The two postures. Permissive and strict on every one of the four fields at
 #: once, which is the shape a real pair of agents differs in.
@@ -60,8 +60,15 @@ STRICT: dict[str, Any] = {
 
 def _stub_flags_argv(entry: dict[str, Any]) -> list[str]:
     args = entry["args"]
-    if args[:3] == _STUB_PYTHON_PREFIX:
-        return args[3:]
+    # An overlay opens with ``[-s] -P -m <stub>``; the legacy shape without
+    # ``-P`` opens with ``[-s] -m <stub>`` and still parses.
+    for prefix in (
+        _STUB_PYTHON_PREFIX,
+        _STUB_PYTHON_PREFIX[1:],
+        ["-s", "-m", rewriter._STUB_MODULE],
+    ):
+        if args[: len(prefix)] == prefix:
+            return args[len(prefix) :]
     assert args[:2] == ["-m", rewriter._STUB_MODULE]
     return args[2:]
 

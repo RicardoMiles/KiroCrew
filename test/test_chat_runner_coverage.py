@@ -33,7 +33,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
-from chat_test_helpers import _make_ready_kiro_prerequisite
+from chat_test_helpers import _make_ready_kiro_prerequisite, pin_harness_choice
 
 from kiro_crew import name_grant
 from kiro_crew.acp.types import (
@@ -1760,7 +1760,9 @@ class TestExpandDollarSkills:
     def test_no_dollar_token_is_untouched(self, tmp_path):
         state, slot = _state(tmp_path), _slot()
 
-        assert chat_runner._expand_dollar_skills("plain", state, slot, "dashboard:x") == (
+        assert chat_runner._expand_dollar_skills(
+            "plain", state, slot, "dashboard:x", slot.project or ""
+        ) == (
             "plain",
             0,
         )
@@ -1771,7 +1773,9 @@ class TestExpandDollarSkills:
         skills.resolve_dollar_skills.side_effect = RuntimeError("bad glob")
 
         with patch.object(chat_runner, "_get_skills", return_value=skills), _quiet_sel() as sel:
-            out = chat_runner._expand_dollar_skills("$broken", state, slot, "dashboard:x")
+            out = chat_runner._expand_dollar_skills(
+                "$broken", state, slot, "dashboard:x", slot.project or ""
+            )
 
         assert out == ("$broken", 0)
         assert sel.return_value.log_tool_invocation.call_args.kwargs["outcome"] == "error"
@@ -1783,7 +1787,9 @@ class TestExpandDollarSkills:
         skills.has_dollar_candidate.return_value = True
 
         with patch.object(chat_runner, "_get_skills", return_value=skills), _quiet_sel() as sel:
-            out = chat_runner._expand_dollar_skills("$nope", state, slot, "dashboard:x")
+            out = chat_runner._expand_dollar_skills(
+                "$nope", state, slot, "dashboard:x", slot.project or ""
+            )
 
         assert out == ("$nope", 0)
         assert sel.return_value.log_tool_invocation.call_args.kwargs["outcome"] == "not_found"
@@ -1797,7 +1803,7 @@ class TestExpandDollarSkills:
 
         with patch.object(chat_runner, "_get_skills", return_value=skills):
             expanded, count = chat_runner._expand_dollar_skills(
-                "run $deploy", state, slot, "dashboard:x"
+                "run $deploy", state, slot, "dashboard:x", slot.project or ""
             )
 
         assert count == 1
@@ -4090,6 +4096,8 @@ class TestRunChatLocalCommands:
         cfg.agents["oncall"] = KiroCrewAgentConfig()
         store = provision_member_memory(cfg, "oncall")
         cfg.save()
+        # save() keeps the harness fields as stored, so the choice goes on disk.
+        pin_harness_choice(member_acp_backend="claude")
         member_memory_auth.bind_private_session_store(
             chat_runner.effective_session_key(slot), store
         )
@@ -5458,6 +5466,42 @@ class TestRunChatAutoApproveRungs:
         client.approve_tool.assert_awaited_once_with("req-cov-1")
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "command", ["git status", "git log --oneline -5", "ls && git diff", "/usr/bin/GIT status"]
+    )
+    async def test_trust_reads_never_auto_approves_git(self, tmp_path, command):
+        """git reads ``.git/config`` on every run, and ``core.fsmonitor`` /
+        ``core.hooksPath`` name a program there that no text classifier sees, so a
+        read-only git command still goes to the card under trust-reads."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._trust_reads = True
+        _set_stream(
+            client,
+            [_permission(tool_input=json.dumps({"command": command})), _complete()],
+        )
+        slot._empty_response_retries = 2
+        with (
+            patch.object(chat_runner, "sel") as mock_sel,
+            patch.object(chat_runner, "tool_approval_timeout_secs", return_value=0.0),
+        ):
+            audit = MagicMock()
+            mock_sel.return_value = audit
+            await chat_runner._run_chat(state, slot, "hello")
+        await _settle(slot)
+
+        client.approve_tool.assert_not_awaited()
+        # The card does not offer a trust-reads grant that would not cover git.
+        cards = [json.loads(m["cls"]) for m in slot.messages if m.get("role") == "permission"]
+        assert cards and all(not card.get("is_read_only") for card in cards), cards
+        assert not [
+            c.kwargs
+            for c in audit.log_tool_invocation.call_args_list
+            if c.kwargs.get("metadata", {}).get("reason") == "trust_reads"
+            and c.kwargs.get("outcome") == "auto_approved"
+        ]
+
+    @pytest.mark.asyncio
     async def test_trust_reads_rejects_an_invalid_tool_name(self, tmp_path):
         state, client = _runner_state(tmp_path)
         slot = _slot()
@@ -6356,6 +6400,43 @@ class TestRunChatWakaTimeCodingAccounting:
         assert note_activity.call_args.kwargs["config"] is config
 
     @pytest.mark.asyncio
+    async def test_heartbeat_project_is_the_turn_start_snapshot(self, tmp_path):
+        """A project picked while the turn streams does not relabel its heartbeat.
+
+        The pick lands as the session registers (the route is free to write
+        slot.project from then on); the heartbeat still names the project the
+        turn prepared on and runs in.
+        """
+        state, client = _runner_state(tmp_path)
+        client.mcp_session_report = MagicMock(return_value=None)
+        slot = _slot()
+        start = tmp_path / "start-project"
+        picked = tmp_path / "picked-mid-turn"
+        start.mkdir()
+        picked.mkdir()
+        slot.project = str(start)
+
+        async def _claim(*_args, **_kwargs):
+            slot.project = str(picked)
+            return client, True, False
+
+        state.sessions.get_or_create = AsyncMock(side_effect=_claim)
+        _set_stream(client, [_statusless_coding_tool_call(), _complete()])
+        with (
+            patch.object(
+                chat_runner.KiroCrewConfig,
+                "load",
+                return_value=self._wakatime_config(),
+            ),
+            patch.object(chat_runner, "note_coding_activity") as note_activity,
+        ):
+            await _drive(state, slot)
+
+        note_activity.assert_called_once()
+        assert note_activity.call_args.args[0] == str(start)
+        assert slot.project == str(picked)
+
+    @pytest.mark.asyncio
     async def test_many_auto_approved_coding_calls_keep_one_turn_bit(self, tmp_path):
         state, client = _runner_state(tmp_path)
         client.mcp_session_report = MagicMock(return_value=None)
@@ -6851,3 +6932,133 @@ class TestRunChatWakaTimeCodingAccounting:
             await _drive(state, slot, _turn_actor="cron")
 
         note_cadence.assert_not_called()
+
+
+class TestBlockedLinkCardRecords:
+    """What the dashboard's blocked-link card lists after a flush.
+
+    The card lists the host's records in the saved reply, each under its own
+    address, and never claims which one a chip stands for
+    (``BlockedLinkCard`` in ``website/src/components/RedactionCards.tsx``).
+    Counts cannot prove that a placeholder and a record are the same URL, so
+    these pin what each record says about itself. They stream the deltas
+    through both per-delta removers in the order the streaming loop applies
+    them, then flush.
+    """
+
+    H = "h.example-sink.net"
+    KEY = "AKIA" + "IOSFODNN7EXAMPLE"  # AWS docs example key, split so no literal sits in the repo
+
+    @staticmethod
+    def _flush(deltas: list[str]) -> tuple[str, list[dict]]:
+        from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+
+        slot = _slot()
+        text = ""
+        for delta in deltas:
+            safe, _ = redact_exfiltration_urls(delta)
+            safe, _ = redact_credentials(safe)
+            chat_runner._accumulate_segment_raw(slot, delta)
+            text += safe
+        redacted, links, _ = chat_runner._redact_segment(slot, text)
+        return redacted, links
+
+    def test_one_address_on_its_host_is_its_one_record(self):
+        url = f"https://{self.H}/only?q=" + "a" * 250
+        content, links = self._flush(["See ", url[:40], url[40:], " now."])
+        assert content.count(f"[REDACTED: suspicious URL to {self.H}]") == 1
+        assert [r["url"] for r in links] == [url]
+
+    def test_glued_pair_a_credential_tag_and_a_key_split_link_list_every_record(self):
+        # Two same-host long-query addresses glued across a delta, a
+        # credential tag, then a same-host address whose key a delta redacted.
+        g1 = f"https://{self.H}/g1?q=" + "a" * 250
+        g2 = f"https://{self.H}/g2?q=" + "b" * 250
+        deltas = [
+            "Two links: ",
+            g1,
+            g2,
+            " [REDACTED: credential] then ",
+            f"https://{self.H}/other?k=",
+            self.KEY + "&t=x",
+            " end.",
+        ]
+        _, links = self._flush(deltas)
+        assert sum(r["domain"] == self.H for r in links) > 1
+        assert all(r["path"] for r in links if r["domain"] == self.H)
+
+    @staticmethod
+    def _key_split_presigned_flush() -> dict:
+        """Presigned S3 addresses split at ``&X-Amz-Date`` beside same-host
+        addresses whose key a delta redacted. The dashboard test
+        ``MarkdownRenderer.blockedLinkCredInUrl.test.tsx`` renders this output."""
+        host = "my-bucket.s3.us-east-1.amazonaws.com"
+        key = TestBlockedLinkCardRecords.KEY
+        deltas: list[str] = []
+        for i, name in enumerate(("report.csv", "invoice.pdf")):
+            url = (
+                f"https://{host}/{name}?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={key}"
+                "%2F20261008%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20261008T000000Z"
+                "&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=" + "a" * 64
+            )
+            cut = url.index("&X-Amz-Date")
+            deltas += [f"Link {i + 1}: ", url[:cut], url[cut:], " . "]
+        for name in ("other-a", "other-b"):
+            deltas += [" plain ", f"https://{host}/{name}?X-Amz-Credential=", key + "%2Fx", " . "]
+        content, links = TestBlockedLinkCardRecords._flush(deltas)
+        return {"content": content, "blocked_links": links}
+
+    def test_key_split_links_beside_presigned_starts_match_the_dashboard_fixture(self):
+        out = self._key_split_presigned_flush()
+        fixture = Path(__file__).resolve().parents[1] / "website/src/test/fixtures/credInUrl.json"
+        assert json.loads(fixture.read_text(encoding="utf-8")) == out
+
+    @staticmethod
+    def _one_presigned_one_key_split_flush() -> dict:
+        """ONE presigned S3 address split at ``&X-Amz-Date`` (a placeholder
+        with no record of its own) beside ONE same-host address whose key a
+        delta redacted (a record the text shows no placeholder for). The
+        dashboard test ``MarkdownRenderer.blockedLinkOneOne.test.tsx`` renders
+        this output."""
+        host = "my-bucket.s3.us-east-1.amazonaws.com"
+        key = TestBlockedLinkCardRecords.KEY
+        url = (
+            f"https://{host}/report.csv?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={key}"
+            "%2F20261008%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20261008T000000Z"
+            "&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=" + "a" * 64
+        )
+        cut = url.index("&X-Amz-Date")
+        deltas = [
+            "Link: ",
+            url[:cut],
+            url[cut:],
+            " . plain ",
+            f"https://{host}/other-a?X-Amz-Credential=",
+            key + "%2Fx",
+            " . ",
+        ]
+        content, links = TestBlockedLinkCardRecords._flush(deltas)
+        return {"content": content, "blocked_links": links}
+
+    def test_one_placeholder_and_one_record_of_different_addresses_name_their_own(self):
+        """One placeholder and one record need not be the same URL: the record
+        names /other-a, not the report.csv the chip stands for. The card lists
+        it under that address and never as the clicked link."""
+        out = self._one_presigned_one_key_split_flush()
+        host = "my-bucket.s3.us-east-1.amazonaws.com"
+        assert out["content"].count(f"[REDACTED: suspicious URL to {host}]") == 1
+        assert [r["path"] for r in out["blocked_links"]] == ["/other-a"]
+        fixture = (
+            Path(__file__).resolve().parents[1] / "website/src/test/fixtures/blockedLinkOneOne.json"
+        )
+        assert json.loads(fixture.read_text(encoding="utf-8")) == out
+
+    def test_clearing_the_streamed_text_clears_its_raw_copy(self):
+        """``_cleared_segment_text`` is how a turn drops its streamed text
+        mid-segment, and it takes the raw copy with it."""
+        slot = _slot()
+        chat_runner._accumulate_segment_raw(slot, "unseen https://h.example-sink.net/x")
+        assert slot.segment_raw_text
+
+        assert chat_runner._cleared_segment_text(slot) == ""
+        assert slot.segment_raw_text == ""

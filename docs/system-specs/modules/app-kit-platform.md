@@ -8,6 +8,22 @@ the publish-facing policy in
 [../../app-kit/publishing-guide.md](../../app-kit/publishing-guide.md); this
 document is the behaviour and the one-way doors.
 
+## Embedded chat title
+
+A framed `ChatEmbed` with no title displays a localized label, never its
+internal slot key as visible text. Until the slot's first page arrives the label
+reads "Loading session…" (muted, `aria-busy`), so a titled conversation is never
+called new while it loads, and the transcript's "Session ready" line waits for
+that page too. A loaded page with no history reads "New session". A page with
+history (rows on the page or older rows beyond it), or a failed first read,
+reads the age-neutral "Untitled session", so a session that gets its first
+message before its title reads "Untitled session" until the title arrives.
+A settled title poll replaces any of these labels on the same mounted header,
+and a slot change shows the loading label until the new slot's first read.
+The slot key remains the header's hover title for debugging; `frameless` embeds
+have no title strip. `ChatEmbed.title.test.tsx` covers the delayed first read,
+fresh and resumed untitled pages, later title arrival and a slot change.
+
 ## Scoped frontend HTTP transport
 
 `useAppApi()` exposes `raw(path, RequestInit)`, `request(path, RequestInit)` and
@@ -32,6 +48,62 @@ dashboard's installed recovery handler without consuming the response body.
 The handler owns existing single-flight refresh, embedded handoff and banner
 behavior. A document without that handler still throws the original HTTP error;
 there is no SDK-owned credential refresh or automatic request replay.
+
+`apiPathAllowed(declared, path)` answers the same check without throwing, so a
+component can hide a control whose request the client would refuse. It shares
+the client's matcher and its absolute-URL refusal; it grants nothing the check
+would not.
+
+`ChatEmbed` and `ChatInput` mount the store-free `chat-core/composer/Attach.tsx`
+picker atom. Each host supplies its existing staging writer and keeps its own
+trigger, file-type hint and focus-return behavior. File selection is reset in
+one place so choosing the same file after removal still works. Only the picker
+is shared: the embed's staging, paste/drop, upload holds, cancellation and
+failed-send recovery stay in the SDK's `useEmbedAttachments`, beside its
+explicit upload grant and scoped transport. Sharing that lifecycle with the
+main chat is still open under #19994.
+`ComposerSend` receives the embed's actual staged-file and upload state, so a
+file-only turn remains sendable and an in-flight upload still holds Send.
+The main chat's slot persistence, file mentions, upload cancellation and send
+recovery keep their existing writers rather than a second private staging list.
+
+`ChatEmbed`'s composer attachments use it for `/api/upload/file`. The upload
+writes to the gateway's disk, so it is an explicit host grant and is never
+implied by `/api/chat`: the attach control renders only when the host's
+declared paths cover the upload path, and the permissions are read off the SDK
+context so a surface with no provider fails closed. Uploads go through the
+scoped `raw` transport with the multipart body untouched, so the token's own
+manifest check still applies server-side. The upload body itself (image
+downscaling, multipart parts, the `paths` contract) is the one
+`utils/composerUpload.ts` the dashboard client also uses; only the transport
+differs. Upload, staging and the send-recovery primitives (`clear`, `restore`,
+`removeFile`) live in chat-core's store-free
+`chat-core/composer/useComposerAttachments.ts`, which takes the grant, the
+POST and the refusal text from its host; `app-sdk/useEmbedAttachments.ts` is
+only the app adapter that supplies the declared-path grant and the scoped
+`raw` POST. The import-graph test in `ChatEmbed.composerStoreFree.test.tsx`
+pins the shared hook as store-free. A pasted or dropped file on an
+ungranted host is refused in the composer with a visible notice; a drop with
+files is always default-prevented so the browser never navigates to the file.
+The send reuses chat-core's `buildOutgoingTurn`, so the wire text and
+`meta.files` match the main chat's, with `meta.sendId` alongside. It uses the
+text-only `'steer'` serialization: this surface carries no `meta.dirs`, so an
+`@rel/` folder token stays as typed instead of becoming an `[attached_dir N]`
+marker naming a path nothing travels with -- the same text a send without a
+file carries. The refusal notice names the page that accepts files by its rail
+label (`nav.sessions`), as text, never a link that would leave the unsaved
+draft. While an upload runs, the composer shows the files' names, refuses the
+picker (its label reads "Uploading files…") and refuses Send through the Send
+atom's `uploading` input; staged files reach the atom as `hasAttachments`, so
+a file-only turn sends, or queues while a turn runs. Wherever
+the send-recovery path hands a composer submit's text back (a refused send, an
+unconfirmed one, a host `onSend` that rejects), its staged files come back with
+it, ahead of any staged since, so a retry needs no new upload; the files ride
+the parked receipt too, so an embed remounted for the slot gets them. Proof
+that an unconfirmed send was delivered unstages the handed-back files still in
+the composer, as it takes the text back, so they are not sent twice. A
+slot switch or unmount aborts in-flight
+uploads and drops their late results.
 
 The host owns session attribution. Chat hosts bind their session; routed app
 pages bind the established `dashboard:ui` page identity. A provided host key
@@ -94,6 +166,22 @@ That direction is host to app: it refreshes an app's own failed query and reache
 no host key from an app bundle.
 The dashboard's own client is reachable from host code only; it is absent from
 the import map and from every vendor stub, which is what the boundary rests on.
+
+## Embedded chat file deliveries
+
+Every surface that draws a `file` row decides with one parser,
+`parseFileRecord` in `website/src/lib/fileRecord.ts`: the SDK's default `file`
+renderer, ChatPage's override and the crew window's sent-file row all call it.
+It accepts a JSON record with a non-empty string `filename`. Optional
+`content_type` and `description` fields must be strings when present, and
+`size` must be a number. Omitted optional fields remain valid; other fields are
+dropped. Anything else (invalid JSON, `null`, a non-object, a missing or empty
+`filename`, malformed metadata) is rejected, so malformed metadata never
+reaches `FileCard`. The surfaces differ only in what they draw: the crew window
+names the peer's file in a line of text rather than a card, and for a rejected
+record the SDK default and the crew window draw nothing, while ChatPage passes
+the row to its `renderUnparsedFile` option, which the single-chat page fills
+with its conversational bubble so the raw text stays visible.
 
 ## Host-mediated chat launch and cron toggles
 
@@ -161,6 +249,94 @@ agent job (`approval_mode="auto"`) in the job's single locked first save instead
 of correcting it in a second write that a due-scan can beat. The rationale per
 field, the fields still deliberately omitted, and the tests pinning each one are
 in `learn-cron-dashboard.md` under "App SDK create allowlist".
+
+## ChatEmbed Stop
+
+`ChatEmbed` shows the dashboard composer's Stop control (`StopControls`) in the
+send slot while a turn runs and the draft is empty. It drives the SAME press
+protocol as the dashboard's `ChatPane`: one hook,
+`website/src/chat-core/stop/useStopPress.ts`, that both hosts call, so there is
+no second copy of the stop state machine. The host hands in only its transport:
+`ChatPane` sends through the Redux `requestStop` thunk, and the embed through
+the scoped API (`POST /api/chat/slots/{slot}/stop[?force=true]`, covered by the
+embed's `/api/chat` grant) in `website/src/app-sdk/embedStopTransport.ts`, which
+maps each reply to an outcome: `ok`, `declined` (compaction), `refused` (a
+definite no), or `lost` (no answer). The embed passes two opt-in extensions
+`ChatPane` does not (`turnScoped` with the turn identity, and the backend's
+`stop_declined` marker), so the main chat's behaviour is the protocol unchanged.
+The embed has no WebSocket, so it reads
+the stop phase from the `stop_state` field of `GET /api/chat/slots/{slot}`, and
+it holds its own soft press as an optimistic `soft_pending` until the poll
+reports a phase or the turn ends: otherwise a second press inside the poll lag
+would read as a fresh soft press, which the backend escalates to a hard kill
+with no warning. A request with no HTTP answer keeps the pending state (it may
+have armed the cancel); a definite failure clears it. Because a lost press
+keeps `soft_pending`, the next press is a force stop, so the embed shows the
+force-stop hint, with its cost (work in progress and queued messages are
+dropped), beside the failure notice; the notice then reads
+`appSdk.chatEmbed.stop_did_not_go_through` without its own "press Stop again".
+
+Everything the hook remembers about a press (the optimistic `soft_pending`, the
+decline flag and the failure notice) belongs to ONE turn. `ChatEmbed` passes the slot read's
+turn identity, `turn_gen` + `turn`, and a change of identity on the same slot
+clears all of it and ignores any reply still due for the old turn. The one thing a
+new turn keeps is the time of the last press, which the double-tap guard reads: the
+press's own catch-up read is often the one that names the successor, already
+`soft_pending`, so clearing that time would let the second tap of a double-click
+force-stop the successor and drop the queue. A slot change clears the time too. That covers
+failures as well as successes: an HTTP error, a 2xx refusal or a lost request
+answered for an earlier press or turn changes nothing, since clearing the new
+turn's armed time would let a double-tap inside the window force-stop it. A soft stop
+with a message queued is why: the queue drain hands the floor straight to the
+next turn, so a 1-second poll can read the successor without ever seeing
+`running: false` or a stop phase, and the new, unpressed turn would otherwise
+show "Stopping" and spend its first press as a force kill. A read without the
+pair (the admission-only reservation before a turn is numbered) neither changes
+the turn nor forgets the last one, so a press made during admission survives the
+numbering of the turn it was aimed at; a new `turn_gen` with the same `turn`
+(a gateway restart) is a new turn. A successful stop reply alone does not clear
+the optimistic state, because the stop it reports may still be pending.
+
+A soft press while the session's automatic compaction holds it is DECLINED by
+`stop_slot_turn` (`{ok: true, compacting: true}`, `_stop_state` left `idle`,
+`_stop_declined_at` armed for `STOP_DECLINED_ESCALATION_SECS`). The embed then
+drops the optimistic `soft_pending`, so nothing reads "Stopping", and arms a
+local decline flag that shows the embed's own reset warning
+(`appSdk.chatEmbed.stop_restarts_session`). It says what Stop does now, not
+"click again", because it also shows to a reader who opened or returned to the
+embed after a press made elsewhere, and it names what survives (the chat
+history) apart from what is dropped (work in progress and queued messages), the
+same loss the force-stop hint names. When a press fails while the warning
+shows, the failure reads `appSdk.chatEmbed.stop_did_not_go_through`, without the
+generic "press Stop again", so one instruction remains. The header and the
+footer carry "Stopping…"/"Killing…"; the placeholder stays neutral. The next press is debounced
+against the declined one and sent as a plain stop: the backend's marker is what
+makes it the hard kill while the compaction lasts, and once the compaction has
+ended the backend drops the marker and the same press is an ordinary soft stop.
+The flag is timed from the reply with the backend's 60-second window, so it
+never ends before the marker does; it also clears when the press after it
+lands, when the turn ends (a turn cannot finish while the compaction holds its
+session, and the compaction's end drops the marker), when the slot changes, and
+when the poll reports `soft_pending` or `killing`. A decline answered after its
+turn ended or the slot changed is not armed. A definite failure of that press
+leaves the flag set, because the marker is still armed, and the warning shows
+beside the error notice. The slot-detail read also carries `stop_declined`, the
+same `slot_projection.stop_declined_armed` read the slots frame and the stop
+route use, so an embed that opens or returns inside the window warns before its
+first press; an absent field reads as not armed. The warning is the local flag
+OR that field, withdrawn only by a server-reported `soft_pending`/`killing` or
+the end of the turn, never by the embed's own optimistic `soft_pending`: while
+the press after a decline is unanswered it may still be the reset, so a lost
+request keeps the warning beside its error. Known residual: the local flag is
+not withdrawn when the poll reports the marker gone, because a poll issued
+before the decline can answer after it; so if the compaction ends inside the
+window the embed keeps warning of a reset that the next press will not perform
+(an over-warning, never a silent reset).
+Writers: `website/src/chat-core/stop/useStopPress.ts`, `website/src/app-sdk/embedStopTransport.ts`,
+`website/src/app-sdk/ChatEmbed.tsx`, `website/src/components/useChatPaneTurnControl.ts`,
+`src/kiro_crew/dashboard/chat_api/slot_detail.py` (`stop_declined`).
+Tests: `website/src/test/useStopPress.test.ts`, `website/src/test/ChatEmbed.stop.test.tsx`,
+`website/src/test/ChatPane.stopEscalation.test.tsx`, `test/test_slot_detail_stop_state.py`.
 
 ## App Store source selection
 
@@ -634,16 +810,44 @@ Writer: `apps/bridges.py::_app_resource_root`.
 ### 5.1 Resource-path containment is host-independent and flavour-explicit
 
 Every manifest resource path (`agents`/`skills`/`sops`, `ui.entry`,
-`ui.pages[].entryPoint`, `backend.entryPoint`) is joined onto the app root, so
-`manifest._path_escapes_app_root` refuses any path that could relocate that join.
+`ui.pages[].entryPoint`, `backend.entryPoint`, `contributes.panelTabs[].entry`,
+session-control `entryPoint`) is joined onto the app root, so
+`manifest._app_path_refusal` refuses any path that could relocate that join.
 It applies three checks, and the two lexical ones run **first and unconditionally**
 — before, and independent of, whether `app_root` is known:
 
 1. `_is_rooted_path` — `PureWindowsPath(p).drive or .root`.
 2. `_has_dotdot_segment` — a `..` segment under **either** path flavour.
-3. Canonical containment (only when `app_root` is given) — `resolve()` +
-   `is_relative_to`, which catches what no lexical check can see: a symlink or
-   reparse point inside the root whose target leaves it.
+3. Canonical containment (only when `app_root` is given) — `hooks.screen_file_path`
+   on the resource and on the root, then `is_relative_to`, which catches what no
+   lexical check can see: a symlink or reparse point inside the root whose target
+   leaves it. The screen reads each link's own target before anything follows it.
+
+Each declared path gets one `Containment` answer: inside the root, outside it,
+refused by the screen (lasting), or unchecked (one of the screen's checks did not
+complete). The callers act on it as follows:
+
+| Caller | Refused | Unchecked |
+|---|---|---|
+| `AppManifest.validate` (install) | error `is refused by the path screen` | error `could not be checked against the app root`, or the `unchecked` list when the caller passes one |
+| `discovery.discover_builtin_apps` | builtin skipped | builtin stays listed, so it is not read as orphaned |
+| `bridges._register_agents` / `_register_skills` | skipped, not retried | skipped and recorded for retry |
+| `bridges._prune_stale_app_resources` (agents) | not a current link; the prune goes on | prune aborted, existing configs kept |
+| `file_entry_point_refusal` (backend spawn) | `refused by the path screen` | `path resolution failed` |
+| `_declared_agent_names` / `manager._app_agent_names` | no name | no name on this pass; the next pass asks again |
+
+A `contributes.commands[].agent` that no checked agent path declares is an install
+error. When an agent path was unchecked, that miss is reported as unchecked too, so
+builtin discovery keeps the app listed. An app root the screen refuses links no
+agent, so the agent prune removes every `<app>--*.json` config it had registered.
+
+The root is screened once per pass, so each declared path costs one screen call.
+The app listing's command-agent containment (`contain_command_agents`, which runs on
+every `GET /api/apps`) uses the same `_app_path_refusal`. The command-agent home-directory
+exemption compares only canonical paths returned by the same screen; a refused
+directory has no identity key and cannot qualify, and project scanning then
+supplies its link-refusal reason. Ordinary local aliases of the installed agents
+directory keep the exemption.
 
 A manifest is portable data validated on whichever host installs the app, so all
 three must reach the same verdict everywhere. Both lexical checks are therefore
@@ -738,7 +942,7 @@ produce two identical routes, so a hit means the convention changed under us.
 
 Writer: `dashboard/server_runtime/static_assets.py::discover_app_window_entries`
 (`APP_WINDOW_URL_PREFIX = "app-windows"`);
-exclusion: `dashboard/token_auth.py::register_app_window_paths`.
+exclusion: `dashboard/token_auth_paths.py::register_app_window_paths`.
 
 The dashboard service worker also declines every `/app-windows/` request. These are standalone top-level documents, not SPA routes, so a failed app-window navigation must never fall back to the cached dashboard shell. In Electron that fallback can put the full dashboard inside a frameless, non-focusable, full-display overlay with no close controls.
 
@@ -1077,6 +1281,10 @@ lifecycle lock and the one step that can safely refuse runs FIRST:
 7. For a registry-sourced app, its clone under `app-sources/<registry-name>` is
    removed, on success only. The removal runs off-loop and inside the lifecycle
    lock, so a queued install cannot have the tree it just re-cloned deleted.
+   `<registry-name>` is read back from the app-writable `installed.json`, so
+   `app_source_dir` refuses one that `app_name_error` refuses, such as `..`,
+   `../` or `.`; the removal is then skipped with a warning and the app is still
+   uninstalled.
 
 The owner-only migration cleanup route delegates to uninstall for a retired builtin
 listed in `_MIGRATED_BUILTINS` or orphaned in this build. Eligibility is rechecked
@@ -1418,7 +1626,7 @@ per socket at ONE chokepoint — `DashboardState._send_ws_all` →
 (`broadcast_ws` and the `_broadcast` `_type` translation) and the
 subagent-subscriber fan-out funnel through it. An event absent from the module's
 tables is DENIED, so a new event name is a silent loss of function for apps until
-it is classified — `test_ws_event_scoping.py` fails the build on an unclassified
+it is classified — `test_ws_event_scoping_frames.py` fails the build on an unclassified
 broadcast name rather than letting it reach production.
 
 Three tiers. Tier 0 (`dashboard`, `refresh`, `update_progress`) carries no
@@ -1925,7 +2133,7 @@ implicit ownership of its own namespace on both the reverse-proxy/UI surface
 via a path-boundary match so `foo` cannot reach `foo-bar`. That implicit grant is
 carved back on the `/api/apps` surface for the literal first path segments that
 resolve to a SHARED route registered before the `/api/apps/{name}` catch-all:
-`RESERVED_APP_PATH_SEGMENTS` in `token_auth` holds `registry`, `registries`,
+`RESERVED_APP_PATH_SEGMENTS` in `token_auth_app_scope` holds `registry`, `registries`,
 `blob`, `install`, and `register`, and the `/api/apps/<name>` branch of
 `_app_owns_path` refuses to match when the app name is one of them. Without the
 carve-out an app that named itself after such a segment, for example `registries`,
@@ -1946,14 +2154,15 @@ already-published one. The two sets are duplicated rather than shared to avoid a
 
 Writers: `dashboard/ws_event_scope.py`, `dashboard/ws.py` (connect-time scope
 resolution), `dashboard/state.py` (`_send_ws_all`, `_ws_client_allowed`,
-`_serialize_for_client`, `SlotOrigin`), `dashboard/token_auth.py`
+`_serialize_for_client`), `dashboard/state_parts/slot_directory.py` (`SlotOrigin`),
+`dashboard/token_auth_app_scope.py`
 (`_APP_TOKEN_IMPLICIT_ALLOW`, `app_token_path_allowed`, `_app_owns_path`,
 `RESERVED_APP_PATH_SEGMENTS`), `apps/manifest.py`
 (`_granted_list`, `RESERVED_APP_PATH_SEGMENTS`), `dashboard/slot_ownership.py`
 (`slot_ownership_middleware`, `SLOT_ROUTE_POLICIES`, `deny_app_slot_access`,
 `app_reserved_key_reason`, `transcript_acquisition_reason`, `app_holds_gateway_key`),
-`dashboard/chat_handlers.py` (`_app_slot_acquisition_denial`,
-`_app_resume_refusal`, `resume_slot_from_history`); consumers: `website/src/app-sdk/index.ts` (mirrors the tables
+`dashboard/chat_api/app_admission.py` (`_app_slot_acquisition_denial`,
+`_app_resume_refusal`), `dashboard/chat_api/resume.py` (`resume_slot_from_history`); consumers: `website/src/app-sdk/index.ts` (mirrors the tables
 for developer-facing diagnostics, drift-guarded by
 `website/src/test/appSdkEventScope.test.ts`). Runtime-facing summary for app
 authors: [../../architecture/app-platform-trust-model.md](../../architecture/app-platform-trust-model.md).
@@ -3256,7 +3465,11 @@ worker threads. The per-directory `asyncio.Lock` from `_turn_lock` is the only l
 held across an await. The app's tests reach every module through one facade,
 `tests/routes_facade.py`, which patches each module that binds a name, so every
 shared name must be one object. `test_orchestration_composition_contract.py` pins
-that, the import order, the one-hop facade, and the lock order end to end.
+that, the import order, the one-hop facade, and the lock order end to end. The
+route tests are split by the behaviour they pin into `test_routes_<topic>.py` files
+beside `test_routes.py`, which keeps the route contract. They share state
+redirection, the autouse live-state guard and the client builders in
+`tests/routes_helpers.py`, and a new route test goes in the part for its behaviour.
 
 Writers: `apps/builtins/spec_builder/backend/handlers.py`, `runtime.py`,
 `decisions.py`, `orchestration/`; `apps/builtins/spec_builder/tests/routes_facade.py`
@@ -3319,8 +3532,9 @@ as redactors, and only the five owners listed in `NON_EGRESS_REDACTION_MODULES`
 them, so a new
 call to either belongs in one of those or needs its own row there.
 `test_apps_registry_composition_contract.py` pins the surface, the
-one-namespace writes, the import order, the three facade call sites, the reload and
-the `create=True` guard end to end.
+one-namespace writes, the import order, the three facade call sites and the reload
+end to end, and `test_apps_registry_composition_contract_patch_spellings.py` pins
+the `create=True` guard.
 
 Writers: `apps/registry.py`, `apps/registry_pipeline/`.
 
@@ -3379,7 +3593,7 @@ names `apps/backend.py::_start_app_backend_body`, `test_spawn_audit.py` names
 `apps/backend.py::_resolve_nvm_path`, and `test_app_off_contract.py`,
 `test_dev_fleet_app.py`, `test_frontend_edition_build.py`,
 `test_sandbox_dev_fleet_live_target.py`, `test_app_bridges.py` and
-`test_app_backend.py` read the spawn's record constructions and environment in the
+`test_app_backend_spawn_env.py` read the spawn's record constructions and environment in the
 facade's source -- including what must NOT be there, so every record construction and
 none of the texts they forbid lives in an owner either. `_pid_alive` stays there because `test_windows_kill_probe_audit.py`
 reads it by path. Four owner call sites reach those residents at call time through

@@ -4,7 +4,7 @@
 ``start_dashboard`` and ``start_api_server`` stay defined there as the boot
 sequencers; the helper families they call, and the boot phases they delegate to,
 live in the modules of ``kiro_crew.dashboard.server_runtime``, and
-``server_runtime.compose`` runs every function those owners define on the server
+``_facade_compose.compose`` runs every function those owners define on the server
 module's globals. These tests pin:
 
 * the surface: every name the module bound before the split still resolves on it,
@@ -43,9 +43,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
-from source_corpus import repo_files_named, repo_root
+from source_corpus import iter_statements, repo_files_named, repo_root
 
 import kiro_crew.dashboard.server as server
+from kiro_crew._facade_compose import compose as facade_compose
 from kiro_crew.dashboard import server_runtime
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
@@ -454,6 +455,7 @@ _LAZY_IMPORTS = {
     "kiro_crew.config.live": "ConfigChange",
     "kiro_crew.config.resolution": "DEGRADED_WHOLE_CONFIG",
     "kiro_crew.connections.warm": "scavenge_warm_mint_artifacts shutdown_warm_mint",
+    "kiro_crew.dashboard": "display_verdicts",
     "kiro_crew.dashboard.chat": "_run_chat",
     "kiro_crew.dashboard.handlers": "wf_handlers work_ledger",
     "kiro_crew.dashboard.handlers.ask_question": (
@@ -487,6 +489,7 @@ _LAZY_IMPORTS = {
     "kiro_crew.hooks": "set_builtin_app_agents set_builtin_app_mcp_servers set_builtin_app_names",
     "kiro_crew.memory": "MemoryStore",
     "kiro_crew.metrics": "_gauges",
+    "kiro_crew.page_cache": "read_now",
     "kiro_crew.security": "redact_credentials redact_exfiltration_urls",
     "kiro_crew.sel": "sel",
     "kiro_crew.stt": "engine stt_models",
@@ -512,7 +515,7 @@ def test_the_lazy_imports_stay_inside_the_functions_that_need_them() -> None:
                     for alias in node.names:
                         local.setdefault(alias.asname or alias.name, set()).add(alias.name)
     assert local == {name: {module} for name, module in expected.items()}
-    assert len(expected) == 82
+    assert len(expected) == 84
 
 
 def test_a_star_import_carries_the_moved_public_names(tmp_path: Path) -> None:
@@ -714,15 +717,20 @@ def test_a_moved_function_reads_its_source_from_its_owner() -> None:
     assert inspect.getsourcefile(server._register_mcp_routes) == _owner("mcp_routes").__file__
 
 
-def test_the_compose_copy_matches_its_siblings() -> None:
-    """The dashboard compositions share one technique; each package keeps its own copy
-    so no package imports another's, and the copies stay identical."""
-
-    def body(package: str) -> str:
-        text = (_SRC / "kiro_crew/dashboard" / package / "__init__.py").read_text(encoding="utf-8")
-        return text[text.index("def compose(") :]
-
-    assert body("server_runtime") == body("agent_admin") == body("file_api")
+def test_the_facade_composes_through_the_shared_helper() -> None:
+    """The facade composes its owners with the one shared helper,
+    ``kiro_crew._facade_compose.compose``, calling it exactly once, and the owner
+    package keeps no copy of its own: its ``__init__`` defines no function."""
+    assert server._facade_compose is facade_compose
+    source = Path(server.__file__).read_text(encoding="utf-8")
+    assert source.count("\n_facade_compose(\n") == 1
+    package = ast.parse(Path(server_runtime.__file__).read_text(encoding="utf-8"))
+    defined = [
+        node.name
+        for node in package.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    ]
+    assert defined == []
 
 
 # ── one edge ──────────────────────────────────────────────────────────────────
@@ -895,6 +903,10 @@ def test_a_second_facade_import_recomposes_the_owners_onto_it(tmp_path: Path) ->
 
 _PATCH_CALLS = ("setattr", "patch.object", "delattr")
 _MULTIPLE_OPTIONS = frozenset({"spec", "create", "spec_set", "autospec", "new_callable"})
+_FUNCTIONS = frozenset({ast.FunctionDef, ast.AsyncFunctionDef})
+_ASSIGNMENTS = frozenset({ast.Assign, ast.AugAssign})
+#: Nodes with no call inside and no binding: a name, a constant, an expression context.
+_LEAVES = frozenset({ast.Name, ast.Constant, ast.Load, ast.Store, ast.Del})
 _FACADE_STRING = re.compile(r"""^kiro_crew\.dashboard\.server\.(\w+)$""")
 
 #: The patches whose attribute the scan cannot resolve from the source, keyed by
@@ -917,21 +929,22 @@ _RESOLVED_DYNAMIC_PATCHES: dict[tuple[str, str], frozenset[str]] = {
 def _facade_aliases(tree: ast.Module) -> set[str]:
     """Every expression spelling a test module binds to the server, to a fixed point."""
     aliases = {_FACADE, f"sys.modules[{_FACADE!r}]", f'sys.modules["{_FACADE}"]'}
-    for node in ast.walk(tree):
+    assignments: list[tuple[ast.expr, ast.expr]] = []
+    # An import and an assignment are statements, so the walk reads statement bodies
+    # only and skips the expressions that make up most of a module.
+    for node in iter_statements(tree):
         if isinstance(node, ast.Import):
             aliases |= {a.asname for a in node.names if a.name == _FACADE and a.asname}
         elif isinstance(node, ast.ImportFrom) and node.module == "kiro_crew.dashboard":
             aliases |= {a.asname or a.name for a in node.names if a.name == "server"}
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1:
+            assignments.append((node.targets[0], node.value))
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            assignments.append((node.target, node.value))
     changed = True
     while changed:
         changed = False
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign) and len(node.targets) == 1:
-                target, value = node.targets[0], node.value
-            elif isinstance(node, ast.AnnAssign) and node.value is not None:
-                target, value = node.target, node.value
-            else:
-                continue
+        for target, value in assignments:
             if not isinstance(target, ast.Name) or target.id in aliases:
                 continue
             if ast.unparse(value) in aliases or _imports_the_facade(value):
@@ -991,16 +1004,16 @@ def _resolve_name(node: ast.AST, params: dict[str, set[str]]) -> set[str] | None
 def _facade_strings(tree: ast.Module, aliases: set[str]) -> set[str]:
     """Every name a test module binds to the server's dotted path, to a fixed point."""
     strings: set[str] = set()
+    assignments: list[tuple[ast.expr, ast.expr]] = []
+    for node in iter_statements(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            assignments.append((node.targets[0], node.value))
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            assignments.append((node.target, node.value))
     changed = True
     while changed:
         changed = False
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign) and len(node.targets) == 1:
-                target, value = node.targets[0], node.value
-            elif isinstance(node, ast.AnnAssign) and node.value is not None:
-                target, value = node.target, node.value
-            else:
-                continue
+        for target, value in assignments:
             if isinstance(target, ast.Name) and target.id not in strings:
                 if _string_text(value, strings, aliases) == _FACADE:
                     strings.add(target.id)
@@ -1055,89 +1068,145 @@ def _resolve_target(
     return None
 
 
+def _may_patch_the_facade(text: str) -> bool:
+    """Every spelling of a server patch names the server's dotted path or imports
+    ``server`` from the dashboard package, so a source with neither holds none."""
+    return "dashboard.server" in text or (
+        "kiro_crew.dashboard import" in text and re.search(r"\bserver\b", text) is not None
+    )
+
+
 def _patched_names_in(text: str) -> tuple[set[str], set[str]]:
     """``(names, dynamic)``: first-level names one test source rebinds on the server,
     and the enclosing functions of each patch whose name the scan cannot resolve --
     which fails the reach test closed unless it is a resolved one."""
-    # Every spelling below names the server's dotted path or imports ``server`` from
-    # the dashboard package, so a source with neither holds no server patch.
-    if "dashboard.server" not in text and not (
-        "kiro_crew.dashboard import" in text and re.search(r"\bserver\b", text)
-    ):
+    if not _may_patch_the_facade(text):
         return set(), set()
     tree = ast.parse(text)
     aliases = _facade_aliases(tree)
     strings = _facade_strings(tree, aliases)
     found: set[str] = set()
     dynamic: set[str] = set()
-    functions = [
-        n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-    ]
-    seen: set[int] = set()
-    scopes = [(tree, {}, "<module>")] + [
-        (fn, _parametrized_strings(fn), fn.name) for fn in functions
-    ]
-    for scope, params, label in reversed(scopes):
-        for node in ast.walk(scope):
-            if id(node) in seen:
-                continue
-            seen.add(id(node))
-            if isinstance(node, ast.Call):
-                func = ast.unparse(node.func)
-                kw = {k.arg: k.value for k in node.keywords if k.arg}
-                target = node.args[0] if node.args else kw.get("target")
-                if target is not None and (
-                    ast.unparse(target) in aliases or _imports_the_facade(target)
-                ):
-                    if func.endswith(_PATCH_CALLS):
-                        name = (
-                            node.args[1]
-                            if len(node.args) >= 2
-                            else kw.get("attribute", kw.get("name"))
-                        )
-                        resolved = _resolve_name(name, params) if name is not None else None
-                        if resolved is None:
-                            dynamic.add(label)
-                        else:
-                            found |= resolved
-                    elif func.endswith("patch.multiple"):
-                        if any(k.arg is None for k in node.keywords):
-                            dynamic.add(label)
-                        found |= {k for k in kw if k not in _MULTIPLE_OPTIONS}
-                elif target is not None and func.split(".")[-1] in ("patch", "setattr", "delattr"):
-                    resolved = _resolve_target(target, params, strings, aliases)
-                    if resolved is None:
-                        dynamic.add(label)
-                    else:
-                        found |= resolved
-            elif isinstance(node, (ast.Assign, ast.AugAssign)):
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-                for target in targets:
-                    if isinstance(target, ast.Attribute) and ast.unparse(target.value) in aliases:
-                        found.add(target.attr)
+
+    def read_call(node: ast.Call, params: dict[str, set[str]], label: str) -> None:
+        kw = {k.arg: k.value for k in node.keywords if k.arg}
+        target = node.args[0] if node.args else kw.get("target")
+        if target is None:
+            return
+        func = ast.unparse(node.func)
+        if ast.unparse(target) in aliases or _imports_the_facade(target):
+            if func.endswith(_PATCH_CALLS):
+                name = node.args[1] if len(node.args) >= 2 else kw.get("attribute", kw.get("name"))
+                resolved = _resolve_name(name, params) if name is not None else None
+                if resolved is None:
+                    dynamic.add(label)
+                else:
+                    found.update(resolved)
+            elif func.endswith("patch.multiple"):
+                if any(k.arg is None for k in node.keywords):
+                    dynamic.add(label)
+                found.update(k for k in kw if k not in _MULTIPLE_OPTIONS)
+        elif func.split(".")[-1] in ("patch", "setattr", "delattr"):
+            resolved = _resolve_target(target, params, strings, aliases)
+            if resolved is None:
+                dynamic.add(label)
+            else:
+                found.update(resolved)
+
+    def visit(node: ast.AST, params: dict[str, set[str]], label: str) -> None:
+        # One walk, carrying the innermost enclosing ``def`` -- whose parametrize
+        # strings resolve a patched name and whose name labels an unresolved one --
+        # down to each call, decorators and defaults included; a lambda opens no
+        # scope. Names, constants and expression contexts hold no call and no
+        # assignment and are not entered: they are most of a module's nodes, and
+        # this walk runs over every test file that could patch the facade.
+        kind = type(node)
+        if kind in _LEAVES:
+            return
+        if kind in _FUNCTIONS:
+            assert isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            params, label = _parametrized_strings(node), node.name
+        elif kind is ast.Call:
+            assert isinstance(node, ast.Call)
+            read_call(node, params, label)
+        elif kind in _ASSIGNMENTS:
+            assert isinstance(node, (ast.Assign, ast.AugAssign))
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Attribute) and ast.unparse(target.value) in aliases:
+                    found.add(target.attr)
+        for field in node._fields:
+            child = getattr(node, field, None)
+            if isinstance(child, ast.AST):
+                visit(child, params, label)
+            elif isinstance(child, list):
+                for item in child:
+                    if isinstance(item, ast.AST):
+                        visit(item, params, label)
+
+    visit(tree, {}, "<module>")
     found |= set(re.findall(r"""["']kiro_crew\.dashboard\.server\.(\w+)["']""", text))
     return found, dynamic
 
 
-def _facade_patched_names() -> set[str]:
+#: How many parts the patch census is read in. The per-test timeout bounds ONE test,
+#: and the whole census -- every test file that could patch the server parsed and
+#: walked, under coverage, on a shared runner -- is more than one test's budget. Each
+#: part is one test of the capture check, so the budget bounds a quarter of the test
+#: tree; the parts hold about the same amount of source, and the sum of the work does
+#: not change.
+CENSUS_PARTS = 4
+
+
+@functools.lru_cache(maxsize=1)
+def _census_parts() -> tuple[tuple[Path, ...], ...]:
+    """The test files the census parses -- under ``test/`` and each ``src/**/tests``,
+    this file excepted, whose text could spell a server patch -- dealt into
+    ``CENSUS_PARTS`` parts of about equal source size: each file, largest first, joins
+    the lightest part so far. Only the paths are kept; the text is read again by the
+    part that parses it."""
     root = repo_root()
     here = Path(__file__).resolve()
-    found: set[str] = set()
-    unresolved = []
+    sizes: list[tuple[int, Path]] = []
     for path in repo_files_named(".py"):
         parts = path.relative_to(root).parts
         in_tests = parts[0] == "test" or (parts[0] == "src" and "tests" in parts)
         if in_tests and path.resolve() != here:
-            names, dynamic = _patched_names_in(path.read_text(encoding="utf-8", errors="replace"))
-            found |= names
-            for label in dynamic:
-                key = (path.name, label)
-                if key in _RESOLVED_DYNAMIC_PATCHES:
-                    found |= _RESOLVED_DYNAMIC_PATCHES[key]
-                else:
-                    unresolved.append(key)
+            text = path.read_text(encoding="utf-8", errors="replace")
+            if _may_patch_the_facade(text):
+                sizes.append((len(text), path))
+    dealt: list[list[Path]] = [[] for _ in range(CENSUS_PARTS)]
+    loads = [0] * CENSUS_PARTS
+    for size, path in sorted(sizes, key=lambda item: (-item[0], item[1])):
+        lightest = loads.index(min(loads))
+        dealt[lightest].append(path)
+        loads[lightest] += size
+    return tuple(tuple(sorted(part)) for part in dealt)
+
+
+@functools.lru_cache(maxsize=CENSUS_PARTS)
+def _census_part(index: int) -> frozenset[str]:
+    """The first-level names the tests of census part *index* rebind on the server, each
+    unresolvable patch replaced by its listed resolution."""
+    found: set[str] = set()
+    unresolved = []
+    for path in _census_parts()[index]:
+        names, dynamic = _patched_names_in(path.read_text(encoding="utf-8", errors="replace"))
+        found |= names
+        for label in dynamic:
+            key = (path.name, label)
+            if key in _RESOLVED_DYNAMIC_PATCHES:
+                found |= _RESOLVED_DYNAMIC_PATCHES[key]
+            else:
+                unresolved.append(key)
     assert unresolved == [], "a test patches a server name the scan cannot resolve"
-    return found
+    return frozenset(found)
+
+
+def _facade_patched_names() -> set[str]:
+    """Every first-level name the test trees rebind on the server: the union of the
+    census parts, each read on its first use."""
+    return set().union(*(_census_part(index) for index in range(CENSUS_PARTS)))
 
 
 def _captured_names(source: str) -> set[str]:
@@ -1273,11 +1342,23 @@ def test_the_capture_scan_flags_what_an_owner_evaluates_when_it_loads() -> None:
     assert {"logger", "sel"} & captured == set()
 
 
-def test_no_owner_captures_a_name_tests_rebind_on_the_facade() -> None:
+@pytest.mark.parametrize("part", range(CENSUS_PARTS))
+def test_no_owner_captures_a_name_tests_rebind_on_the_facade(part: int) -> None:
     """An owner that imported, defaulted or evaluated a rebound name when it loaded
     would keep that object, and a patch of the server would silently stop applying
-    there. An owner may DEFINE one: the server's binding of it is the composed copy,
-    and every caller reads it through the server's globals."""
+    there. One census part per test keeps each test's work a bounded share of the test
+    tree: a captured name is visible in the part that holds the test rebinding it."""
+    patched = _census_part(part)
+    for stem, source in _owner_sources().items():
+        assert _captured_names(source) & patched == set(), stem
+
+
+def test_the_whole_census_holds_the_known_rebinds_and_an_owner_s_definitions() -> None:
+    """The whole census, read from the parts' caches: it saw the rebinds this suite is
+    known to make, and enough of them to have measured anything. An owner may DEFINE a
+    rebound name: the server's binding of it is the composed copy, and every caller
+    reads it through the server's globals. In file order this test follows the per-part
+    checks and reads their cached parts."""
     patched = _facade_patched_names()
     assert {
         "sel",
@@ -1296,8 +1377,7 @@ def test_no_owner_captures_a_name_tests_rebind_on_the_facade() -> None:
         "start_enabled_app_backends",
     } <= patched
     assert len(patched) >= 50
-    for stem, source in _owner_sources().items():
-        assert _captured_names(source) & patched == set(), stem
+    for stem in _owner_sources():
         defined = {name for name in vars(_owner(stem)) if name in patched}
         assert all(getattr(server, name) is vars(_owner(stem))[name] for name in defined), stem
 
@@ -1409,7 +1489,7 @@ _DASHBOARD_BOOT = tuple("""
     _register_mcp_routes _deferred _deferred setup_spawn_resume_routes
     _deferred_work_ledger _deferred_work_ledger _deferred_work_ledger
     _deferred_work_ledger _deferred_work_ledger _deferred _deferred _deferred _deferred
-    _deferred _deferred _deferred
+    _deferred _deferred _deferred _deferred _deferred _deferred
     _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred
     _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred
     _deferred _deferred _deferred _deferred
@@ -1418,6 +1498,7 @@ _DASHBOARD_BOOT = tuple("""
     _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred
     _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred
     _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred
+    _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred
     register_all subprocess_executor subprocess_executor subprocess_executor
     subprocess_executor subprocess_executor subprocess_executor _register_deploy_routes
     setup_knowledge_routes setup_weixin_routes setup_feedback_routes
@@ -1443,6 +1524,7 @@ _DASHBOARD_BOOT = tuple("""
     _reconcile_listener_publication _kick_workflow_initialization
     _kick_connections_warm_scavenge _kick_session_search_index _kick_config_watch
     _kick_local_decision_model _kick_knowledge_orphan_reclaim _kick_owner_only_sweep
+    _kick_display_verdicts
     load_loop_stall_exit_after
     _arm_prevent_sleep_poll register_pre_exec_stop safety_override safety_override
     safety_override
@@ -1477,7 +1559,7 @@ _API_BOOT = tuple("""
     _register_mcp_routes _deferred _deferred setup_spawn_resume_routes
     _deferred_work_ledger _deferred_work_ledger _deferred_work_ledger
     _deferred_work_ledger _deferred_work_ledger _deferred _deferred _deferred _deferred
-    _deferred _deferred _deferred
+    _deferred _deferred _deferred _deferred _deferred _deferred
     _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred
     _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred
     _deferred _deferred _deferred _deferred
@@ -1486,6 +1568,7 @@ _API_BOOT = tuple("""
     _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred
     _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred
     _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred
+    _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred _deferred
     _register_deploy_routes _register_stt_hooks _register_own_host_warm
     _register_config_watch _register_prevent_sleep_shutdown
     _register_listener_guard_shutdown _register_browser_install_cleanup
@@ -1496,7 +1579,8 @@ _API_BOOT = tuple("""
     subprocess_executor _resolved_bound_host _resolved_bound_host _note_listener_sidecar
     _resolved_bound_host _reconcile_listener_publication _kick_workflow_initialization
     _kick_connections_warm_scavenge _kick_session_search_index _kick_config_watch
-    _kick_local_decision_model _kick_owner_only_sweep _arm_prevent_sleep_poll
+    _kick_local_decision_model _kick_owner_only_sweep _kick_display_verdicts
+    _arm_prevent_sleep_poll
     register_pre_exec_stop record_boot_to_ready _dispatch_healthy_boot_marker
     """.split())
 _API_TEARDOWN: tuple[str, ...] = ("_release_sleep_block",)
@@ -1699,8 +1783,8 @@ def _routes(app: web.Application) -> list[tuple[str, str, str]]:
 #: SHA-256 of the MCP route table's ``"<method> <path> <handler>"`` rows in
 #: registration order, and their count. The table is shared by both entrypoints, so a
 #: route added to it on purpose updates these with it.
-_MCP_TABLE_ROWS = 283
-_MCP_TABLE_DIGEST = "e46b1d1f39ae16e706b16cf5795764452e51debb26edbd9bea0f13886bdadfa1"
+_MCP_TABLE_ROWS = 300
+_MCP_TABLE_DIGEST = "c13bb64c3702d1494a989027bc16bbe2f21fabd992292022c78806e5aee6c9c2"
 
 
 def test_the_mcp_route_table_keeps_its_rows_and_order() -> None:
@@ -2323,12 +2407,14 @@ async def test_the_dashboard_inner_layers_serve_the_shell_and_audit_mutations(
     assert [c.kwargs for c in log.log_api_access.call_args_list] == [
         {
             "caller": "dashboard_user",
+            "forwarded": False,
             "operation": "POST /api/things",
             "outcome": "ok",
             "resources": "/api/things",
         },
         {
             "caller": "dashboard_user",
+            "forwarded": False,
             "operation": "DELETE /api/things",
             "outcome": "error",
             "resources": "/api/things",
@@ -2379,6 +2465,7 @@ async def test_the_headless_audit_records_every_api_method(
     assert [c.kwargs for c in log.log_api_access.call_args_list] == [
         {
             "caller": "mcp_tool",
+            "forwarded": False,
             "operation": "GET /api/spawn",
             "outcome": "error",
             "resources": "/api/spawn",

@@ -25,6 +25,7 @@ import pytest
 from kiro_crew import platform_compat, process_identity
 from kiro_crew.mcp_gateway import backend_record
 from kiro_crew.testing.ids import unallocatable_pids
+from kiro_crew.testing.wait import async_wait_until, finished
 
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="process groups are POSIX")
 
@@ -46,10 +47,10 @@ async def _session_leader_with_child(
     )
     spawned.append(proc)
     # Wait for the child so the group holds two processes before anything reads it.
-    for _ in range(200):
-        if len(platform_compat.process_descendants(proc.pid)) >= 1:
-            break
-        await asyncio.sleep(0.01)
+    await async_wait_until(
+        lambda: len(platform_compat.process_descendants(proc.pid)) >= 1,
+        off_loop=True,
+    )
     return proc
 
 
@@ -68,14 +69,27 @@ async def _spawned() -> AsyncIterator[list[asyncio.subprocess.Process]]:
 
 
 async def _group_gone(pgid: int, timeout: float = 10.0) -> bool:
-    deadline = asyncio.get_running_loop().time() + timeout
-    while asyncio.get_running_loop().time() < deadline:
+    """True once no process, zombie included, is left in group *pgid*.
+
+    A killed leader is this test's own child and stays a zombie until asyncio's
+    child watcher collects it. macOS answers signal 0 to a group holding only
+    zombies with EPERM rather than ESRCH, so EPERM means "not gone yet" and
+    only ESRCH proves the group is empty."""
+
+    def _check() -> bool:
         try:
             os.killpg(pgid, 0)
         except ProcessLookupError:
             return True
-        await asyncio.sleep(0.05)
-    return False
+        except PermissionError:
+            return False
+        return False
+
+    try:
+        await async_wait_until(_check, timeout=timeout, off_loop=True)
+        return True
+    except AssertionError:
+        return False
 
 
 _CLEANUP_WAIT_SECS = 10.0
@@ -92,7 +106,7 @@ async def _cleanup(proc: asyncio.subprocess.Process) -> None:
     except (ProcessLookupError, PermissionError):
         pass
     if proc.returncode is None:
-        await asyncio.wait_for(proc.wait(), timeout=_CLEANUP_WAIT_SECS)
+        await finished(proc.wait(), "process wait")
 
 
 # ── format ───────────────────────────────────────────────────────────────
@@ -228,6 +242,29 @@ async def test_reap_kills_a_real_term_ignoring_group_and_spares_a_recycled_one(
         assert stranger.returncode is None
 
 
+@posix_only
+@pytest.mark.asyncio
+async def test_group_gone_polls_past_the_eperm_macos_gives_a_zombie_only_group() -> None:
+    """macOS answers signal 0 to a group whose members are all zombies with EPERM.
+    The helper must keep polling through it and still demand ESRCH."""
+    real_killpg = os.killpg
+    probes: list[int] = []
+
+    def killpg(pgid: int, sig: int) -> None:
+        if sig == 0:
+            probes.append(pgid)
+            if len(probes) <= 3:
+                raise PermissionError(1, "Operation not permitted")
+        real_killpg(pgid, sig)
+
+    async with _spawned() as spawned:
+        leader = await _session_leader_with_child(spawned)
+        real_killpg(leader.pid, signal.SIGKILL)
+        with patch.object(os, "killpg", killpg):
+            assert await _group_gone(leader.pid)
+        assert len(probes) > 3, "the EPERM answers were polled past, not skipped"
+
+
 # ── who reaps ────────────────────────────────────────────────────────────
 
 
@@ -299,11 +336,12 @@ async def test_a_new_daemon_reaps_the_record_a_crashed_one_left(
             start_new_session=True,
         )
         spawned.append(daemon)
-        deadline = asyncio.get_running_loop().time() + 60
-        while not await asyncio.to_thread(transport.endpoint_exists, sock):
+
+        async def _sock_bound() -> bool:
             assert daemon.returncode is None, "daemon exited before binding"
-            assert asyncio.get_running_loop().time() < deadline, "daemon never bound"
-            await asyncio.sleep(0.05)
+            return await asyncio.to_thread(transport.endpoint_exists, sock)
+
+        await async_wait_until(_sock_bound)
         assert await _group_gone(
             orphan.pid
         ), "the crashed generation's backend survived the new daemon's boot"
@@ -443,11 +481,12 @@ async def test_a_slow_boot_reap_does_not_delay_the_bind(
         )
         try:
             await asyncio.wait_for(started.wait(), timeout=30)
-            deadline = asyncio.get_running_loop().time() + 30
-            while not await asyncio.to_thread(transport.endpoint_exists, sock):
+
+            async def _sock_bound() -> bool:
                 assert not daemon.done(), "daemon exited before binding"
-                assert asyncio.get_running_loop().time() < deadline, "the reap held up the bind"
-                await asyncio.sleep(0.05)
+                return await asyncio.to_thread(transport.endpoint_exists, sock)
+
+            await async_wait_until(_sock_bound)
         finally:
             stop.set()
             await asyncio.wait_for(daemon, timeout=60)

@@ -145,12 +145,18 @@ def _pin_default_config(monkeypatch) -> None:
     runner installed that wheel, and on POSIX an absent one is a hard issue: the
     tests asserting ``_doctor()`` does not exit would then report the host rather
     than the behaviour they name. The STT arms pin it back on for themselves.
+
+    The harness is pinned to kiro-cli: a fresh config defaults to KAS, whose
+    engine check needs a kiro-cli with ``--agent-engine`` that the stubbed
+    ``kiro-cli 1.0.0`` does not report.
     """
+    from kiro_crew.agent_sdk.backends import ACP_BACKEND_KIRO
     from kiro_crew.config.loader import KiroCrewConfig
 
     def _pristine() -> KiroCrewConfig:
         cfg = KiroCrewConfig()
         cfg.stt.enabled = False
+        cfg.agent.acp_backend = ACP_BACKEND_KIRO
         return cfg
 
     monkeypatch.setattr(KiroCrewConfig, "load", classmethod(lambda cls: _pristine()))
@@ -245,10 +251,14 @@ class TestDoctor:
         The autouse ``_hermetic_config`` fixture pins STT OFF so unrelated doctor
         tests never reach this section, so any test that wants it has to ask.
         """
+        from kiro_crew.agent_sdk.backends import ACP_BACKEND_KIRO
         from kiro_crew.config.loader import KiroCrewConfig
 
         def _cfg() -> KiroCrewConfig:
             cfg = KiroCrewConfig()
+            # kiro-cli, like ``_pin_default_config``: the KAS engine row is not
+            # the subject here.
+            cfg.agent.acp_backend = ACP_BACKEND_KIRO
             cfg.stt.enabled = True
             for name, value in fields.items():
                 setattr(cfg.stt, name, value)
@@ -4228,6 +4238,55 @@ class TestRestartReadinessVerdict:
         # No point chasing a token for a gateway that is not there.
         mock_token_url.assert_not_called()
 
+    def test_replacement_that_dies_relays_only_its_own_log_lines(self, tmp_path, capsys):
+        """The died-immediately report quotes what the replacement wrote, not older lines.
+
+        The replacement rotates the old, longer gateway.log to .prev at boot and logs its
+        refusal into a fresh file, so the relay has to follow the rotation.
+        """
+        from kiro_crew import cli_server
+
+        log = tmp_path / "gateway.log"
+        log.write_text("ERROR old gateway line from yesterday\n" * 50, encoding="utf-8")
+        real_mark = cli_server._gateway_log_mark
+
+        def mark_then_boot():
+            mark = real_mark()
+            log.replace(log.with_suffix(".log.prev"))
+            log.write_text(
+                "ERROR Refusing to start: persistence preflight failed\nfix: free disk space\n",
+                encoding="utf-8",
+            )
+            return mark
+
+        with (
+            patch("kiro_crew.cli_server.config_dir", return_value=tmp_path),
+            patch("kiro_crew.cli_server._gateway_log_mark", side_effect=mark_then_boot),
+        ):
+            code, _sel, _url = self._drive(poll=1, ready_status=0, marker_pid=[None, None])
+
+        assert code == 1
+        out = capsys.readouterr().out
+        assert "Its last lines in gateway.log:" in out
+        assert "Refusing to start: persistence preflight failed" in out
+        assert "fix: free disk space" in out
+        assert "old gateway line" not in out
+
+    def test_replacement_that_never_becomes_ready_relays_no_log_lines(self, tmp_path, capsys):
+        """A still-running replacement is not dead, so its log is not quoted as the cause."""
+        (tmp_path / "gateway.log").write_text("INFO still booting\n", encoding="utf-8")
+
+        with (
+            patch("kiro_crew.cli_server.config_dir", return_value=tmp_path),
+            patch("kiro_crew.cli_server._gateway_log_mark", return_value=(None, None, 0)),
+        ):
+            code, _sel, _url = self._drive(poll=None, ready_status=503, marker_pid=[None, None])
+
+        assert code == 1
+        out = capsys.readouterr().out
+        assert "did not become ready" in out
+        assert "still booting" not in out
+
     def test_replacement_that_never_becomes_ready_is_reported_as_a_failure(self, capsys):
         """A live-but-not-serving replacement must exit non-zero with timeout wording."""
         code, mock_sel, mock_token_url = self._drive(
@@ -5578,10 +5637,14 @@ class TestDoctorStt:
         Applied last, so a test that wants the off arm asks for it explicitly
         (``enabled=False``) rather than relying on what the autouse pin left behind.
         """
+        from kiro_crew.agent_sdk.backends import ACP_BACKEND_KIRO
         from kiro_crew.config.loader import KiroCrewConfig
 
         def _cfg() -> KiroCrewConfig:
             cfg = KiroCrewConfig()
+            # kiro-cli, like ``_pin_default_config``: the KAS engine row is not
+            # the subject here.
+            cfg.agent.acp_backend = ACP_BACKEND_KIRO
             cfg.stt.enabled = True
             for name, value in fields.items():
                 setattr(cfg.stt, name, value)
@@ -6095,7 +6158,8 @@ class TestConfigDirOverride:
         any lockdown applied only AFTER the tokens are on disk leaves them
         readable through the directory's inherited DACL in the failure window.
         The lockdown therefore lands on the temp file, before any token byte
-        reaches it."""
+        reaches it, and that temp sits in the masked staging directory rather
+        than beside .env."""
         import os as os_mod
 
         import kiro_crew.cli_setup as cs
@@ -6118,11 +6182,12 @@ class TestConfigDirOverride:
 
         monkeypatch.setattr(pc, "restrict_to_owner", _spy)
         cs._setup_slack_tokens()
-        # Locked exactly once, on a file in the credential dir, while it was
-        # still empty of tokens.
-        assert seen == [(tmp_path, False)]
+        # Locked exactly once, on a file in the masked staging directory, while
+        # it was still empty of tokens.
+        assert seen == [(tmp_path / "auth-store-staging", False)]
         assert "xoxb-test" in env_file.read_text(encoding="utf-8")
         assert not list(tmp_path.glob("*.tmp"))  # no temp residue
+        assert not list((tmp_path / "auth-store-staging").iterdir())
         if os_mod.name == "posix":
             assert env_file.stat().st_mode & 0o777 == 0o600
 
@@ -6406,6 +6471,60 @@ class TestSpawnCliAuth:
         out = capsys.readouterr().out
         assert "Error" in out
         assert "gateway not running" not in out
+
+    def _list_rows(self, monkeypatch, capsys, payload: dict) -> str:
+        """Run ``spawn list`` against a canned gateway answer and return stdout."""
+        monkeypatch.setattr("kiro_crew.cli_commands.read_local_secret", lambda _port, **_kw: "s")
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps(payload).encode()
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        monkeypatch.setattr(
+            "kiro_crew.cli_commands.loopback_urlopen", lambda _req, timeout=0: mock_resp
+        )
+
+        from kiro_crew.cli_commands import _spawn
+
+        _spawn(argparse.Namespace(spawn_action="list", port=5476))
+        return capsys.readouterr().out
+
+    def test_spawn_list_queued_row_prints_no_terminal_controls(self, monkeypatch, capsys):
+        """A queued spawn's id and task are agent-authored: no live escape, no forged row."""
+        esc = "\x1b"
+        out = self._list_rows(
+            monkeypatch,
+            capsys,
+            {
+                "agents": [],
+                "queued": [
+                    {
+                        "id": f"q{esc}[2Jid",
+                        "task": f"do it{esc}]0;pwned\x07\n  ✅ forged-row  done",
+                    }
+                ],
+            },
+        )
+        assert esc not in out
+        assert "\x07" not in out
+        assert len(out.strip().splitlines()) == 1
+        assert "forged-row" in out  # kept as visible text, on the SAME line
+
+    def test_spawn_list_running_row_prints_no_terminal_controls(self, monkeypatch, capsys):
+        """The running-agent rows share the queued rows' rule."""
+        esc = "\x1b"
+        out = self._list_rows(
+            monkeypatch,
+            capsys,
+            {
+                "agents": [
+                    {"id": f"a{esc}[31m1", "task": f"t{esc}[2K\r\n  ✅ forged  done", "done": False}
+                ],
+                "queued": [],
+            },
+        )
+        assert esc not in out
+        assert "\r" not in out
+        assert len(out.strip().splitlines()) == 1
 
 
 class TestArtifactCli:
@@ -7309,6 +7428,134 @@ class TestDoctorEmbeddings:
         out = capsys.readouterr().out
         assert "model url:   ❌ unreachable" in out
         assert "Check network connectivity" in out
+
+
+class TestGatewayLogRelay:
+    """``_gateway_log_lines_since``: what a failed restart quotes from gateway.log."""
+
+    @staticmethod
+    def _lines(tmp_path, content: bytes, offset):
+        """Relay *content* as if gateway.log measured *offset* bytes before the spawn."""
+        from kiro_crew import cli_server
+
+        log = tmp_path / "gateway.log"
+        log.write_bytes(content)
+        st = log.stat()
+        mark = None if offset is None else (st.st_dev, st.st_ino, offset)
+        with patch("kiro_crew.cli_server.config_dir", return_value=tmp_path):
+            return cli_server._gateway_log_lines_since(mark)
+
+    @staticmethod
+    def _rotate_and_relay(tmp_path, old: bytes, before_rotation: bytes, after: bytes):
+        """Mark a non-empty gateway.log, then do what a booting replacement does.
+
+        The replacement's inherited stdout appends *before_rotation* to the measured
+        file, ``cli._setup_cli_logging`` renames it to gateway.log.prev (the same
+        ``Path.replace`` it runs at boot), and *after* lands in a fresh gateway.log.
+        """
+        from kiro_crew import cli_server
+
+        log = tmp_path / "gateway.log"
+        log.write_bytes(old)
+        with patch("kiro_crew.cli_server.config_dir", return_value=tmp_path):
+            mark = cli_server._gateway_log_mark()
+            with open(log, "ab") as fh:
+                fh.write(before_rotation)
+            log.replace(log.with_suffix(".log.prev"))
+            log.write_bytes(after)
+            return cli_server._gateway_log_lines_since(mark)
+
+    def test_an_unknown_offset_relays_nothing(self, tmp_path):
+        assert self._lines(tmp_path, b"ERROR something\n", None) == []
+
+    def test_a_log_that_did_not_grow_relays_nothing(self, tmp_path):
+        assert self._lines(tmp_path, b"old\n", 4) == []
+
+    def test_a_missing_log_relays_nothing(self, tmp_path):
+        from kiro_crew import cli_server
+
+        with patch("kiro_crew.cli_server.config_dir", return_value=tmp_path):
+            mark = cli_server._gateway_log_mark()
+            assert mark == (None, None, 0)
+            assert cli_server._gateway_log_lines_since(mark) == []
+
+    def test_a_log_created_after_the_mark_is_relayed_whole(self, tmp_path):
+        from kiro_crew import cli_server
+
+        with patch("kiro_crew.cli_server.config_dir", return_value=tmp_path):
+            mark = cli_server._gateway_log_mark()
+            (tmp_path / "gateway.log").write_bytes(b"ERROR Refusing to start\n")
+            assert cli_server._gateway_log_lines_since(mark) == ["ERROR Refusing to start"]
+
+    def test_a_rotated_log_shorter_than_the_old_one_is_still_relayed(self, tmp_path):
+        """The boot rotation starts a fresh file, so the old size is no offset into it."""
+        old = b"INFO old gateway line\n" * 200
+        got = self._rotate_and_relay(
+            tmp_path, old, b"", b"ERROR Refusing to start: persistence preflight failed\n"
+        )
+        assert got == ["ERROR Refusing to start: persistence preflight failed"]
+
+    def test_a_rotated_log_longer_than_the_old_one_is_read_from_its_start(self, tmp_path):
+        old = b"INFO old\n"
+        after = b"INFO replacement booting\n" * 3 + b"ERROR no worker thread\n"
+        got = self._rotate_and_relay(tmp_path, old, b"", after)
+        assert got == ["INFO replacement booting"] * 3 + ["ERROR no worker thread"]
+
+    def test_output_written_before_the_rotation_is_relayed_from_prev(self, tmp_path):
+        got = self._rotate_and_relay(
+            tmp_path,
+            b"INFO old gateway line\n",
+            b"WARNING written before logging setup\n",
+            b"ERROR signing-key preflight timed out\n",
+        )
+        assert got == [
+            "WARNING written before logging setup",
+            "ERROR signing-key preflight timed out",
+        ]
+
+    def test_a_prev_file_from_an_earlier_boot_is_not_relayed(self, tmp_path):
+        """A gateway.log.prev that is not the measured file belongs to an older gateway."""
+        from kiro_crew import cli_server
+
+        log = tmp_path / "gateway.log"
+        (tmp_path / "gateway.log.prev").write_bytes(b"ERROR from last week\n")
+        log.write_bytes(b"INFO old\n")
+        with patch("kiro_crew.cli_server.config_dir", return_value=tmp_path):
+            mark = cli_server._gateway_log_mark()
+            # A size rollover renames the measured file away; it stays alive as .1, so
+            # its inode cannot be reused by the fresh gateway.log.
+            log.replace(tmp_path / "gateway.log.1")
+            log.write_bytes(b"ERROR Refusing to start\n")
+            assert cli_server._gateway_log_lines_since(mark) == ["ERROR Refusing to start"]
+
+    def test_only_the_last_lines_are_kept_and_blank_lines_dropped(self, tmp_path):
+        from kiro_crew import cli_server
+
+        body = "".join(f"line {i}\n\n" for i in range(50)).encode()
+        got = self._lines(tmp_path, body, 0)
+        assert len(got) == cli_server._RESTART_LOG_RELAY_LINES
+        assert got[-1] == "line 49"
+        assert got[0] == f"line {50 - cli_server._RESTART_LOG_RELAY_LINES}"
+
+    def test_terminal_control_sequences_are_stripped(self, tmp_path):
+        got = self._lines(tmp_path, b"\x1b]0;pwned\x07ERROR \x1b[31mred\x1b[0m\x9b\n", 0)
+        assert len(got) == 1
+        assert "\x1b" not in got[0] and "\x07" not in got[0]
+        assert "ERROR" in got[0] and "red" in got[0]
+
+    def test_a_line_cut_by_the_byte_cap_is_dropped(self, tmp_path):
+        from kiro_crew import cli_server
+
+        cap = cli_server._RESTART_LOG_RELAY_BYTES
+        body = b"x" * (cap + 10) + b"\nlast line\n"
+        got = self._lines(tmp_path, body, 0)
+        assert got == ["last line"]
+
+    def test_a_long_line_is_capped(self, tmp_path):
+        from kiro_crew import cli_server
+
+        got = self._lines(tmp_path, b"y" * 5000 + b"\n", 0)
+        assert got == ["y" * cli_server._RESTART_LOG_RELAY_LINE_CHARS]
 
 
 class TestResolveRestartReadyTimeout:
@@ -8378,7 +8625,14 @@ class TestBannerBranding:
         import kiro_crew.cli as cli_mod
         import kiro_crew.cli_chat as chat_mod
 
-        for mod in (cli_mod, chat_mod):
+        # cli.py, every module split out of it, and cli_chat.
+        split_out = [sys.modules[name] for name in cli_mod._OWNERS]
+        split_out += [
+            cli_mod.cli_parser_gateway,
+            cli_mod.cli_parser_agent,
+            cli_mod.cli_parser_admin,
+        ]
+        for mod in (cli_mod, *split_out, chat_mod):
             src = Path(mod.__file__).read_text(encoding="utf-8")
             assert "BANNER = r" not in src, f"{mod.__name__} re-inlined the banner literal"
 

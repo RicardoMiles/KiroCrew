@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeAll } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import AgentDropdownList, { DefaultAgentRow, ManageAgentsFooter , defaultWriteFailureOf } from '../components/AgentDropdownList'
 import type { AgentItem } from '../components/AgentDropdownList'
@@ -88,7 +88,7 @@ describe('AgentDropdownList namespaces (member vs template)', () => {
   it('groups by kind and keeps a same-name member and template as two rows', () => {
     render(<AgentDropdownList agents={both} activeAgent="" defaultAgent="" onSelect={() => {}} />)
     const groups = screen.getAllByRole('group')
-    expect(groups.map(g => g.getAttribute('aria-label'))).toEqual(['Crewmates', 'Custom agents'])
+    expect(groups.map(g => g.getAttribute('aria-label'))).toEqual(['Custom agents', 'Crewmates'])
     expect(screen.getAllByRole('option')).toHaveLength(3)
     expect(screen.getAllByText('reviewer')).toHaveLength(2)
   })
@@ -97,11 +97,11 @@ describe('AgentDropdownList namespaces (member vs template)', () => {
     // The header already says what each row IS; a grey "package" / "kirocrew"
     // tag beside it only asks the reader to decode a second vocabulary. The
     // templates group instead carries the one fact a first-time picker needs:
-    // a template uses the default workspace and shared memory, creating no crewmate.
+    // a custom agent is a reusable agent setup.
     render(<AgentDropdownList agents={both} activeAgent="" defaultAgent="" onSelect={() => {}} />)
     expect(screen.queryByText('package')).toBeNull()
     expect(screen.queryByText('kirocrew')).toBeNull()
-    expect(screen.getByText(/default workspace and shared memory/i)).toBeInTheDocument()
+    expect(screen.getByText(/a reusable agent setup/i)).toBeInTheDocument()
   })
 
   it('drops the header and the templates hint when the list holds one kind only', () => {
@@ -114,7 +114,7 @@ describe('AgentDropdownList namespaces (member vs template)', () => {
     render(<AgentDropdownList agents={templatesOnly} activeAgent="" defaultAgent="" onSelect={() => {}} />)
     expect(screen.getByRole('group', { name: 'Custom agents' })).toBeInTheDocument()
     expect(screen.queryByText('Custom agents')).toBeNull()
-    expect(screen.queryByText(/default workspace and shared memory/i)).toBeNull()
+    expect(screen.queryByText(/a reusable agent setup/i)).toBeNull()
     expect(screen.queryByText('package')).toBeNull()
     expect(screen.getAllByRole('option')).toHaveLength(2)
   })
@@ -127,11 +127,12 @@ describe('AgentDropdownList namespaces (member vs template)', () => {
   it('reports the kind with the name, so the caller can send the namespace', () => {
     const onSelect = vi.fn()
     render(<AgentDropdownList agents={both} activeAgent="" defaultAgent="" onSelect={onSelect} />)
+    // Templates lead the grouped list: [reviewer/template, test-writer, reviewer/member].
     const options = screen.getAllByRole('option')
     fireEvent.click(options[0])
-    fireEvent.click(options[1])
-    expect(onSelect).toHaveBeenNthCalledWith(1, 'reviewer', 'member')
-    expect(onSelect).toHaveBeenNthCalledWith(2, 'reviewer', 'template')
+    fireEvent.click(options[2])
+    expect(onSelect).toHaveBeenNthCalledWith(1, 'reviewer', 'template')
+    expect(onSelect).toHaveBeenNthCalledWith(2, 'reviewer', 'member')
   })
 
   it('draws the roster avatar on a crewmate row and none on a template row', () => {
@@ -140,14 +141,14 @@ describe('AgentDropdownList namespaces (member vs template)', () => {
     // member rows only, so a same-name pair is told apart at a glance.
     render(<AgentDropdownList agents={both} activeAgent="" defaultAgent="" onSelect={() => {}} />)
     const options = screen.getAllByRole('option')
-    expect(options[0].querySelector('img')).not.toBeNull()
-    expect(options[1].querySelector('img')).toBeNull()
+    expect(options[0].querySelector('img')).toBeNull()
+    expect(options[2].querySelector('img')).not.toBeNull()
   })
 
   it('lights up only the row in the slot\'s recorded namespace', () => {
     render(<AgentDropdownList agents={both} activeAgent="reviewer" activeKind="template" defaultAgent="" onSelect={() => {}} />)
     const selected = screen.getAllByRole('option').map(o => o.getAttribute('aria-selected'))
-    expect(selected).toEqual(['false', 'true', 'false'])
+    expect(selected).toEqual(['true', 'false', 'false'])
   })
 
   it('lights the member row when the slot recorded no namespace and a member holds the name', () => {
@@ -156,7 +157,7 @@ describe('AgentDropdownList namespaces (member vs template)', () => {
     // what actually runs; the same-name template must not read as current.
     render(<AgentDropdownList agents={both} activeAgent="reviewer" defaultAgent="" onSelect={() => {}} />)
     const selected = screen.getAllByRole('option').map(o => o.getAttribute('aria-selected'))
-    expect(selected).toEqual(['true', 'false', 'false'])
+    expect(selected).toEqual(['false', 'false', 'true'])
   })
 
   it('lights the template row when the slot recorded no namespace and no member holds the name', () => {
@@ -166,7 +167,7 @@ describe('AgentDropdownList namespaces (member vs template)', () => {
     ]
     render(<AgentDropdownList agents={templateOnly} activeAgent="planner" defaultAgent="" onSelect={() => {}} />)
     const selected = screen.getAllByRole('option').map(o => o.getAttribute('aria-selected'))
-    expect(selected).toEqual(['false', 'true'])
+    expect(selected).toEqual(['true', 'false'])
   })
 
   it('renders a flat list, with no group headers, for a name-only roster', () => {
@@ -183,13 +184,33 @@ describe('AgentDropdownList hosts own the scroll (#6375)', () => {
   // unbounded with no failing test.
   // vitest's cwd is website/ (the vitest config root), and import.meta.url is
   // not file-scheme under its transform, so resolve from cwd instead.
+  // ChatPane's picker menus live in its owner modules, so its host text is the
+  // facade joined with them.
+  const chatPaneSource = () => ['ChatPane.tsx',
+    'ChatPanePickerMenus.tsx',
+    'ChatPaneProps.ts',
+    'ChatPaneTranscript.tsx',
+    'useChatPaneDraft.ts',
+    'useChatPanePickers.ts',
+    'useChatPaneSend.ts',
+    'useChatPaneTurnControl.ts',
+    'useChatPaneUploads.ts',
+  ].map(f => readFileSync(join(process.cwd(), 'src', 'components', f), 'utf8')).join('\n')
+  const pages = join(process.cwd(), 'src', 'pages')
+  const ownerDir = join(pages, 'chat', 'page')
+  // ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings), so the ChatPage row reads the page and those owners.
+  const chatPageSource = () => [
+    readFileSync(join(pages, 'ChatPage.tsx'), 'utf8'),
+    ...readdirSync(ownerDir).filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f)).sort().map(f => readFileSync(join(ownerDir, f), 'utf8')),
+    ...readdirSync(pages).filter(f => /^useChatPage\w*\.ts$/.test(f)).sort().map(f => readFileSync(join(pages, f), 'utf8')),
+  ].join('\n')
   const hosts = [
-    ['ChatPage', join(process.cwd(), 'src', 'pages', 'ChatPage.tsx')],
-    ['ChatPane', join(process.cwd(), 'src', 'components', 'ChatPane.tsx')],
+    ['ChatPage', chatPageSource],
+    ['ChatPane', chatPaneSource],
   ] as const
 
-  it.each(hosts)('%s wraps the list in a scroll-owning listbox', (_name, file) => {
-    const src = readFileSync(file, 'utf8')
+  it.each(hosts)('%s wraps the list in a scroll-owning listbox', (_name, read) => {
+    const src = read()
     const sites = [...src.matchAll(/<AgentDropdownList[\s>]/g)]
     expect(sites.length).toBeGreaterThan(0)
     for (const site of sites) {

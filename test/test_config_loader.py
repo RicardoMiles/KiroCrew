@@ -2333,6 +2333,26 @@ class TestEdgeCases:
             cfg = _load_from_dict({"dashboard": {"folder_sort": junk}})
             assert cfg.dashboard.folder_sort == "custom", junk
 
+    def test_session_sort_loaded_from_config(self) -> None:
+        from kiro_crew.config.sections import SESSION_SORT_MODES
+
+        for key in SESSION_SORT_MODES:
+            cfg = _load_from_dict({"dashboard": {"session_sort": key}})
+            assert cfg.dashboard.session_sort == key
+
+    def test_session_sort_defaults_to_date_desc(self) -> None:
+        """Absent = latest activity first, the order the sidebar draws with no
+        stored choice, so an upgrade changes nothing the person sees."""
+        cfg = _load_from_dict({})
+        assert cfg.dashboard.session_sort == "date-desc"
+
+    def test_session_sort_unknown_value_reads_as_date_desc(self) -> None:
+        """A hand-edited or downgraded value falls back the same way the
+        sidebar's reader does."""
+        for junk in ("newest", "", None, 3, ["name-asc"], "Name-Asc"):
+            cfg = _load_from_dict({"dashboard": {"session_sort": junk}})
+            assert cfg.dashboard.session_sort == "date-desc", junk
+
     def test_update_nudge_loaded_from_config(self) -> None:
         """The popup's snooze/skip record round-trips through load, so a GET
         after a PATCH reads back what was written."""
@@ -3292,10 +3312,36 @@ class TestSttModelCatalog:
     def test_every_target_is_downloadable(self) -> None:
         assert set(_SUPERSEDED_STT_MODELS.values()) <= {m.name for m in stt_models.CATALOG}
 
-    def test_the_advertised_menu_is_the_catalog(self) -> None:
+    def test_the_advertised_menu_is_the_catalog_plus_the_custom_sentinel(self) -> None:
         """The enum the schema publishes drives the dashboard picker. Anything it
-        offers beyond the catalog is a model the downloader cannot fetch."""
-        assert set(loader_module._VALID_STT_MODELS) == {m.name for m in stt_models.CATALOG}
+        offers beyond the catalog is a model the downloader cannot fetch.
+
+        ``custom`` is the one exception and is asserted exactly rather than
+        excluded: it names no artifact, so what makes it loadable is the
+        ``custom_model_path`` / ``custom_model_sha256`` pair, and the loader
+        degrades it to the default when they are not both usable. Pinning the set
+        in both directions keeps a second sentinel from being added without a
+        load path behind it."""
+        assert set(loader_module._VALID_STT_MODELS) == {m.name for m in stt_models.CATALOG} | {
+            stt_models.CUSTOM_MODEL
+        }
+
+    def test_custom_is_accepted_only_with_a_usable_path_and_digest(self, caplog) -> None:
+        """The sentinel is a selection, not a model: without the pair there is
+        nothing to load and nothing to verify it against, so it must degrade the
+        way an unknown name does rather than reach a load."""
+        digest = "a" * 64
+        assert (
+            _validated_stt_model(
+                stt_models.CUSTOM_MODEL,
+                custom_path="ggml-x.bin",
+                custom_sha256=digest,
+            )
+            == stt_models.CUSTOM_MODEL
+        )
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.config.loader"):
+            assert _validated_stt_model(stt_models.CUSTOM_MODEL) == stt_models.DEFAULT_MODEL
+        assert stt_models.CUSTOM_MODEL in caplog.text
 
     def test_an_unknown_name_degrades_to_the_default(self, caplog) -> None:
         with caplog.at_level(logging.WARNING, logger="kiro_crew.stt.models"):
@@ -6057,7 +6103,7 @@ class TestAppAgentDispatch(unittest.TestCase):
         # memory. The roster's default crewmate may carry a private store of its own;
         # that store is reached only by the crewmate (its DM thread, or an
         # explicit pick), never inherited by a session that picked nobody. The
-        # doctor line beside the binding (test_cli_doctor) says so.
+        # doctor line beside the binding (test_cli_doctor_config_sections) says so.
         import kiro_crew.config.loader as loader
         from kiro_crew.config.loader import KiroCrewAgentConfig
 

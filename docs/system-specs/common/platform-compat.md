@@ -51,6 +51,7 @@ produces exactly those silent failures, which is why the helper is named per cal
 | Parent PID | `get_ppid(pid)` (Linux: `PPid:` through `read_proc_status_int`), or `parent_pid(pid)` from `read_proc_stat` where `None` must mean unknown | a text read of `/proc/<pid>/status` (its `Name:` line is the raw comm) / libproc |
 | Fields of `/proc/<pid>/stat` (parent, group, session, state, start ticks, RSS pages, CPU ticks) and `status` | `read_proc_stat(pid, proc_root=)` -> `ProcStat`, the reader new code uses: ONE bytes read, `comm` never decoded (any process may set it to arbitrary bytes through `prctl(PR_SET_NAME)`, and the kernel cuts a multibyte name at 15 bytes mid-character); `None` when the file is unreadable or the line has no `)`, otherwise each field is `None` on its own when its token is missing or not a number, and `ProcStat()` is the all-unknown reading. `cpu_ticks` is utime plus stime, so a caller differencing two reads takes the rate and the identity check (`start_ticks`) from one read. `process_age_secs(start_ticks, now=)` gives the age on the `boottime_now()` clock (`now` for a fixture's own `uptime`). `read_proc_status_int(pid, label)` reads one `status` number (`PPid`, `Threads`, `VmRSS`) from bytes. `linux_pgroup_members(pgid)` is a group's running members with each one's start ticks from the same read; `proc_child_map()` the whole host's parent edges. `_process_group_supervisor.py` runs as `python -I -c` and must stay stdlib-only, so it carries its own minimal bytes parse. `comm` is read as bytes and decoded with `surrogateescape` or `replace` (`linux_process_name`, the terminal title), and a `status` read that needs more than one number decodes with `errors="replace"`. `test/test_proc_bytes_reads_gate.py` rejects a strict text read of `stat`, `status` or `comm` in `src/kiro_crew` wherever it can follow the path (a literal, a join, or a name bound in the function, an enclosing one or the module; not a leaf passed in as an argument) | `read_text` on the stat or status file (a comm that is not UTF-8 raises `UnicodeDecodeError`, which an `except OSError` does not catch and an `except ValueError` reads as "gone"; a strict ASCII decode fails on any non-ASCII name); splitting before the LAST `)`; one read per field (a recycled pid can answer the second) |
 | Session process identity | `get_process_start_id(pid)`; Windows uses query-only creation FILETIME, Linux start ticks, macOS libproc microseconds with a `sysctl KERN_PROC_PID` fallback for a zombie (libproc refuses one; the kernel's zombie list still carries the same `p_start` instant) | caller-supplied PID or a bare PID without its creation identity |
+| Reboot-unique process identity | `process_incarnation_id(pid)`; Linux start ticks plus boot UUID, macOS libproc microseconds, Windows creation FILETIME; `None` when unavailable. `own_process_start_time()` caches this for the caller's lifetime. | bare boot-relative start ticks for a record that survives reboot |
 | Listener-owner ancestry | `process_descendant_identities(pid, candidate_pids=...)` returns each PID, PPID, start token, and its `ATOMIC` or `LSTART` source. Rechecks use `process_start_id_for_source` and never fall across encodings; an unavailable capture source is inconclusive. Before the POSIX fallback filters stable rows, it derives the root subtree from the first `ps` snapshot and requires every one of those rows to be unchanged in the second; any missing, reparented, or re-identified subtree row returns `None`, while unrelated rows may churn. The shared tri-state process-start comparator accepts strictly later, excludes strictly earlier, and treats equal coarse or unparseable order as inconclusive. A discovered parent must keep the same identity across its child-list read. Every child named by that read must still have a readable identity and the same parent. A changed parent, vanished child, or reparented child makes the whole walk return `None` rather than a completed partial result. On Windows each candidate-to-root chain must also keep the same PIDs, creation IDs, and edges across two Toolhelp snapshots, while unrelated siblings may churn. `created_after` remains a numeric-only Boolean wrapper over that core for its pod and harness callers | requiring the whole process tree to remain unchanged, accepting a bare descendant PID, filtering unstable root-subtree rows into a completed partial result, comparing an `lstart` capture with atomic ticks or microtime, treating same-second fallback timestamps or a changed/vanished task as foreign, or maintaining a second comparison implementation |
 | macOS zombie state | `darwin_pid_is_zombie(pid)` (`True` / `False` / `None` unreadable; a pid the kernel does not list reads `True`); `darwin_kinfo_proc(pid)` for the record with its start id; `darwin_pgroup_members(pgid)` lists a process group with each member's zombie flag | `pid_exists` as an exit oracle (a zombie is alive to it); `pgroup_exists` as an empty-group oracle (a retained zombie leader keeps it true); `proc_pidinfo` on a zombie |
 | Zombie state, cross-platform | `pid_is_zombie(pid)` (`True` / `False` / `None`): Linux reads the state field of `/proc/<pid>/stat` after the last `)` (`Z`, or `X` for a process being torn down), macOS defers to `darwin_pid_is_zombie`, Windows and an unreadable pid answer `None` — the "is it still RUNNING" question a survivor check asks beside `pid_exists` (a signalled child sits in the zombie state until it is collected); never signals | `pid_exists` alone as a running-vs-exited oracle; reading the state before the first `)` (a comm may contain spaces and parentheses); treating `None` as "not a zombie" |
@@ -89,7 +90,7 @@ produces exactly those silent failures, which is why the helper is named per cal
 | Create a file or directory in the data home | `kiro_crew.owner_only_files`: `open(path, mode, opener=owner_only_opener)` or `write_text_owner_only` for a file, `prepare_owner_only_sqlite(db)` immediately before a write-capable SQLite `connect` (SQLite gives `-wal`/`-shm`/`-journal` the database file's own mode), `mkdirs_owner_only(path)` for a directory chain, `ensure_directory(path)` / `owner_only_opener_for(path)` / `write_text_owner_only_in_home(path, text)` where the target is usually in the data home but may be configured elsewhere (outside the home each behaves exactly like the plain call); `atomic_write` already defaults to `0o600` (and `0o700` for directories it creates) for a target inside the data home. The policy -- every file there `0600`, every directory `0700`, set at creation -- and the once-per-start sweep that repairs older trees (`tighten_data_home`, run on a worker thread once the dashboard listener serves, touching only the fixed store list `STARTUP_SWEEP_STORES`, never following links and skipping hard-linked files) are stated in that module's docstring. POSIX only; on Windows each helper keeps the previous behaviour and the data home's inheritable DACL applies | `open(path, "w")`, `Path.write_text`, `Path.mkdir(parents=True)` or `os.open(..., 0o644)` for a data-home path (the umask default, `0644`/`0755`, is readable by other local accounts); `chmod` after the write (a window in which the file is readable); `open` + `fchmod` + `close` to tighten an existing store file (closing any descriptor releases this process's POSIX record locks on it, which SQLite relies on; `prepare_owner_only_sqlite` and the sweep change the mode without opening the file); `os.umask(0o077)` (inherited by every child, so files agents write into the user's own repositories would come out `0600`) |
 | Read a state file that a writer replaces atomically (a store's JSON; a record a request, a gate or an install depends on) | `kiro_crew.atomic_write.read_bytes_with_retry(path)`, then decode and parse. A Windows sharing violation (`PermissionError`, `WinError 32`, while the writer's replace is in flight) is retried inside a bounded budget. An absent file and a damaged one are not retried and reach the reader's own handling, and a hold that outlasts the budget raises as before, so a gate or refusal that fails closed stays closed. The retry runs only off the event loop: a reader reached from a coroutine is offloaded with `asyncio.to_thread` | `path.read_text()` / `path.read_bytes()` (POSIX permits the overlapping read, so only the Windows matrix and Windows hosts ever fail) |
 | Is a path on a NETWORK volume | `path_volume_is_remote(path)` (Windows: the volume ROOT's drive type through `windows_acl.volume_is_remote`, so a UNC path and a mapped drive both read remote, at no SMB round trip; `None` off Windows, where the caller has a mount table — `taskq.store.detect_network_filesystem` is the caller) | reading a failed query, `DRIVE_UNKNOWN` or a non-Windows host as "local" (`windows_acl.volume_is_local` collapses unknown onto `False` on purpose; that is the trust answer, not this one) |
-| Confirm a Linux readonly filesystem | `is_readonly_filesystem(path)`; false for other platforms or probe failure. Used to reject a private-runtime diagnostic marker planted in the writable host home. | `os.statvfs` in a cross-platform consumer, or readonly file mode alone |
+| Confirm a Linux readonly filesystem | `is_readonly_filesystem(path)`; false for other platforms or probe failure. Used to reject a private-runtime diagnostic marker planted in the writable host home, and to send a memory store reader on a confirmed read-only mount straight to its read-only lock open (elsewhere the reader falls back on the refused write itself). | `os.statvfs` in a cross-platform consumer, or readonly file mode alone |
 | Directory link | `symlink_or_junction(target, link)` | `os.symlink` (`WinError 1314` without elevation) |
 | Detect/remove a dir link | `is_link_or_junction(path)` / `unlink_link_or_junction(path)` | `path.is_symlink()` (misses a Windows junction) |
 | Compare a resolved path against an unresolved one | `strip_extended_length_prefix(path)` on BOTH sides before comparing | comparing the two spellings as `Path.resolve` returns them (on Windows `ntpath.realpath` keeps the extended-length prefix when its prefix-strip re-check races a concurrent swap of the same file, so a prefixed child against an unprefixed parent reads as a path escape; the fold is LEXICAL and must not re-resolve, which would bless the redirect the caller is testing for) |
@@ -423,7 +424,7 @@ rejected newly opened handles are closed before returning the proven subset.
 This covers an **already observed, handle-pinned** chain. An intermediary that died
 before it was ever observed/pinned remains unverifiable; a single numeric snapshot
 is not enough to recover that chain. The deterministic and self-owned native
-regressions are in `test/test_platform_compat.py`, `TestProcessDescendants`.
+regressions are in `test/test_platform_compat_process_tree.py`, `TestProcessDescendants`.
 
 ## Windows session-tree teardown
 
@@ -610,7 +611,7 @@ handle that cannot be waited on while its exit code reads `STILL_ACTIVE`. So doe
 other error. Real-process regressions force both interleavings:
 `test/test_runtime_cleanup_windows.py::test_a_member_exiting_inside_the_terminate_window_reads_as_exited`
 and `test/test_runtime_cleanup_windows.py::test_a_member_refused_before_its_object_signals_reads_as_exited`;
-`test/test_platform_compat.py::TestTerminateRefusedOnAnExitingMember` pins each
+`test/test_platform_compat_windows_tree.py::TestTerminateRefusedOnAnExitingMember` pins each
 branch on a virtual clock. `pod._windows_job.retire_identity` meets the same refusal
 when it ends a pod publisher, and judges it by its own bounded retirement wait.
 
@@ -641,7 +642,7 @@ helper and its configuration are unchanged.
 The Task Scheduler backend uses these primitives with `pod._windows_run` durable
 run identities and publisher retirement. Job emptiness alone is not reclamation
 authority. Before attempting `/Run`, a failed start may cancel only its exact
-unclaimed reservation under the supervisor's claim lock. The durable `cancelled`
+unclaimed reservation under the claim lock. The durable `cancelled`
 state refuses admission and survives task/wrapper/result cleanup errors; the next
 `start` retries that cleanup before reserving a new generation. The claim lock
 covers cancellation through receipt deletion. Claimed, malformed or changed-run
@@ -649,6 +650,35 @@ records and unexpected HOME/PID/handoff evidence refuse rollback. A failed or
 raised `/Run` never grants cancellation, even if no publisher has claimed yet.
 If cancellation itself cannot be persisted, the ordinary reservation remains
 unresolved rather than being inferred safe on a later invocation.
+
+The scheduled `pod _run` producer claims its reservation as its first act,
+before the checkout, venv and dist checks, so the record (`preparing`) names it
+by pid plus creation time. A producer whose own claim is refused writes nothing.
+On every exit of a claimed boot the producer, not the task wrapper, writes
+`.winresult`; the wrapper writes no sidecar. A boot that refuses without
+spawning a gateway then publishes a `finished` receipt with its exit code,
+under the claim lock and only over its own unchanged `preparing` record. An
+escaped exception or an unproven Job drain withholds that receipt and leaves
+`preparing`. `finished` certifies that no gateway was spawned; it does not
+cover a descendant of a process started before any lifetime Job existed (the
+child-viability probe), the same residual the ready path accepts.
+
+`stop` retires an unspawned (`preparing` or `finished`) generation only after
+proving its producer gone. It opens the producer by pid and creation identity
+(a recycled pid reads as gone and is never signalled) and refuses to retire its
+own pid. A `preparing` producer is only waited for, never terminated: `stop`
+refuses at its deadline. A `finished` producer is given the whole stop budget
+through `wait_identity` to exit on its own, because the boot's failure audit is
+written after the receipt, and is terminated only if it outlives that budget.
+After the wait, `stop` re-reads the record and refuses unless the generation and
+publisher are unchanged and the state is still unspawned. Then `/End` stops any
+wrapper still unwinding. A supervised-pid record or handoff marker refuses, as
+does a HOME under a `preparing` producer; an evidence path that cannot be
+inspected counts as present. Only then is `retired` published, as a
+compare-and-swap under the claim lock. `finish` consumes `drained` or `retired`
+only once HOME is gone, so a HOME cleanup failure stays retryable. A `reserved`
+record nobody claimed, and a `preparing` record whose dead producer left a HOME,
+still need the manual retirement in `pod/README.md`.
 Native tests exercise owner-only access, descendant containment,
 nested resource jobs and breakaway refusal; injected failures run on all hosts.
 
@@ -670,7 +700,7 @@ pull request's CI wall clock, and the queue sat on the required check. So a
 POSIX-but-not-Linux regression is caught within a day and before any nightly bytes
 are published, rather than before merge. In front of a pull request there is
 `macos-on-demand.yml` (the same full suite, called against the PR head, advisory;
-runs on a darwin-sensitive path, on the `ci:macos` label, on a 1-in-20 SHA sample, or when an added
+runs on a darwin-sensitive path, on the `ci:macos` label, on a 1-in-50 SHA sample, or when an added
 `*.py`/`*.sh` line uses a Linux-only primitive such as `/proc/` or GNU `stat -c`; the path, sample and
 content switches are refused while the lane already holds `LANE_MAX_LIVE_RUNS` live runs of the hosted
 macOS pool (the ceiling moves with the shard count, so the value lives in the workflow), the

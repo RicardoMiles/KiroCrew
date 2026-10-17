@@ -11,8 +11,8 @@ charter routes an engineering note to `docs/`. The packaged index links across t
 it.
 
 Everything here is read from the current code, and citations name a file and a
-**symbol** (`src/kiro_crew/context.py` → `build_message`) rather than a line
-number, which rots. Where an older doc disagreed with the code, that doc was
+**symbol** (`src/kiro_crew/context_assembly/turn_message.py` → `build_message`)
+rather than a line number, which rots. Where an older doc disagreed with the code, that doc was
 corrected rather than annotated.
 
 Detail this file deliberately does not restate:
@@ -29,10 +29,11 @@ Detail this file deliberately does not restate:
 
 ## 1. Main chat session start
 
-One function assembles the whole first-turn prompt: `context.py` →
-`build_message` with `is_new_session=True`. It appends ~30 separately sourced
-strings and returns them joined. `context.py` → `build_session_context` builds the
-middle — the part wrapped in `[SESSION CONTEXT …]`, and the only part injected
+One function assembles the whole first-turn prompt: `ContextBuilder.build_message`
+(`context_assembly/turn_message.py`) with `is_new_session=True`. It appends ~30
+separately sourced strings and returns them joined.
+`ContextBuilder.build_session_context` (`context_assembly/session_start.py`) builds
+the middle — the part wrapped in `[SESSION CONTEXT …]`, and the only part injected
 once rather than per turn.
 
 ### Block order
@@ -157,7 +158,7 @@ one where it is defined:
 | Name | Constant |
 |---|---|
 | Standing-rule block at session start (window-independent) | `_LESSONS_STARTUP_CAP` |
-| Confined project skill bodies | `PROJECT_SKILL_BODY_CAP` in `skills.py` |
+| Confined project skill bodies | `PROJECT_SKILL_BODY_CAP` in `skills_body_reads.py` |
 | Episodic block on a new session | `_EPISODIC_INJECT_CAP` |
 | Memory activity index | the `cap` default of `activity_index` in `memory.py` |
 | Per-message truncation on the fallback path | `_PER_MESSAGE_CAP` |
@@ -247,7 +248,7 @@ word-overlap matching entirely; discovery then runs through the skill index,
 `skill_search` and the `$skillname` token. Set it positive to re-enable matching.
 The mechanism, when on:
 
-- `skills.py` → `get_triggered_skills` scores each visible skill's comma-separated
+- `skills_selection.py` → `get_triggered_skills` scores each visible skill's comma-separated
   `triggers` through `trigger_match.py` → `trigger_score`. A phrase's score is the
   fraction of *its* words present in the message; an entry's score is its best
   phrase; a `!`-prefixed phrase whose words all appear is a veto evaluated after
@@ -283,7 +284,7 @@ The mechanism, when on:
 
 #### Per-session body dedup
 
-`ContextBuilder._dedup_triggered_bodies` in `context.py` keeps, per provider
+`ContextBuilder._dedup_triggered_bodies` (`context_assembly/delivery_records.py`) keeps, per provider
 session, a digest-keyed record of which skill bodies the prompt carried. Both the
 session key and each skill key are stored as fixed-size digests, and both levels
 are LRU-bounded: `_SENT_SKILL_BODY_SESSIONS` (512) sessions and
@@ -383,7 +384,7 @@ spawn tools cannot drift:
 | `include_lessons` | learned corrections, user profile | false only when the child purely reads and reports |
 | `include_project` | `[PROJECT]`, `[DOCUMENTATION]`, steering | false when the work is outside the active project tree |
 
-`subagent.py` → `_context_groups_of` turns them into the `context_groups` set that
+`subagent_parts/run_record.py` → `_context_groups_of` turns them into the `context_groups` set that
 both `build_message` and the `state.json` record read, so a retried or continued
 run sees the scope its caller asked for. Anything withheld is named to the child
 in `[CONTEXT SCOPE]` — an unexplained gap makes a sub-agent invent user
@@ -523,9 +524,17 @@ Its name is not `kirocrew`, so `_skills_injection_plan` reads it as a custom age
 with no mapping — row 3 of the table. A dispatched worker therefore sees **no skill
 catalog, no `skill://` bodies and no trigger matching** (matching is gated on
 `not is_custom` for the same reason). A worker that needs a procedure must be told
-to read it — `skill_search` / `skill_fetch` still work, and the usual instruction
-names the SKILL.md path in the brief. Memory, lessons, critical rules and hooks are
+to read it: with an empty scope `skill_search` finds nothing and an exact read
+returns nothing either, so the instruction has to name the SKILL.md path in the
+brief. Memory, lessons, critical rules and hooks are
 unaffected: those are injected for every agent.
+
+The generated agents whose own prompt names a skill do not rely on a brief for it —
+each conductor, the team lead, the dashboard author and the dashboard manager carry
+a `skill://` entry for exactly the skills their prompt tells them to read
+(`agent_materialization/skill_resources.py`), which is row 4 of the table rather
+than row 3. The worker stays on row 3 on purpose: what it needs comes from the
+item it was dispatched for, not from its spec.
 
 ## 5. Crew mode (Crew page)
 
@@ -619,7 +628,7 @@ restored, possibly stale copy), `MINIMAL` (cron; none).
 
 ### Routing and dispatch
 
-`select_crew` (roster / bind) is answered by `mcp_core.py` → `_do_select_crew`,
+`select_crew` (roster / bind) is answered by `mcp_core_parts/crew.py` → `_do_select_crew`,
 and `route_crew` by its own `_do_route_crew` beside it. Routing scores the crews'
 free-text `triggers` through the same
 `trigger_match.py` primitive the skill matcher uses (`rank_triggered`), so the two
@@ -632,7 +641,7 @@ the dashboard session-control server per session
 (`members.member_dispatch_session_server`); the member caller is authorized
 automatically for sessions it created, bounded by `agent.member_dispatch`.
 
-**The inheritance rule that matters:** `dashboard/session_control.py` resolves a
+**The inheritance rule that matters:** `dashboard/session_control_parts/session_create.py` resolves a
 new session's agent as `agent.strip() or caller_slot.agent` — an omitted `agent`
 makes the child inherit the **caller's** agent, so a session created from a
 conductor is born a conductor, with no file-writing tools and unable to do the
@@ -671,24 +680,24 @@ per-member permission control; both exist today, in the forms above.
 
 | Question | Files |
 |---|---|
-| What is in the first-turn prompt, in what order | `src/kiro_crew/context.py` (`build_message`, `build_session_context`), composed from the owners in `src/kiro_crew/context_assembly/` |
+| What is in the first-turn prompt, in what order | `src/kiro_crew/context.py` (`ContextBuilder`), whose `build_message` and `build_session_context` live in `src/kiro_crew/context_assembly/turn_message.py` and `session_start.py`, composed from the other owners there |
 | Which block is which, and how big it was | `src/kiro_crew/context_blocks.py` (`_MARKERS`, `_CLOSERS`, `measure_prompt`) |
 | Budgets, caps, the protected ceiling | `src/kiro_crew/context_assembly/budget.py` (`_budget`, `_ResolvedCaps`, `admit_background`), `src/kiro_crew/context.py` (`_resolve_caps`) |
 | Marker and fence scrubs of untrusted text | `src/kiro_crew/context_assembly/markers.py`, `src/kiro_crew/context.py` (`_neutralize_structural_markers`) |
 | Replay and recall projection | `src/kiro_crew/context_assembly/replay.py`, `src/kiro_crew/context.py` (`build_session_replay`, `_recall_rows`) |
 | Memory block contents | `src/kiro_crew/memory.py` (`get_context`, `activity_index`, `get_activity_context`) |
-| Lessons | `src/kiro_crew/learn.py`, `src/kiro_crew/vector_memory.py` (`write_lesson`), `src/kiro_crew/vector_memory_runtime/lessons.py` (the lesson readers, ranking and tiered rendering) |
-| Skill index, pinned bodies, discovery | `src/kiro_crew/skill_runtime/delivery.py` (`get_context`), `src/kiro_crew/skills.py` (`load_skill`) |
-| Trigger matching, and its model-picked override | `src/kiro_crew/trigger_match.py`, `src/kiro_crew/skills.py` (`get_triggered_skills`), `src/kiro_crew/skill_runtime/delivery.py` (`split_triggered`, `trigger_hint`), `src/kiro_crew/decisions/points/skills_select.py` |
+| Lessons | `src/kiro_crew/learn.py`, `src/kiro_crew/vector_memory_runtime/lesson_write.py` (`write_lesson`), `src/kiro_crew/vector_memory_runtime/lessons.py` (the lesson readers, ranking and tiered rendering) |
+| Skill index, pinned bodies, discovery | `src/kiro_crew/skill_runtime/delivery.py` (`get_context`), `src/kiro_crew/skills_body_reads.py` (`load_skill`) |
+| Trigger matching, and its model-picked override | `src/kiro_crew/trigger_match.py`, `src/kiro_crew/skills_selection.py` (`get_triggered_skills`), `src/kiro_crew/skill_runtime/delivery.py` (`split_triggered`, `trigger_hint`), `src/kiro_crew/decisions/points/skills_select.py` |
 | Which agents get skills | `src/kiro_crew/context.py` (`_skills_injection_plan`), `src/kiro_crew/agent_discovery.py` (`agent_skill_globs`, `expand_skill_uri`) |
-| Steering and hooks | `src/kiro_crew/context.py` (`_load_steering_resources`, `steering_target_admissible`), `src/kiro_crew/hooks.py` |
+| Steering and hooks | `src/kiro_crew/context_assembly/agent_spec.py` (`_load_steering_resources`, `steering_target_admissible`), `src/kiro_crew/hooks.py` |
 | Post-compaction re-injection | `src/kiro_crew/messaging/turn_bracket.py` (`TurnBracket`, `consume_reinjection`, `rearm_reinjection`; re-exported by `messaging/dispatch.py`) |
 | Ledger snapshot on nudge turns | `src/kiro_crew/session_ledger.py` (`render_snapshot`), `src/kiro_crew/dashboard/handlers/autonudge.py` |
-| Sub-agent context scope | `src/kiro_crew/subagent.py` (`_context_groups_of`), `src/kiro_crew/mcp_tools/spawn.py` |
+| Sub-agent context scope | `src/kiro_crew/subagent_parts/run_record.py` (`_context_groups_of`), `src/kiro_crew/mcp_tools/spawn.py` |
 | Sub-agent prompt assembly, shared vs dedicated | `src/kiro_crew/subagent_manager/run.py` |
 | Scratch directories | `src/kiro_crew/agent_scratch.py` (`allocate_scratch`, `scratch_env`) |
 | The worker agent spec | `src/kiro_crew/agent_materialization/worker_agent.py` (`_write_worker_spec`) |
 | Member identity, rules, briefing, activity, V2 essentials | `src/kiro_crew/members.py`, `src/kiro_crew/context_assembly/member.py` (`build_member_section`, `build_v2_essentials`), `src/kiro_crew/member_essential_context.py` |
-| Crew records, routing, binding | `src/kiro_crew/config/loader.py`, `src/kiro_crew/mcp_core.py` |
+| Crew records, routing, binding | `src/kiro_crew/config/loader.py`, `src/kiro_crew/mcp_core_parts/crew.py` |
 | Per-member permissions | `src/kiro_crew/agent_capabilities.py`, `src/kiro_crew/agent_state.py` |
-| Session creation and agent inheritance | `src/kiro_crew/dashboard/session_control.py` |
+| Session creation and agent inheritance | `src/kiro_crew/dashboard/session_control_parts/session_create.py` |

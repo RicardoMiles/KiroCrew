@@ -56,7 +56,7 @@ vi.mock('../utils/composerSendHolds', () => ({
   registerComposerUpload: vi.fn(),
   releaseComposerSend: vi.fn(),
   unregisterComposerUpload: vi.fn(),
-  useComposerUploadCancellable: () => false,
+  useComposerUploadCount: () => 0,
 }))
 
 import { useChatPageResourcesController } from '../pages/chat/useChatPageResourcesController'
@@ -65,8 +65,9 @@ function wrapper({ children }: QueryClientProviderProps) {
   return <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>{children}</QueryClientProvider>
 }
 
-function useSlotlessController() {
-  const activeSlotRef = useRef<string | null>(null)
+function useSlotlessController(slot: string | null = null, locked = false) {
+  const activeSlotRef = useRef<string | null>(slot)
+  const composerLockedRef = useRef(locked)
   const inputRef = useRef('')
   const drafts = useRef<Record<string, string>>({})
   const currentProjectRef = useRef<string | undefined>(undefined)
@@ -75,7 +76,7 @@ function useSlotlessController() {
   const snipSlotRef = useRef<string | null>(null)
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return useChatPageResourcesController({
-    activeSlot: null,
+    activeSlot: slot,
     activeSlotRef,
     messages: [],
     slotLoading: false,
@@ -90,6 +91,7 @@ function useSlotlessController() {
       voiceCaretRef,
       voicePendingCaretRef,
       saveDrafts: vi.fn(),
+      composerLockedRef,
     },
     capture: {
       setUploading: vi.fn() as Dispatch<SetStateAction<boolean>>,
@@ -129,5 +131,45 @@ describe('slotless capture entry points', () => {
     expect(captureSeam.captureScreen).not.toHaveBeenCalled()
     expect(captureSeam.screenshot).not.toHaveBeenCalled()
     expect(captureSeam.hold).not.toHaveBeenCalled()
+  })
+})
+
+describe('capture entry points while a memory-mode switch locks the composer', () => {
+  // A capture finishing after the switch hands uploads over would land in the
+  // slot being deleted and vanish, so a locked composer starts none.
+  beforeEach(() => {
+    vi.clearAllMocks()
+    captureSeam.screenshot.mockResolvedValue({ path: '/shots/should-not-exist.png' })
+    captureSeam.captureScreen.mockResolvedValue(null)
+  })
+
+  it.each([false, true])('the attach-menu capture starts nothing (snip supported: %s)', async (supported) => {
+    captureSeam.supported = supported
+    const { result } = renderHook(() => useSlotlessController('slot-a', true), { wrapper })
+
+    await act(async () => { await result.current.handleCapture() })
+
+    expect(captureSeam.screenshot).not.toHaveBeenCalled()
+    expect(captureSeam.captureScreen).not.toHaveBeenCalled()
+    expect(captureSeam.hold).not.toHaveBeenCalled()
+  })
+
+  it('the preview snip starts nothing', async () => {
+    captureSeam.supported = true
+    renderHook(() => useSlotlessController('slot-a', true), { wrapper })
+
+    await act(async () => { window.dispatchEvent(new Event('kirocrew-web-preview-snip')) })
+
+    expect(captureSeam.captureScreen).not.toHaveBeenCalled()
+    expect(captureSeam.hold).not.toHaveBeenCalled()
+  })
+
+  it('an unlocked composer with a slot does start the capture', async () => {
+    captureSeam.supported = true
+    const { result } = renderHook(() => useSlotlessController('slot-a', false), { wrapper })
+
+    await act(async () => { await result.current.handleCapture() })
+
+    expect(captureSeam.captureScreen).toHaveBeenCalled()
   })
 })

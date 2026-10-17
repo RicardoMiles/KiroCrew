@@ -41,6 +41,14 @@ export interface MemberRosterRow {
   memory_version?: number
   memory_owner?: string
   model?: string
+  /** The crewmate's own effort pin; '' inherits. */
+  reasoning_effort?: string
+  /** What the sessions this crewmate opens through `session_create` run on
+   *  when the call names no model: '' = the crewmate's own model, 'auto' = the
+   *  backend default (a real pin here), else a listed model. */
+  worker_model?: string
+  /** Same for the reasoning effort; '' = the crewmate's own level. */
+  worker_reasoning_effort?: string
   /** Optional presentation label shown in place of `name`. `name` stays the
    *  identity every per-member route and binding is keyed on. */
   display_name?: string
@@ -97,6 +105,74 @@ export interface MemberRecap {
   recent: { title: string; ts: number }[]
 }
 
+/** One key result: how the crewmate will know its goal is reached. */
+export interface GoalKeyResult {
+  id: string
+  text: string
+  /** A number ("27", "80%") or a word ("yes"). */
+  target: string
+  /** The crewmate's latest reading, free text (a number or a short note); '' until it first reads it. */
+  current: string
+  /** Epoch seconds of the latest reading; 0 when never read. */
+  updated_at: number
+  /** Every reading of the last 90 days, oldest first. */
+  readings?: { value: string; at: number }[]
+  /** The ids of the goals this milestone serves (none, one or several). */
+  goal_ids: string[]
+}
+
+/** One of the crewmate's goals. `number` is its 1-based place in the list. */
+export interface MemberGoal {
+  id: string
+  number: number
+  text: string
+  created_at: number | null
+  updated_at: number | null
+  updated_by: 'user' | 'crewmate' | null
+}
+
+/** The check-in switches and their shared timing. weekday: 0 = Sunday. */
+export interface GoalSchedules {
+  time: string
+  timezone: string
+  daily: boolean
+  weekly: boolean
+  weekday: number
+  monthly: boolean
+  month_day: number
+}
+
+/** A saved weekly report or monthly review (an artifact). */
+export interface GoalReport {
+  kind: 'weekly' | 'monthly'
+  slug: string
+  title: string
+  at: number
+}
+
+/** GET /api/members/{slug}/goals: the crewmate's goal record. */
+export interface MemberGoals {
+  slug: string
+  member: string
+  /** The crewmate's goals, in list order (no cap on how many). */
+  goals: MemberGoal[]
+  key_results: GoalKeyResult[]
+  schedules: GoalSchedules
+  reports: GoalReport[]
+  /** The key result the user removed last, restorable (with its readings) until the set changes again. */
+  removed_key_result: { id: string; text: string; at: number } | null
+  /** The goal the user removed last, restorable (with its milestone links). */
+  removed_goal: { id: string; text: string; at: number } | null
+  /** The goal a write added or changed (write answers only). */
+  goal_id?: string
+  limits: {
+    goal_text_max_chars: number
+    key_result_text_max_chars: number
+    key_result_value_max_chars: number
+    key_result_reading_max_chars: number
+  }
+}
+
 export interface CrewTeam {
   id: string
   name: string
@@ -116,6 +192,41 @@ export interface CrewTeam {
 export interface DashboardFieldSpec {
   type: 'number' | 'string' | 'boolean' | 'array' | 'object'
   source: { agentic: true } | { fold: string; path: string }
+}
+
+/** One dynamic-dashboard read, as both dashboard routes answer it.
+ *
+ *  Declared once because the two routes serve the SAME body out of the same handler
+ *  module -- a crewmate's by slug, a root session's by slot -- so two spellings of it
+ *  would be two things to keep in step, and a reader comparing them would have to work
+ *  out whether a field missing from one is absent or merely unwritten. */
+export interface DashboardRead {
+  instance_version: number
+  template: { id: string; version: number }
+  html: string
+  /** The live page with its values already filled in by the gateway (data island +
+   *  bootstrap + page), absent when the fill failed or the state is not live. The frame
+   *  prefers it; the raw `html` is the fallback. */
+  rendered_html?: string
+  manifest: DashboardManifest
+  state: 'empty' | 'live' | 'stale' | 'error'
+  /** Every field this page can ever be sent, off the package's own model. */
+  fields?: string[]
+  /** The `kind="dashboard"` package this response rendered, when the binding resolved
+   *  to one. The tab carries it back on a refetch and drops any pushed frame belonging
+   *  to a different package. Absent where no package is bound, which is every root
+   *  session today: only a crewmate carries a binding. */
+  dashboard?: string
+  /** The person's layout lock: while true the crewmate cannot apply or roll back a page. */
+  structure_locked?: boolean
+  /** Set on a `preview` read: this body is the staged page, not the record. */
+  preview?: boolean
+  /** Set on a `preview` read: which staged page this is. Keep sends it back. */
+  staged_ms?: number
+  /** The crewmate's tab shows the SUGGESTIONS page instead of this read's page: the
+   *  gateway's one decision (`dashboard_agentic.shows_suggestions`), which the
+   *  crewmate's turn block is told too. Absent on every other read. */
+  suggestions?: boolean
 }
 
 /** A dashboard template's manifest. Mirrors `TemplateManifest`. */
@@ -162,9 +273,11 @@ export function createAgentsEndpoints({ post, put, del, j, jfetch: fetch, sessio
         headers: sessionKey ? { 'X-Session-Key': sessionKey } : { ..._sk },
       }).then(j),
     /** The model a new session on this Kiro Crew agent would run on. Empty
-     *  `agent` resolves the configured default agent. */
-    agentResolvedModel: (agent: string) =>
-      fetch('/api/agents/resolved-model?agent=' + encodeURIComponent(agent)).then(j),
+     *  `agent` resolves the configured default agent; `app` adds the owning
+     *  app's own model setting. */
+    agentResolvedModel: (agent: string, app?: string) =>
+      fetch('/api/agents/resolved-model?agent=' + encodeURIComponent(agent)
+        + (app ? '&app=' + encodeURIComponent(app) : '')).then(j),
     /** Execution choices for a chat: configured members AND installed shared
      *  templates, each row tagged with its `selection_kind`. Read-only -- unlike
      *  the sync route it enrols nothing and allocates no member memory, so
@@ -250,21 +363,19 @@ export function createAgentsEndpoints({ post, put, del, j, jfetch: fetch, sessio
         '/api/members/' + encodeURIComponent(slug) + '/dashboard?member=' + encodeURIComponent(member)
           + (locale ? '&locale=' + encodeURIComponent(locale) : '')
           + (preview ? '&preview=1' : ''),
-      ).then(j) as Promise<{
-        instance_version: number
-        template: { id: string; version: number }
-        html: string
-        /** The live page with its values already filled in by the gateway (data
-         * island + bootstrap + page), absent when the fill failed or the state is not
-         * live. The frame prefers it; the raw `html` is the fallback. */
-        rendered_html?: string
-        manifest: DashboardManifest
-        state: 'empty' | 'live' | 'stale' | 'error'
-        /** Set on a `preview` read: this body is the staged page, not the record. */
-        preview?: boolean
-        /** The person's layout lock: while true the crewmate cannot apply or roll back a page. */
-        structure_locked?: boolean
-      } | null>,
+      ).then(j) as Promise<DashboardRead | null>,
+    // The person's Keep: install exactly the staged page the preview read named by
+    // `staged_ms`. Owner-only, refused to an agent's internal-secret caller, 409
+    // `preview_changed` when another page was staged since, 423 `dashboard_locked`.
+    memberDashboardPreviewApply: (slug: string, member: string, stagedMs: number) =>
+      post('/api/members/' + encodeURIComponent(slug) + '/dashboard/preview/apply?member=' + encodeURIComponent(member), { staged_ms: stagedMs })
+        .then(j) as Promise<{ ok: boolean; instance_version: number; template_id: string }>,
+    // The person's Discard: drop the staged page the preview read named. Same gates
+    // as Keep; 409 `preview_changed` when another page was staged since, ok when
+    // nothing is staged any more.
+    memberDashboardPreviewDiscard: (slug: string, member: string, stagedMs: number) =>
+      post('/api/members/' + encodeURIComponent(slug) + '/dashboard/preview/discard?member=' + encodeURIComponent(member), { staged_ms: stagedMs })
+        .then(j) as Promise<{ ok: boolean }>,
     // Set or clear that lock. Owner-only on the gateway, and refused to an agent's
     // internal-secret caller: only the person, from the crewmate's Profile card, can move it.
     memberDashboardLock: (slug: string, member: string, locked: boolean) =>
@@ -279,15 +390,21 @@ export function createAgentsEndpoints({ post, put, del, j, jfetch: fetch, sessio
       if (locale) p.set('locale', locale)
       if (preview) p.set('preview', '1')
       const query = p.toString()
-      return fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/dashboard' + (query ? '?' + query : '')).then(j) as Promise<{
-        instance_version: number
-        template: { id: string; version: number }
-        html: string
-        rendered_html?: string
-        manifest: DashboardManifest
-        state: 'empty' | 'live' | 'stale' | 'error'
-      } | null>
+      return fetch('/api/chat/slots/' + encodeURIComponent(slot) + '/dashboard' + (query ? '?' + query : '')).then(j) as Promise<DashboardRead | null>
     },
+    /** The whole read, after the page refused a patch it could not place in order.
+     *
+     *  The host's half of the frame's gap rule. A page applies patches in sequence
+     *  and asks for this when one skips a version -- applying it anyway would show
+     *  one field from after a change and the rest from before it, with nothing on the
+     *  page saying so. 409 `no_live_page` when nothing is armed; the remedy is to
+     *  re-read the dashboard, which arms one. */
+    memberDashboardRefetch: (slug: string, member: string, dashboard: string) =>
+      fetch(
+        '/api/members/' + encodeURIComponent(slug) + '/dashboard/refetch?member='
+          + encodeURIComponent(member) + '&dashboard=' + encodeURIComponent(dashboard),
+        { method: 'POST' },
+      ).then(j) as Promise<{ dashboard?: string; read: { [key: string]: unknown } } | null>,
     // The crewmate's self-maintained briefing markdown. Read-only from the UI
     // (no editor: the file is agent-written and edited where the crewmate keeps
     // it). `member` is the exact crew name (slugs are lossy).
@@ -328,6 +445,30 @@ export function createAgentsEndpoints({ post, put, del, j, jfetch: fetch, sessio
       fetch(
         '/api/members/' + encodeURIComponent(slug) + '/recap?member=' + encodeURIComponent(member),
       ).then(j) as Promise<MemberRecap>,
+    // A crewmate's goals (the Goals tab). Every write is an owner action and
+    // answers the whole record; `member` is the exact crew name (slugs are lossy).
+    memberGoals: (() => {
+      const base = (slug: string) => '/api/members/' + encodeURIComponent(slug) + '/goals'
+      const q = (member: string) => '?member=' + encodeURIComponent(member)
+      return {
+        get: (slug: string, member: string) => fetch(base(slug) + q(member)).then(j) as Promise<MemberGoals>,
+        /** Add a goal (no goal_id) or replace goal `goalId`'s text, `expected` being the text it replaces. */
+        setGoal: (slug: string, member: string, text: string, goalId?: string, expected?: string) =>
+          put(base(slug) + '/long-term', goalId ? { member, long_term: text, goal_id: goalId, expected } : { member, long_term: text }).then(j) as Promise<MemberGoals>,
+        removeGoal: (slug: string, member: string, id: string) =>
+          del(base(slug) + '/items/' + encodeURIComponent(id) + q(member)).then(j) as Promise<MemberGoals>,
+        restoreGoal: (slug: string, member: string, id: string) =>
+          post(base(slug) + '/items/' + encodeURIComponent(id) + '/restore', { member }).then(j) as Promise<MemberGoals>,
+        setKeyResults: (slug: string, member: string, items: { id?: string; text: string; target: string; current?: string; goal_ids?: string[] }[], expected?: { text: string; target: string }[]) =>
+          put(base(slug) + '/key-results', { member, items, expected }).then(j) as Promise<MemberGoals>,
+        removeKeyResult: (slug: string, member: string, id: string) =>
+          del(base(slug) + '/key-results/' + encodeURIComponent(id) + q(member)).then(j) as Promise<MemberGoals>,
+        restoreKeyResult: (slug: string, member: string, id: string) =>
+          post(base(slug) + '/key-results/' + encodeURIComponent(id) + '/restore', { member }).then(j) as Promise<MemberGoals>,
+        setSchedules: (slug: string, member: string, changes: Partial<GoalSchedules>) =>
+          put(base(slug) + '/schedules', { member, ...changes }).then(j) as Promise<MemberGoals>,
+      }
+    })(),
     // Crewmate teams: a name plus an ordered member list, stored by the gateway
     // in the data home's crew-teams directory. Dashboard-only like the members routes; the three
     // writes are owner actions. `remove` rather than `delete`: a reserved word
@@ -355,23 +496,20 @@ export function createAgentsEndpoints({ post, put, del, j, jfetch: fetch, sessio
     appearances: {
       list: () => fetch('/api/appearances').then(j) as Promise<{ packs?: unknown }>,
       /**
-       * The whole pack, inlined. Read it through `hooks/usePackDetail` (a React
-       * Query entry, `staleTime: Infinity`) rather than directly: this route
-       * carries every file in the pack, so one read per pack per session is the
-       * budget, and a grid or roster calling it per avatar would load N whole packs
-       * to draw N frames. The crew avatar pays that one read per WORN pack to learn
-       * each slot's format (the per-slot route cannot say it before the request);
-       * `packDetailFrom` then keeps the bytes only for a Lottie slot, so the cache
-       * never pins an svg or a base64 sheet no renderer reads from here. The three
-       * shipped sample bundles are 1-4 KB; a content-free detail variant is the
-       * follow-up if real packs prove otherwise.
+       * One pack. Read it through `hooks/usePackDetail` (a React Query entry,
+       * `staleTime: Infinity`) rather than directly, so a grid or roster shares one
+       * read per pack per session however many avatars wear it.
        *
        * A renderer needs it because the FORMAT lives per slot — the player has to
        * be chosen before any bytes are requested, which the per-slot route
-       * (`packSlotUrl`) cannot answer.
+       * (`packSlotUrl`) cannot answer. `meta: true` (`?meta=1`) answers exactly
+       * that, without any file's bytes: each slot's format, the sprite geometry
+       * and the cue presence. Without it the route inlines every file in the pack,
+       * which only a Lottie slot reads — its document is parsed in the page.
        */
-      detail: (id: string) =>
-        fetch('/api/appearances/' + encodeURIComponent(id)).then(j) as Promise<unknown>,
+      detail: (id: string, opts?: { meta?: boolean }) =>
+        fetch('/api/appearances/' + encodeURIComponent(id) + (opts?.meta ? '?meta=1' : ''))
+          .then(j) as Promise<unknown>,
       /** Install an exported pack. The JSON envelope, not multipart: the bundle is
        *  already parsed client-side to reject an obviously wrong pick, so posting
        *  it back as a file would only re-serialize what we hold. */

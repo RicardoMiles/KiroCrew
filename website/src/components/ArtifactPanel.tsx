@@ -44,7 +44,7 @@ interface Props {
    *  an optional delivery verdict: an explicit `false` (or a promise of one)
    *  means the message was NOT delivered, so the batch must stay pending; any
    *  other return counts as delivered. */
-  onSubmitComments?: (message: string) => void | boolean | Promise<void | boolean>
+  onSubmitComments?: (message: string, count?: number) => void | boolean | Promise<void | boolean>
   /** Gateway connection flag. Gates the submit-to-chat affordance (mirrors
    *  ChatInput's Send gating) so a batch submit can't fire while the chat
    *  send path would silently refuse it. Defaults true for embeddings
@@ -291,7 +291,7 @@ export default memo(function ArtifactPanel({ slug, kind, content, onClose, activ
     // clear-on-submit behavior).
     let verdict: void | boolean | Promise<void | boolean>
     try {
-      verdict = onSubmitComments(formatArtifactCommentsMessage(slug, name, batch, extraPrompt))
+      verdict = onSubmitComments(formatArtifactCommentsMessage(slug, name, batch, extraPrompt), batch.length)
     } catch {
       verdict = false
     }

@@ -61,26 +61,17 @@ from kiro_crew.security import (
 )
 from kiro_crew.user_json import strip_json_comments as _strip_json5_comments
 from kiro_crew.user_json import strip_utf8_bom
+from kiro_crew.yaml_safe import NoAliasSafeLoader
 
 
-class _NoAliasSafeLoader(yaml.SafeLoader):
-    """SafeLoader that refuses YAML anchors/aliases.
+class _NoAliasSafeLoader(NoAliasSafeLoader):
+    """The loader for foreign-agent config files, which are untrusted.
 
-    Foreign-agent config files are untrusted. Plain ``yaml.safe_load`` still
-    expands ``*alias`` references into a shared-reference graph, so a tiny
-    "billion-laughs" config would explode when the downstream secret/leaf
-    traversal re-walks it. Rejecting aliases at compose time keeps the
-    amplification vector closed while preserving full indentation support. A
-    lone anchor with no alias is harmless (nothing to amplify) and is allowed.
+    The downstream secret/leaf traversal re-walks whatever the parse returns, so
+    an alias-expanded "billion-laughs" config would explode there; refusing the
+    alias at compose time keeps that vector closed while preserving full
+    indentation support.
     """
-
-    def compose_node(self, parent: Any, index: Any) -> Any:
-        if self.check_event(yaml.events.AliasEvent):
-            event = self.get_event()
-            raise yaml.composer.ComposerError(
-                None, None, "found alias, which is not allowed", event.start_mark
-            )
-        return super().compose_node(parent, index)
 
 
 def _load_no_alias_yaml(text: str) -> Any:
@@ -601,7 +592,7 @@ def _read_simple_yaml(path: Path, anchor: Path, scan: _Scan) -> dict[str, Any]:
     # PyYAML is a hard dependency; the SafeLoader base blocks arbitrary object
     # construction and parses full YAML (the previous hand-rolled parser silently
     # dropped MCP servers on any indentation other than 0/2 spaces).
-    # _NoAliasSafeLoader additionally refuses anchors/aliases so a "billion-laughs"
+    # _NoAliasSafeLoader additionally refuses aliases so a "billion-laughs"
     # foreign config cannot amplify into an exponential downstream traversal.
     # Bound the input with an explicit YAML cap and catch every parser failure
     # mode — a malformed, alias-bearing, or pathologically nested config must

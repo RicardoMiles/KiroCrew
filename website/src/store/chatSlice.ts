@@ -986,34 +986,55 @@ export const {
   setActiveSlot, clearSlotState, setPendingInput, stageToMainComposer, setAgentSwitchNotice, clearUnresumableResume, clearUndeletableHistory, setQuestionCard, clearQuestionCard, setQuestionDraft, setQuestionNotice, setQuestionRequestInFlight, markQuestionSettled, resolveQuestionCard, setFollowupCard, clearFollowupCard, dismissFollowupItem, setFolderSuggestion, clearFolderSuggestion, ageFolderSuggestion, appendMessage, appendSlotMessage, updateStreamingMessage, finalizeAssistant,
   removeThinking, confirmOptimisticSend, markSendUnconfirmed, resolveOptimisticSteer, removeByApprovalId, resolveByApprovalId, clearPendingPermissions, setSlotRunning, setSlotStopping, settleStopNotRunning, startLocalTurn, startServerTurn, endLocalTurn, syncSlotRunningFromServer, setSlotState, setSlotStatusDetail, setStopPressedAt, clearMessages, clearSlotCache, truncateAfterIndex, replaceMessages, hydrateSlotMessages, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages,
   sseContextUsage, setVoicePlaying, setVoicePreparing, setVoiceAudio,
-  toggleActivity, openActivityToTab, openActivityPanel, openActivityToTool, clearFocusToolCallId, requestSlotReveal, clearSlotReveal, requestFolderReveal, clearSubagentsForSnapshot, sseSubagentPending, markSubagentApproving, sseSubagentSpawn, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentQueued, reconcileSubagentQueuedFromSlots,
+  toggleActivity, openActivityToTab, openActivityPanel, openActivityToTool, clearFocusToolCallId, requestSlotReveal, clearSlotReveal, requestFolderReveal, clearSubagentsForSnapshot, sseSubagentPending, markSubagentApproving, markSubagentApprovalGone, reconcileSubagentApprovalGone, sseSubagentSpawn, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentQueued, reconcileSubagentQueuedFromSlots,
   sseSubagentBatchUpdate, sseSubagentBatchChunks, selectSubagent, clearTerminalSubagents,
   setAutomations, sseAutomation, removeAutomation,
   sseSubagentSnapshot, sseToolActivity, sseToolResult, sseActivityEvent,
   sseMcpAppRender,
   sseWorkflowEvent, clearWorkflowRun, reconcileWorkflowRuns,
-  sseSideResult, sseSideQueue, sideReleaseConsumed, sideClose, sideOptimisticAppend, sideOptimisticRollback,
+  sseSideResult, sseSideQueue, sideSendStatus, sideReleaseConsumed, sideClose, sideOptimisticAppend, sideOptimisticRollback,
 } = chatSlice.actions
 
-export { clampToolOutput, TOOL_OUTPUT_MAX_CHARS, queueEntryAttachments, queueEntryQuote, type QueueEntryAttachments } from './chat/wire'
+/** The `GET /api/spawn` read in flight, shared by every gone card that asks
+ *  while it is pending: a batch refusal, a reconnect and a tab opening on N
+ *  gone cards all dispatch together, and one inventory answers them all. */
+let spawnInventoryRead: ReturnType<typeof api.spawnList> | null = null
+const readSpawnInventory = () => (spawnInventoryRead ??= api.spawnList().finally(() => { spawnInventoryRead = null }))
+
+/**
+ * Reconcile a gone approval immediately against the backend's authoritative
+ * process inventory. A failed read deliberately leaves the card unresolved and
+ * active; SubagentProgressBar's existing reconciliation loop retries later.
+ */
+export const reconcileGoneSubagent = createAsyncThunk<void, { slot: string; id: string; approval_id: string }>(
+  'chat/reconcileGoneSubagent',
+  async ({ slot, id, approval_id }, { dispatch }) => {
+    const response = await readSpawnInventory()
+    const agent = (response.agents ?? []).find(a => a.id === id) ?? null
+    dispatch(reconcileSubagentApprovalGone({ slot, id, approval_id, agent }))
+  },
+)
+
+export { clampToolOutput, TOOL_OUTPUT_MAX_CHARS, normalizeQueueEntries, queueEntryAttachments, queueEntryQuote, type QueueEntryAttachments } from './chat/wire'
+export { hydrateQueuedBubbles } from './chat/queue'
 export { floorForGen, hasUnidentifiedDurableRow, raiseChunkSeq, snapshotChunkGen, snapshotChunkSeq, transcriptTsMs } from './chat/transcript'
 export {
   OLDER_PAGE_LIMIT, OLDER_WALK_PAGE_LIMIT, SLOT_DETAIL_MAX_LIMIT, PANE_HYDRATE_LIMIT, REFRESH_LIMIT_CEILING,
   slotSwitchFetchLimit, slotCoverageShortfall, countMatchedFetchLimit, isSupersededPagingRejection,
   abortActiveOlderFetch, type CoverageRow,
 } from './chat/paging'
-export type { ChatState, FollowupItem, SideMessage, SideQueueEntry, SideState, SlotState, SlotStatusDetail, WorkflowRunProgress } from './chat/state'
+export type { ChatState, FollowupItem, SideMessage, SideQueueEntry, SideSendStatus, SideStandingNotice, SideState, SlotState, SlotStatusDetail, WorkflowRunProgress } from './chat/state'
 export { FOLDER_SUGGESTION_MAX_TURNS, capturePendingAskId, isAnsweredQuestionEnding, pendingQuestionFor, shouldResolveAskOnSend } from './chat/composerCards'
 export { mcpAppKey } from './chat/mcpApps'
 export {
-  isAwaitingSpawnApproval, selectSidebarApprovalCounts, selectSidebarStartedSubagentCounts, selectSidebarSubagentCounts, selectSlotPendingSpawnApprovals,
+  isActiveSubagent, isAwaitingSpawnApproval, isSpawnApprovalGone, isSpawnApprovalRetired, selectSidebarApprovalCounts, selectSidebarStartedSubagentCounts, selectSidebarSubagentCounts, selectSlotPendingSpawnApprovals,
   selectSlotSubagents, selectSlotSubagentsActive, selectSubagentActivityCount,
 } from './chat/subagents'
 export { WORKFLOW_TERMINAL_STATUSES, isTerminalWorkflowStatus, selectSidebarWorkflowActive, selectSidebarWorkflowActiveKeys } from './chat/workflows'
 export { selectAutomationForSlot, selectSidebarAutomationRunningKeys } from './chat/automations'
 export { queueEditBroadcastAt } from './chat/side'
 export {
-  selectActiveSlotProject, selectComposerBusy, selectContinuable, selectSendConfirmed, selectSlotMessages,
+  selectActiveSlotProject, selectComposerBusy, selectContinuable, selectProjectChipLocked, selectSendAccepted, selectSendConfirmed, selectSlotMessages,
   selectSlotPendingApproval, selectSlotRunEpoch, selectSlotStreamState, selectSlotToolLog, selectTrailingSendUnconfirmed,
   selectSlotTurnFromWake, selectTurnInterrupted,
   QUIET_END_SERVER, QUIET_END_TOOL,
@@ -1022,6 +1043,6 @@ export { clearSwitchSlotGone, switchSlot, switchSlotNoticeCopy, type SwitchSlotA
 export { refreshSlot, warmSlotCache } from './chat/slotRefresh'
 export { wireTurnIdentity } from './chat/runState'
 export { WINDOW_WALK_MAX_PAGES } from './chat/windowWalk'
-export { createSlot, deleteHistorySession, fetchHistory, forkSlot, resumeFromHistory } from './chat/lifecycle'
+export { clearHistorySessions, createSlot, deleteHistorySession, fetchHistory, forkSlot, resumeFromHistory } from './chat/lifecycle'
 
 export default withRefreshRevision(chatSlice.reducer)

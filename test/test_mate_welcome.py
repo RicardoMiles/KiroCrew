@@ -243,7 +243,8 @@ class TestGoalWelcome:
         assert "rather than technical terms" in kickoff
         assert "own and look after" not in kickoff
         assert "Leave out your template, role or agent type" in kickoff
-        assert "once they say yes" in kickoff
+        # The goal is proposed through the goal tool, not left in conversation.
+        assert "set_goal" in kickoff
         assert "described as" not in kickoff
         # An unlabelled crewmate is named by its key.
         unlabelled = cg.goal_kickoff(SimpleNamespace(display_name="", description=""), "scout")
@@ -255,6 +256,24 @@ class TestGoalWelcome:
         assert kickoff.startswith(cg.GOAL_WELCOME.format(name="Scout"))
         assert "described as: 'Review open PRs'" in kickoff
         assert "restates it in your own" in kickoff
+        assert "in place of asking what your goal should be" in kickoff
+
+    @pytest.mark.asyncio
+    async def test_a_card_made_crewmate_confirms_its_recorded_goal(
+        self, tmp_path, dispatched, roster
+    ):
+        """The create card writes the goal into the goal record, not the description."""
+        from kiro_crew import member_goals
+
+        roster.agents = {**_ROWS, "scout": SimpleNamespace(display_name="Scout", description="")}
+        state = _make_state(tmp_path)
+        _owe("scout", "scout", WELCOME_KIND_GOAL)
+        _bind_thread(state, "scout", "scout", owed=False)
+        member_goals.set_goal("scout", "scout", "Watch the queue", by=member_goals.BY_USER)
+        assert await cg.maybe_start_first_greeting(state, "scout") == cg.STARTED
+        [kickoff] = dispatched.kickoffs
+        assert kickoff.startswith(cg.GOAL_WELCOME.format(name="Scout"))
+        assert "described as: 'Watch the queue'" in kickoff
         assert "in place of asking what your goal should be" in kickoff
 
 
@@ -274,7 +293,12 @@ class TestHiddenKickoff:
             assert slot.task is not None
             await slot.task
         kickoff = cg.FIRST_WELCOME_WITH_CREW.format(name="Mate")
-        assert seen == [(kickoff, {"_synthetic_payload": True, "_turn_actor": "gateway"})]
+        assert seen == [
+            (
+                kickoff,
+                {"_synthetic_payload": True, "_turn_actor": "gateway"},
+            )
+        ]
         # The kickoff is never written to the transcript: the only row is the
         # crewmate's own greeting.
         roles = [(m["role"], m["content"]) for m in slot.messages]
@@ -296,7 +320,12 @@ class TestHiddenKickoff:
             assert await cg.maybe_start_first_greeting(state, OTHER_SLUG) == cg.STARTED
             await slot.task
         kickoff = cg.goal_kickoff(_ROWS["code-reviewer"], "code-reviewer")
-        assert seen == [(kickoff, {"_synthetic_payload": True, "_turn_actor": "gateway"})]
+        assert seen == [
+            (
+                kickoff,
+                {"_synthetic_payload": True, "_turn_actor": "gateway"},
+            )
+        ]
         assert "Review my PRs" in kickoff
         assert [m["role"] for m in slot.messages] == ["assistant"]
 

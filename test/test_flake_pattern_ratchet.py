@@ -8,7 +8,9 @@ fixture on the shared ``monkeypatch``, a promise-sleep, ``waitForTimeout``). Thi
 counts per file only the shapes those patterns miss: patches of ``asyncio.sleep``, the
 ``datetime`` classes or another module's ``time`` binding, ``sys.modules`` evictions,
 raw environment writes, duration bounds, short literal waits, literal listener ports,
-crew-log flush ceilings and unpaused removals, and five frontend shapes (promise-sleeps
+crew-log flush ceilings, unpaused removals, Event waits a test parks on an executor
+(``to_thread(<obj>.wait, ...)`` and ``run_in_executor(<any>, <obj>.wait, ...)``,
+whatever the bound, none included), and five frontend shapes (promise-sleeps
 only in the Electron tests, which the semgrep rule does not read). So no site needs
 both ``# nosemgrep`` and ``# flake-ok``. The tree already holds thousands of these, so
 each file a change touches is held to its own count at the change's merge-base.
@@ -24,10 +26,10 @@ each file a change touches is held to its own count at the change's merge-base.
   module ten other diff-scoped gates read. Precedence: ``FLAKE_RATCHET_BASE`` when
   set; on CI the first parent of the merge commit a pull request, push or merge
   queue run checks out; else the newer of the merge-bases with ``upstream/<base>``
-  and ``origin/<base>``, or the local ``<base>`` branch. When none is readable (a
-  shallow clone, as CI's backend shards are today), the ratchet warns and compares
-  nothing: judging against a stored count would red a change for sites that other,
-  already merged changes added.
+  and ``origin/<base>``, or the local ``<base>`` branch. CI's Backend Tests checkout
+  is depth 2 so that first parent is readable. When none is readable (a depth-1
+  clone), the ratchet warns and compares nothing: judging against a stored count
+  would red a change for sites that other, already merged changes added.
 * A line that keeps a shape on purpose carries ``# flake-ok: <reason>`` (``//
   flake-ok: <reason>`` in TypeScript) with a reason of ten characters or more, words
   not punctuation, on a line of the finding.
@@ -54,6 +56,7 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 
 import pytest
+import yaml
 from source_corpus import repo_files, repo_root
 from test_ratchet_scope import (
     _GIT_COMMAND_LINE_CONFIG,
@@ -198,6 +201,8 @@ class _Module:
         self.calls: list[ast.Call] = []
         self.asserts: list[ast.Assert] = []
         self.writes: list[ast.AST] = []  # Assign, AugAssign, Delete
+        #: local name -> asyncio name, for ``from asyncio import to_thread as tt``.
+        self.asyncio_names: dict[str, str] = {}
         # One walk; every detector reads these lists instead of walking again.
         stack: list[ast.AST] = [tree]
         while stack:
@@ -215,6 +220,9 @@ class _Module:
                 for alias in node.names:
                     if alias.name in _CLOCK_ATTRS:
                         self.modules[alias.asname or alias.name] = alias.name
+            elif isinstance(node, ast.ImportFrom) and node.module == "asyncio":
+                for alias in node.names:
+                    self.asyncio_names[alias.asname or alias.name] = alias.name
 
     def stdlib_of(self, node: ast.AST) -> str | None:
         """The stdlib module a Name or Attribute names, through this file's aliases."""
@@ -458,6 +466,33 @@ def _k14_unpaused_crew_log_rmtree(module: _Module, source: str) -> Iterable[ast.
             yield node
 
 
+def _is_wait(node: ast.AST) -> bool:
+    return isinstance(node, ast.Attribute) and node.attr == "wait"
+
+
+def _k15_parked_pool_wait(module: _Module) -> Iterable[ast.AST]:
+    """A test parking ``<obj>.wait`` on an executor: ``to_thread(<obj>.wait, ...)`` or
+    ``run_in_executor(<any>, <obj>.wait, ...)``, whatever the bound, none included.
+
+    The parked wait holds a pool thread the code it waits for may need to make the
+    event fire, so a bound only changes how the starvation fails. The callee is matched
+    by its last name, so an aliased module counts too, and a name bound by
+    ``from asyncio import to_thread as tt`` resolves to ``to_thread``. Any ``.wait``
+    counts, which may over-count a little. Known misses: ``functools.partial``, a
+    ``lambda``, a rebound ``w = ev.wait``, a rebound callee (``f = asyncio.to_thread``),
+    ``executor.submit`` and ``getattr``."""
+    for node in module.calls:
+        func = node.func
+        if isinstance(func, ast.Name):
+            callee = module.asyncio_names.get(func.id, func.id)
+        else:
+            callee = func.attr if isinstance(func, ast.Attribute) else ""
+        if callee == "to_thread" and node.args and _is_wait(node.args[0]):
+            yield node
+        elif callee == "run_in_executor" and len(node.args) >= 2 and _is_wait(node.args[1]):
+            yield node
+
+
 #: class -> words one of which every shape of that class contains. A file holding none
 #: is not parsed: each set is deliberately broader than its detector, never narrower.
 PY_TRIGGERS: dict[str, tuple[str, ...]] = {
@@ -469,6 +504,7 @@ PY_TRIGGERS: dict[str, tuple[str, ...]] = {
     "K11-literal-listener-port": ("(",),
     "K13-fixed-flush-ceiling": ("flush",),
     "K14-unpaused-crew-log-rmtree": ("rmtree",),
+    "K15-parked-pool-wait": ("to_thread", "run_in_executor"),
 }
 
 #: class -> detector. K14 also reads the source text.
@@ -481,6 +517,7 @@ PY_DETECTORS: dict[str, Callable[..., Iterable[ast.AST]]] = {
     "K11-literal-listener-port": _k11_literal_listener_port,
     "K13-fixed-flush-ceiling": _k13_fixed_flush_ceiling,
     "K14-unpaused-crew-log-rmtree": _k14_unpaused_crew_log_rmtree,
+    "K15-parked-pool-wait": _k15_parked_pool_wait,
 }
 
 
@@ -889,6 +926,28 @@ PY_CASES: dict[str, tuple[tuple[str, ...], str]] = {
         "import shutil\ndef test_x():\n    with eager.paused():\n"
         "        shutil.rmtree(crew_log_path('session', sid).parent)\n",
     ),
+    "K15-parked-pool-wait": (
+        (
+            "import asyncio\nasync def test_x():\n    assert await asyncio.to_thread(ev.wait, 5)\n",
+            "import asyncio\nasync def test_x():\n    await asyncio.to_thread(ev.wait, timeout=2.0)\n",
+            "import asyncio\nasync def test_x():\n    await asyncio.to_thread(self.ev.wait)\n",
+            "import asyncio\nasync def test_x():\n"
+            "    await asyncio.to_thread(ev.wait, default_timeout())\n",
+            "from asyncio import to_thread\nasync def test_x():\n    await to_thread(ev.wait, 5)\n",
+            "from asyncio import to_thread as tt\nasync def test_x():\n    await tt(ev.wait, 5)\n",
+            "import asyncio\nasync def test_x():\n    real = asyncio\n"
+            "    await real.to_thread(ev.wait, 5)\n",
+            "import asyncio\nasync def test_x():\n"
+            "    await asyncio.get_running_loop().run_in_executor(None, started.wait, 5)\n",
+            "async def test_x(loop):\n    await loop.run_in_executor(pool, release.wait)\n",
+        ),
+        # Another callable, a non-blocking read, polling from the loop, a held-side
+        # wait on the code's own thread, and the shape named only in a docstring.
+        "import asyncio\nasync def test_x(loop):\n    'asyncio.to_thread(ev.wait, 5)'\n"
+        "    await asyncio.to_thread(work, 5)\n    await asyncio.to_thread(ev.is_set)\n"
+        "    await loop.run_in_executor(None, work, 5)\n"
+        "    await async_wait_until(ev.is_set)\ndef held():\n    assert ev.wait(5)\n",
+    ),
 }
 
 JS_CASES: dict[str, tuple[str, tuple[str, ...], str]] = {
@@ -1102,6 +1161,44 @@ def test_a_pull_request_merge_commit_is_measured_against_its_first_parent(
     base, how = merge_base(git_repo)
     assert base == before and "first parent" in how
     assert change_risen(git_repo, base) == {("K6-raw-environ-write", "test/test_b.py"): (1, 0)}
+
+
+def _ci_shaped_checkout(source: Path, dest: Path, depth: int) -> Path:
+    """Fetch ``source``'s ``main`` at ``depth`` into a fresh repo, detached, the way
+    ``actions/checkout`` fetches the merge ref: no ``origin/main`` and no ``main``."""
+    _run_git(dest.parent, "init", "-q", dest.name)
+    _run_git(dest, "fetch", "-q", f"--depth={depth}", source.as_uri(), "main")
+    _run_git(dest, "checkout", "-q", "--detach", "FETCH_HEAD")
+    return dest
+
+
+@pytest.mark.parametrize("depth", [1, 2])
+def test_a_ci_checkout_needs_depth_two_to_compare(git_repo, monkeypatch, depth) -> None:
+    # The base gains a commit after the branch point, so depth 2 is not the whole history.
+    (git_repo / "test" / "test_b.py").write_text(_sites("b"), encoding="utf-8")
+    _run_git(git_repo, "commit", "-q", "-am", "change")
+    _run_git(git_repo, "checkout", "-q", "main")
+    (git_repo / "test" / "test_c.py").write_text("def test_c():\n    assert 1\n", encoding="utf-8")
+    _run_git(git_repo, "add", "-A")
+    _run_git(git_repo, "commit", "-q", "-m", "main moved")
+    before = _run_git(git_repo, "rev-parse", "main")
+    _run_git(git_repo, "merge", "-q", "--no-ff", "-m", "merge", "change")
+    checkout = _ci_shaped_checkout(git_repo, git_repo.parent / f"ci-{depth}", depth)
+    monkeypatch.setenv("GITHUB_BASE_REF", "main")
+    base, how = merge_base(checkout)
+    if depth == 1:
+        assert base is None, how
+        return
+    assert base == before and "first parent" in how
+    assert change_risen(checkout, base) == {("K6-raw-environ-write", "test/test_b.py"): (1, 0)}
+
+
+def test_the_backend_tests_checkout_keeps_the_merge_parent() -> None:
+    # Without the merge parent the ratchet compares nothing on CI and gates nothing.
+    workflow = yaml.safe_load((repo_root() / ".github/workflows/ci.yml").read_text("utf-8"))
+    steps = workflow["jobs"]["backend-test"]["steps"]
+    checkout = next(step for step in steps if "actions/checkout" in str(step.get("uses", "")))
+    assert (checkout.get("with") or {}).get("fetch-depth") == 2
 
 
 def test_a_site_already_on_the_base_does_not_red_a_change_to_another_file(git_repo) -> None:

@@ -530,6 +530,20 @@ class TestTheAgenticFold:
     def test_another_entry_type_does_not_move_it(self) -> None:
         assert self.fold(entry("panel/published", {"template": "x", "data": {}}))["wrote"] == 0
 
+    def test_a_rewrite_of_an_unchanged_value_moves_its_stamp(self) -> None:
+        """A crewmate that writes the SAME ``for_you`` list again after a chat reply
+        still moves ``at``, which is what ``written_at.for_you`` reads, so the page
+        stops folding the cards the reply folded. Built directly rather than with
+        ``entry()``, which puts two entries 1 ms apart: the same whole second."""
+        cards = [{"text": "Fix the CLI bubble?", "ask": "decide", "options": ["Fix it"]}]
+        data = {"field": "for_you", "type": "array", "value": {"v": cards}}
+        first = Entry(type=AGENTIC, seq=1, time=1_759_000_000_000, src="gateway", data=data)
+        second = Entry(type=AGENTIC, seq=2, time=1_759_000_045_000, src="gateway", data=data)
+        read = self.fold(first, second)
+        assert read["fields"]["for_you"]["value"] == cards
+        assert read["fields"]["for_you"]["at"] == projection._panel_iso(second.time)
+        assert read["fields"]["for_you"]["at"] != projection._panel_iso(first.time)
+
 
 class TestTheMistakeBookFold:
     def fold(self, *entries: Entry) -> dict[str, Any]:
@@ -717,36 +731,130 @@ class TestTheFoldScope:
         an event, which reads as an empty fold."""
         assert dashboard_feed.scope_for("nope") == ""
 
-    def test_every_manifest_fold_name_has_a_scope(self) -> None:
+    def test_every_manifest_fold_name_is_keyed(self) -> None:
         """A template may declare any of them, so a name the manifest accepts and
-        this cannot key would be a dashboard that never fills."""
+        nothing can reach would be a dashboard that never fills.
+
+        UNIVERSAL, and it stays universal. A template is rendered by
+        ``member_dashboard._render``, whose feed reaches a fold only by its BUS SCOPE and
+        has no tree read -- so for this surface a scope IS reachability, and a set that
+        admitted a scopeless name would hand an operator writing a ``panel-templates``
+        page a binding that is missing on every read.
+        """
         from kiro_crew.dashboard_templates.manifest import FOLD_NAMES
 
         for name in FOLD_NAMES:
             assert dashboard_feed.scope_for(name), name
 
-    def test_the_manifest_does_not_accept_a_fold_it_cannot_reach(self) -> None:
-        """The other half of the ratchet above, stated as the thing that must stay true
-        while a key kind has no reader.
+    def test_a_package_fold_name_is_keyed_or_read_as_a_tree(self) -> None:
+        """The same invariant for the PACKAGE surface, which has the extra reader.
 
-        A TREE-keyed fold is registered in the projection kernel but has no bus scope
-        and, on this base, no read path either -- its reader lives with the page host.
-        So it must not be a name the manifest ACCEPTS: a binding the save gate admits
-        and the feed can neither key nor read is a block that only ever draws the stale
-        band. The exclusion is in `manifest.FOLD_NAMES`, not in the kernel's registry,
-        so the fold stays registered for the key-kind machinery while being unbindable.
-
-        This is what keeps the check above honest rather than exempted: when the read
-        path lands beside the fold, the tree set joins `FOLD_NAMES` and `scope_for`
-        gains a tree answer together, and this test is what fails if only one of the
-        two arrives.
+        Reachability is the question for both sets; the surfaces differ in what can
+        reach a fold. A tree fold has no scope by design -- it joins the logs of many
+        slots, so its value is stale when any member's log grows and no event key could
+        say which -- and it is read instead (``read_tree_projection``, on a page load and
+        on a refetch), which ``member_dashboard_fields.LivePage`` does for a package's
+        page. A fold in neither family still fails here.
         """
         from kiro_crew.crew_log.projection import TREE_PROJECTION_NAMES
-        from kiro_crew.dashboard_templates.manifest import FOLD_NAMES
+        from kiro_crew.dashboard_templates.manifest import PACKAGE_FOLD_NAMES
+
+        for name in PACKAGE_FOLD_NAMES:
+            assert dashboard_feed.scope_for(name) or name in TREE_PROJECTION_NAMES, name
+
+    def test_a_template_binding_a_tree_fold_is_refused_at_parse(self) -> None:
+        """THE SET IS A GATE, so the refusal is asked of the gate and not of the set.
+
+        An operator writes a ``panel-templates`` page, binds a block to a tree fold and
+        the save gate is what has to say no. Admitting it would hand them a field
+        ``read_fields`` skips on every read -- the feed reaches a fold by its bus scope
+        and a tree fold has none -- so the block draws the stale band forever and
+        nothing on the page says why.
+        """
+        from kiro_crew.crew_log.projection import TREE_PROJECTION_NAMES
+        from kiro_crew.dashboard_templates.manifest import ManifestError
+
+        for name in TREE_PROJECTION_NAMES:
+            with pytest.raises(ManifestError) as caught:
+                manifest(boards={"type": "number", "source": {"fold": name, "path": "a.b"}})
+            # Refused BY NAME, so the author is told which binding to change rather
+            # than being handed a manifest-wide "invalid".
+            assert name in str(caught.value), caught.value
+
+    def test_a_package_binding_the_same_tree_fold_is_accepted(self) -> None:
+        """The other side of the split, through the gate a PACKAGE actually passes.
+
+        The package surface keeps the binding this PR is for: its page is drawn by
+        ``member_dashboard_fields.LivePage``, which reads a tree fold. Asked of
+        ``dashboard_package``'s own validator because that is the gate a package goes
+        through -- a package never reaches ``parse_manifest``.
+        """
+        from kiro_crew.artifact_store import dashboard_package as dp
+        from kiro_crew.crew_log.projection import TREE_PROJECTION_NAMES
+
+        for name in TREE_PROJECTION_NAMES:
+            assert name in dp.fold_names(), (
+                f"{name} has a reader on the package surface, so a package binding it "
+                "must still be accepted"
+            )
+
+    def test_the_template_set_never_admits_a_scopeless_fold(self) -> None:
+        """THE SPLIT IS THE POINT, so it is pinned rather than left to the two loops.
+
+        One shared set is how a reader the package surface gained reached the template
+        surface, which never gained it. Re-merging them would admit every tree fold to
+        ``parse_manifest`` again, and the package loop above would still pass because
+        that set is a superset.
+        """
+        from kiro_crew.crew_log.projection import TREE_PROJECTION_NAMES
+        from kiro_crew.dashboard_templates.manifest import FOLD_NAMES, PACKAGE_FOLD_NAMES
 
         assert TREE_PROJECTION_NAMES, "no tree fold is registered; this test guards none"
         for name in TREE_PROJECTION_NAMES:
-            assert name not in FOLD_NAMES, name
+            assert name not in FOLD_NAMES, (
+                f"{name} has no bus scope and no template reader, so a template "
+                "manifest binding it is a block that never fills"
+            )
+            assert name in PACKAGE_FOLD_NAMES, name
+        assert FOLD_NAMES < PACKAGE_FOLD_NAMES
+
+    def test_a_tree_fold_the_manifest_accepts_has_a_reader(self) -> None:
+        """The other half of the ratchet above, and the half that moves with this change.
+
+        A TREE-keyed fold is registered in the projection kernel and has no bus scope by
+        design, so the ONLY way a block bound to one ever fills is a read. While there
+        was no read path, the name was withheld from every gate -- a binding
+        the save gate admits and the feed can neither key nor read is a block that only
+        ever draws the stale band.
+
+        The read path lands here for the PACKAGE surface, so the name joins that
+        surface's set, and the invariant turns into its positive form: every tree fold
+        the package gate accepts must have a reader that resolves it. Stated as two concrete things rather than as a flag,
+        because a flag can be set while neither is true -- the kernel's read function
+        exists, and the page host actually calls it.
+        """
+        import inspect
+
+        from kiro_crew.crew_log import projection
+        from kiro_crew.dashboard.handlers import member_dashboard_fields as mdf
+        from kiro_crew.dashboard_templates.manifest import PACKAGE_FOLD_NAMES
+
+        assert projection.TREE_PROJECTION_NAMES, "no tree fold is registered; this test guards none"
+        for name in projection.TREE_PROJECTION_NAMES:
+            assert name in PACKAGE_FOLD_NAMES, (
+                f"{name} is a tree fold with a read path, so the package gate must "
+                "accept a block binding it"
+            )
+            # No scope, which is WHY it needs a read: a tree joins the logs of many
+            # slots, so no event key can say which one moved it.
+            assert dashboard_feed.scope_for(name) == "", name
+
+        # THE READER, named: the kernel's read function, and the page host that calls it.
+        assert callable(projection.read_tree_projection)
+        assert "read_tree_projection" in inspect.getsource(mdf.LivePage._read_trees), (
+            "LivePage._read_trees is the tree folds' only production reader; a tree "
+            "fold the gate accepts with nothing reading it fills from nowhere"
+        )
 
 
 class TestThePathWalk:
@@ -1366,7 +1474,13 @@ class TestTheRealPackagePath:
         def _get(slug: str, **_kw: Any) -> Any:
             if get_raises is not None:
                 raise get_raises
-            return SimpleNamespace(slug=slug, content=content, version=version)
+            # A version a PERSON cut, which is what the older rule draws.
+            return SimpleNamespace(
+                slug=slug,
+                content=content,
+                version=version,
+                events=[{"by": "user", "type": "edited", "version": version}],
+            )
 
         monkeypatch.setattr(
             artifacts, "get_default_store", lambda: SimpleNamespace(get=_get), raising=False
@@ -1484,26 +1598,21 @@ class TestTheRealPackagePath:
 
     # -- what a live package answers, with no Model to check against --------- #
 
-    def test_a_readable_package_is_live_and_carries_no_model(
+    def test_a_readable_package_is_live_and_carries_its_own_model(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A package that parses is ``live`` and brings NO manifest field specs.
+        """A package that parses is ``live`` and brings ITS OWN field specs.
 
-        The translation into field specs ships with the change that makes the display
-        read the same package, because that change is the first place its output is used
-        for anything: here, every package-bound write is refused before a Model would be
-        checked, so translating one would build a manifest and throw it away.
-
-        ``from_package`` is what the write route turns on, and it is PROVENANCE -- the
-        only thing this module can honestly say. What a package-sourced read means for a
-        write is the route's own decision, which is why the refusal lives there.
+        The page draws the package, so a write is checked against the same
+        ``package_manifest`` translation the page's controller subscribes by.
         """
         from kiro_crew import dashboard_package
 
         self.gate(monkeypatch)
         got = self.read()
         assert got.state == dashboard_package.STATE_LIVE
-        assert got.model is None
+        assert got.model is not None
+        assert got.model.manifest.id == "dashboard-package"
         assert got.from_package is True
         # The slug and the version still reach a person through the sentence, which is
         # what the refusal quotes.
@@ -1583,13 +1692,20 @@ class TestTheRealGateAndStore:
         art = store.create(
             name="Atlas", kind="dashboard", content=json.dumps(self._package("crewmate:atlas"))
         )
+        # A version a PERSON cut, which is the page the older rule draws.
+        cut = self._package("crewmate:atlas")
+        cut["view"]["blocks"][0]["title"] = "For you"
+        read = store.get(art.slug, assign_token=True)
+        store.update(
+            art.slug, content=json.dumps(cut), actor="user", snapshot_token=read.content_token
+        )
         got = dashboard_package.read_package_model("atlas")
         assert got.state == dashboard_package.STATE_LIVE
         # The STORED package is what was found, not the template a fall-through would
-        # have handed back: that is the thing this case is about, and ``from_package``
-        # is what says so now that a package read carries no Model.
+        # have handed back: that is the thing this case is about.
         assert got.from_package is True
-        assert got.model is None
+        assert got.model is not None
+        assert set(got.model.manifest.fields) == {"for_you"}
         assert art.slug in got.state_reason
 
     def test_a_package_the_validator_rejects_is_an_error_and_not_a_fall_through(

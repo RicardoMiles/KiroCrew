@@ -20,14 +20,15 @@ from __future__ import annotations
 import subprocess
 import sys
 import urllib.error
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from kiro_crew import cli_doctor
+from kiro_crew import _llama_lib_path, cli_doctor
 from kiro_crew.config.loader import KiroCrewConfig
-from kiro_crew.doctor_checks import access
+from kiro_crew.doctor_checks import access, install
 from kiro_crew.platform import PlatformCompositionError
 
 pytestmark = pytest.mark.skipif(
@@ -185,6 +186,9 @@ class _Host:
         mp.setattr(cli_doctor, "_load_llama_class", lambda: self.llama)
         mp.setattr(cli_doctor, "_platform_libs_dirname", lambda: self.libs_dir)
         mp.setattr(cli_doctor, "verify_vendored_libs", lambda: self.vendored)
+        # The lib-path row reads the start-up record as well as the variable cleared
+        # above, and a start-up step that ran earlier in this process leaves that record.
+        mp.setattr(cli_doctor, "dropped_inherited_lib_path", lambda: None)
         mp.setattr(cli_doctor, "resolve_custom_model", lambda: self.custom_model)
         mp.setattr(cli_doctor, "model_file_present", lambda path=None: self.model_present)
         mp.setattr(cli_doctor, "default_model_path", lambda: self.tmp / "model.gguf")
@@ -214,6 +218,10 @@ class _Host:
         import kiro_crew.channels as channels
 
         mp.setattr(sqlite_compat, "fts5_available", lambda: self.fts5)
+        # The timezone-data row reads the host's zone files; pin both probes so
+        # the host's real data never decides.
+        mp.setattr(install, "_tz_probe_offset", lambda: self.tz_offset)
+        mp.setattr(install, "_tz_data_from_system", lambda: True)
         # The browser-bootstrap rows resolve through the patched ``shutil.which``;
         # pin the writability probe too, so the host's real files never decide.
         mp.setattr(
@@ -277,6 +285,7 @@ class _Host:
         self.paused: str | None = None
         self.local = True
         self.fts5 = True
+        self.tz_offset = timedelta(hours=-7)
 
     def _marker(self, name: str):
         def marker(*args, **kwargs):
@@ -423,6 +432,7 @@ Runtime
   deps:        ✅ websockets, slack_sdk, aiohttp available
   <<_doctor_import_path>>
   sqlite fts5: ✅ available
+  tz data:     ✅ current (America/Vancouver stays UTC-7 in winter)
 
 Vector Memory (in-process embeddings)
   runtime:     ✅ vendored llama-cpp-python importable
@@ -508,6 +518,20 @@ def test_a_ready_host_prints_every_section_in_order_and_passes(host, capsys) -> 
     assert len(lists) == 1
 
 
+def test_a_start_up_record_of_an_inherited_lib_path_leaves_the_report_unchanged(
+    host, capsys
+) -> None:
+    """A start-up step that ran earlier in the process records the lib path it removed."""
+    _ready(host)
+    installed = host.tmp / "old" / "kiro_crew" / "_vendor" / "llama_cpp_libs" / "linux_x86_64"
+    host.mp.setattr(_llama_lib_path, "_dropped_inherited", str(installed))
+
+    out, code = host.run(capsys)
+
+    assert out == _READY
+    assert code is None
+
+
 _BROKEN = """\
 Kiro Crew Doctor 👻
 
@@ -586,6 +610,11 @@ Runtime
   <<_doctor_import_path>>
   sqlite fts5: ❌ missing (memory/knowledge search will fail)
                Or use a Python whose SQLite was built with FTS5.
+  tz data:     ⚠️  out of date (older than IANA tzdb 2026b)
+               It still moves America/Vancouver back to UTC-8 on
+               2026-11-01, so a job in that zone runs an hour late.
+               Fix: update the operating system's timezone data
+               (the tzdata package), then restart the gateway.
   <<_doctor_source_checkout>>
 
 Vector Memory (in-process embeddings)
@@ -635,7 +664,7 @@ Connectivity
      Then run: kirocrew token
   auth check:  ❌ external access allowed without token!
 
-❌ Fix these issues: platform composition failed: companion missing, git, node, stale project_dir, agent config, agent model pin, dashboard auth: remote bind without Slack, _doctor_effective_model issue, render_doctor_section issue, _doctor_credentials issue, _doctor_sandbox issue, _doctor_live_target_pointer issue, doctor_dead_paths issue, python deps, _doctor_import_path issue, sqlite fts5, embedding runtime, custom embedding model unusable, speech recogniser (extra_missing), ffmpeg, _doctor_discord issue, _doctor_whatsapp issue, telegram: missing TELEGRAM_BOT_TOKEN and telegram.allowed_chat_ids, loop-stall dump attributed to cron job 'nightly' ('job-7'), recent loop-stall crash dump (2h ago), dashboard auth: no token required on external interface
+❌ Fix these issues: platform composition failed: companion missing, git, node, stale project_dir, agent config, agent model pin, dashboard auth: remote bind without Slack, _doctor_effective_model issue, render_doctor_section issue, _doctor_credentials issue, _doctor_sandbox issue, _doctor_live_target_pointer issue, doctor_dead_paths issue, python deps, _doctor_import_path issue, sqlite fts5, timezone data out of date, embedding runtime, custom embedding model unusable, speech recogniser (extra_missing), ffmpeg, _doctor_discord issue, _doctor_whatsapp issue, telegram: missing TELEGRAM_BOT_TOKEN and telegram.allowed_chat_ids, loop-stall dump attributed to cron job 'nightly' ('job-7'), recent loop-stall crash dump (2h ago), dashboard auth: no token required on external interface
 """
 
 
@@ -666,6 +695,7 @@ def test_a_broken_host_reports_every_issue_in_order_and_exits_one(host, capsys) 
     host.ffmpeg = None
     host.pip_ok = False
     host.fts5 = False
+    host.tz_offset = timedelta(hours=-8)
     host.llama = None
     host.vendored = {"linux-x86_64": ["libllama.so", "libggml.so"]}
     host.custom_model = SimpleNamespace(

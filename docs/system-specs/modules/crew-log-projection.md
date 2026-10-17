@@ -29,6 +29,40 @@ Scope: the SESSION kind. The crew-kind projections (`roster`, `activity`,
 `board`, `budget`, ...) are out of scope here because no crew-kind fold exists yet;
 the crew kind does have writers (`on_crew_dispatch`, `on_crew_report`).
 
+### 1.1 Where the code lives
+
+`crew_log/projection.py` is the module every caller imports, and every name it bound
+before its owners moved out is still reached there. It is a mirror facade
+(`kiro_crew._facade_mirror`): a read of a moved name is served by the owner that binds
+it, and a patch through the facade reaches every owner holding the name, so the moved
+code reads its names as plain module globals. Owners never import the facade, and new
+work goes to the owner of its responsibility rather than back into the facade.
+A new fold goes in its own `projection_<fold>.py`, or in its family's owner, and adds
+only its registry entry (`_FOLDS`, in `crew_log/projection_registry.py`) beside the others.
+
+| Owner | Holds |
+|---|---|
+| `crew_log/projection_catalogue.py` | every registered fold name by key kind, the `_Fold` record, `Projection`, and the folds' one logger |
+| `crew_log/projection_session_log.py` | `open_session_log`, and the identity a fold reads a log under (`log_origin`) |
+| `crew_log/projection_values.py` | the bounded coercions every fold applies to entry data (`_as_str`, `_as_id`, `_keyable`, `TEXT_LIMIT`, `ID_LIMIT`) and `_rows_in` |
+| `crew_log/projection_side_panel.py` | the `status`, `timeline`, `tools` and `approvals` folds and their caps |
+| `crew_log/projection_usage.py` | the `usage` fold, its caps, and the credit table (`CREDIT_SOURCES`) every billing fold charges by |
+| `crew_log/projection_subagents.py` | the `subagents` fold |
+| `crew_log/projection_ledger.py` | the `ledger` slot fold |
+| `crew_log/projection_internal.py` | the internal `class` and `outline` folds |
+| `crew_log/projection_radar.py` | the `radar` slot fold |
+| `crew_log/projection_dashboard.py` | the `panel`, `agentic` and `mistakes` slot folds |
+| `crew_log/projection_work.py` | the `work` slot fold, and which units a work board spans (`_work_units`, `work_slots_naming_board`) |
+| `crew_log/projection_workstreams.py` | the `workstreams` slot fold and its board closure |
+| `crew_log/projection_worktree.py` | the `worktree` tree fold |
+| `crew_log/projection_registry.py` | `_FOLDS`: what each fold touches, copies and retains, its eager or lazy posture, and the import-time checks over the registry |
+| `crew_log/projection_kernel.py` | `Checkpoint` and the pure fold API (`require_name`, `fold_state_version`, `initial`, `advance`, `projection_of`, `fold`) |
+| `crew_log/projection_budget.py` | the warm memo's byte budget: each fold's measured row cost and the operator ceiling |
+| `crew_log/projection_session.py` | folding one session's log on the projection kernel (`SessionProjections`, `fold_session`) and its savepoint |
+| `crew_log/projection_slot_memo.py` | a slot's folds kept warm: the memo, its locks, the revision counter, resume and persist |
+| `crew_log/projection_readers.py` | reading a slot's and a tree's folds (`fold_slot_checkpoint`, `read_slot_projection`, `units_in_succession`, `read_tree_projection`) |
+| `crew_log/projection_session_memo.py` | a session's folds kept warm, and `read_projection` |
+
 ## 2. The fold contract
 
 A projection is a value plus the `seq` it was folded through (FR-5). Two
@@ -1313,7 +1347,7 @@ terminal run:"),
 and what to do (the `kirocrew config set` command for the retention setting,
 named as the one switch that also expires the transcripts the Archive page
 lists, since `store.sweep_expired` runs off the same value), stating no default,
-since the default lives in `config/sections.py` and prose restating it would go
+since the default lives in `config/sections_session.py` and prose restating it would go
 stale silently. Because the live logs go first, what the cap leaves unread is
 closed sessions' logs, and a live row nests on one of those in exactly one
 case: a slot that outlived a gateway restart, whose current log was opened
@@ -1778,9 +1812,9 @@ grew unbounded state loses its savepoint instead of writing an unbounded file on
 every read.
 
 **Changing what a fold stores moves THAT FOLD's `state_version`, and a test
-enforces it.** The number lives on the fold in `projection.py`, beside the `start`
-and `step` whose stored shape it describes, and the projection kernel reads it off
-each definition. It and `_state_matches_fold` both check the payload's SHAPE, so
+enforces it.** The number lives on the fold's own `_FOLDS` entry, the entry that
+names the `start` and `step` whose stored shape it describes (section 1.1 says where
+each fold's code lives), and the projection kernel reads it off each definition. It and `_state_matches_fold` both check the payload's SHAPE, so
 the case neither sees is a fold whose MEANING changes while its keys do not -- a
 counting fix in `usage` or `status` being the likely one. The old build's savepoint
 then resumes onto the new logic, and the long sessions this exists to speed up are

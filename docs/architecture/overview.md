@@ -321,7 +321,7 @@ a surface a human is watching keeps its session, a background job must not.
 
 `kiro_crew.shutdown_event` (an `asyncio.Event`) is the process-wide signal; every
 background loop waits on it so Ctrl-C wakes them immediately instead of at the
-next poll. `_shutdown()` in `slack/gateway.py` then tears down in a deliberate
+next poll. `_shutdown()` in `slack/gateway_runtime/exit_path.py` then tears down in a deliberate
 order, and the order is load-bearing:
 
 1. Stop the work that must not outlive the process or spend the shutdown
@@ -704,7 +704,7 @@ detail; this table is only an index.
 |---|---|---|
 | ACP client (JSON-RPC transport to kiro-cli) | `src/kiro_crew/acp/` | [acp-client.md](../system-specs/modules/acp-client.md) |
 | App Kit platform contracts | `src/kiro_crew/apps/` | [app-kit-platform.md](../system-specs/modules/app-kit-platform.md) |
-| Artifacts (persisted generated UI) | `src/kiro_crew/artifacts.py`, `artifact_store/` | [artifacts.md](../system-specs/modules/artifacts.md) |
+| Artifacts (persisted generated UI) | `src/kiro_crew/artifacts.py` (and its `artifacts_*` owner modules), `artifact_store/` | [artifacts.md](../system-specs/modules/artifacts.md) |
 | Browser automation auth layer | `src/kiro_crew/browser/` | [browser.md](../system-specs/modules/browser.md) |
 | Channel history buffer | `src/kiro_crew/channel_history.py` | [channel-history.md](../system-specs/modules/channel-history.md) |
 | CLI surface | `src/kiro_crew/cli.py` | [cli.md](../system-specs/modules/cli.md) |
@@ -737,9 +737,9 @@ detail; this table is only an index.
 | Session manager (pool, expiry, compaction) | `src/kiro_crew/session.py` | [session.md](../system-specs/modules/session.md) |
 | Side conversations | `src/kiro_crew/dashboard/side_state.py` | [side.md](../system-specs/modules/side.md) |
 | Slack gateway and handler | `src/kiro_crew/slack/` | [slack-gateway.md](../system-specs/modules/slack-gateway.md) |
-| Subagents (parallel background agents) | `src/kiro_crew/subagent.py` | [subagent.md](../system-specs/modules/subagent.md) |
+| Subagents (parallel background agents) | `src/kiro_crew/subagent.py`, `subagent_parts/`, `subagent_manager/` | [subagent.md](../system-specs/modules/subagent.md) |
 | Task state machine | `src/kiro_crew/task.py` | [task.md](../system-specs/modules/task.md) |
-| TaskRunner (spec to plan to execution) | `src/kiro_crew/taskrunner.py` | [taskrunner.md](../system-specs/modules/taskrunner.md) |
+| TaskRunner (spec to plan to execution) | `src/kiro_crew/taskrunner.py` + `taskrunner_parts/` | [taskrunner.md](../system-specs/modules/taskrunner.md) |
 | Themes | `src/kiro_crew/dashboard/handlers/themes.py` | [themes.md](../system-specs/modules/themes.md) |
 | Third-party account connections | `src/kiro_crew/connections/` | [connections.md](../system-specs/modules/connections.md) |
 

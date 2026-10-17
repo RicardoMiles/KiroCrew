@@ -9,7 +9,12 @@ editor -- would let two crewmates overwrite each other's dashboard.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
+import random
+import re
+import string
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
@@ -20,6 +25,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from kiro_crew import members as members_mod
 from kiro_crew.dashboard.handlers import member_dashboard as routes
 from kiro_crew.dashboard_templates import catalog, instance
+from kiro_crew.platform.context import redact_via_context
 
 #: The REAL resolvers, bound at import time.
 #:
@@ -99,7 +105,7 @@ async def _none(*_a, **_k):
 
 
 @asynccontextmanager
-async def _client():
+async def _client(state=None):
     """A started client that always closes.
 
     An ``async with`` helper rather than an ``@pytest.fixture``, by this repo's
@@ -109,8 +115,13 @@ async def _client():
     Closing is not tidiness. A ``TestClient`` owns an aiohttp session AND a listening
     socket, so a returned-but-never-closed client leaks two descriptors per test and,
     on a loaded runner, fails UNRELATED tests with EMFILE.
+
+    *state* stands in for the gateway's ``DashboardState`` where a case needs one;
+    without it the app carries none, as every other case here reads it.
     """
     app = web.Application()
+    if state is not None:
+        app["state"] = state
     routes.register_member_dashboard_routes(app)
     c = TestClient(TestServer(app))
     await c.start_server()
@@ -234,6 +245,69 @@ async def test_a_preview_read_with_nothing_staged_is_a_404_the_tab_can_name():
         resp = await client.get(_q("", preview="1"))
         assert resp.status == 404
         assert (await resp.json())["code"] == "no_preview"
+
+
+def _template_at_the_ceiling() -> str:
+    """A second template whose page is exactly the frame's ceiling. Returns the page."""
+    from kiro_crew import dashboard_frame
+
+    head, tail = PAGE + "<script>", "</script>"
+    page = head + "x" * (dashboard_frame.MAX_PAGE_BYTES - len(head) - len(tail)) + tail
+    directory = catalog.builtin_dir() / "big-board"
+    directory.mkdir()
+    manifest = _manifest(id="big-board", title="Big board")
+    (directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (directory / "template.html").write_text(page, encoding="utf-8")
+    return page
+
+
+async def test_a_template_page_at_the_frames_ceiling_previews_applies_and_draws(monkeypatch):
+    """The template-folder path at the ceiling, end to end, with the scrub off the loop.
+
+    The read scrubs the stored page before it answers, and near the ceiling that takes
+    hundreds of milliseconds -- so it runs off the event loop, where the pause would
+    otherwise land on every other session's chat.
+    """
+    import threading
+
+    page = _template_at_the_ceiling()
+    loop_thread = threading.current_thread()
+    on_loop: list[bool] = []
+    scrub = routes._safe_body
+
+    def _scrub(body):
+        on_loop.append(threading.current_thread() is loop_thread)
+        return scrub(body)
+
+    monkeypatch.setattr(routes, "_safe_body", _scrub)
+    async with _client() as client:
+        instance.stage_preview(SLUG, template_id="big-board")
+        resp = await client.get(_q("", preview="1"))
+        assert resp.status == 200, await resp.text()
+        preview = await resp.json()
+        instance.apply_preview(SLUG)
+        resp = await client.get(_q(""))
+        assert resp.status == 200, await resp.text()
+        live = await resp.json()
+    assert preview["preview"] is True and page in preview["rendered_html"]
+    assert live["state"] == "live" and page in live["rendered_html"]
+    assert live["template"] == {"id": "big-board", "version": 1}
+    assert on_loop == [False, False]
+
+
+async def test_a_preview_read_the_store_refuses_answers_in_the_stores_words(monkeypatch):
+    """A store refusal on the staged read (a linked session directory raises
+    `InstanceError`) is the route's structured answer, not aiohttp's bare 500."""
+    from kiro_crew.dashboard.handlers import member_dashboard as md
+
+    def _refuse(_slug):
+        raise instance.InstanceError("the session dashboard directory is a link")
+
+    monkeypatch.setattr(md, "_preview_record", _refuse)
+    async with _client() as client:
+        resp = await client.get(_q("", preview="1"))
+        assert resp.status == 500
+        assert (await resp.json())["code"] == "dashboard_failed"
 
 
 # --------------------------------------------------------------------------
@@ -698,6 +772,323 @@ def test_a_credential_in_a_page_is_redacted_before_it_reaches_the_reader():
     assert "credits" in routes._template_text_safe(page), "the redaction ate the bindings"
 
 
+#: 62 letters and digits, then 18 marks: the 80-character palette a pixel-art page indexes
+#: into. Any 40-character window of it holds forty distinct characters, which is what the
+#: bare-secret pass reads as a key.
+_PALETTE = string.ascii_lowercase + string.ascii_uppercase + string.digits + "#$%&*+-=?@^_~:;<>!"
+
+
+def _bare_key() -> str:
+    """Forty base64 characters of a digest: a label-less secret key, built at runtime."""
+    return base64.b64encode(hashlib.sha256(b"kc-bare-0").digest()).decode()[:40]
+
+
+def test_a_script_is_served_as_its_author_wrote_it():
+    """The bare-secret pass reads an alphabet as a key, and the page ran on the marker.
+
+    The script loaded, nothing reported an error, and every lookup into the alphabet
+    answered the wrong index.
+    """
+    page = f'<canvas id="c"></canvas><script>var ART_CHARS = "{_PALETTE}";</script>'
+    assert redact_via_context(page) != page, "the premise: the whole-page pass rewrites it"
+    assert routes._template_text_safe(page) == page
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "<style>@font-face {{ font-family: X; src: url(data:font/woff2;base64,{blob}) }}</style>",
+        "<style>.a {{ background: url(data:image/png;base64,{blob}) }}</style>",
+        "<script>var img = new Image(); img.src = 'data:image/png;base64,{blob}';</script>",
+        '<script type="application/json">{{"font": "data:font/woff2;base64,{blob}"}}</script>',
+    ],
+)
+def test_a_long_base64_data_uri_in_a_stylesheet_or_script_is_served_as_written(template):
+    """A font or an image inlined into the page's code is binary, so the bare-secret
+    pass reads windows of it as keys and the browser then decodes the marker."""
+    blob = base64.b64encode(
+        b"".join(hashlib.sha256(bytes([n])).digest() for n in range(12))
+    ).decode()
+    page = template.format(blob=blob)
+    assert redact_via_context(page) != page, "the premise: the whole-page pass rewrites it"
+    assert routes._template_text_safe(page) == page
+
+
+def test_the_same_run_outside_a_script_or_stylesheet_is_still_masked():
+    run = _PALETTE[:62]
+    for page in (
+        f"<p>{run}</p>",
+        f'<p title="{run}">x</p>',
+        f'<a href="#" onclick="draw(\'{run}\')">x</a>',
+        f'<script src="/lib.js" data-key="{run}"></script>',
+    ):
+        assert run not in routes._template_text_safe(page), page
+
+
+def test_a_label_less_key_in_visible_text_is_masked_beside_a_script_that_keeps_its_literal():
+    page = f"<script>var A = '{_PALETTE}';</script><p>key {_bare_key()}</p>"
+    out = routes._template_text_safe(page)
+    assert f"var A = '{_PALETTE}';" in out
+    assert _bare_key() not in out
+
+
+def test_a_credential_written_into_a_script_or_stylesheet_is_still_masked():
+    # ASSEMBLED at runtime for the reason the page case above gives.
+    dashes = "-" * 5
+    kind = "RSA PRIVATE KEY"
+    secrets = [
+        "AKIA" + "IOSFODNN7" + "EXAMPLE",
+        "ghp" + "_" + "ZXAMPLEzxampleZXAMPLEzxampleZXAMPLE12",
+        f"{dashes}BEGIN {kind}{dashes}\nMIIEowIBAAKCAQEA3Zx8kUoTBqQw0hXvPj9mKpLq2yTnVr7\n"
+        f"{dashes}END {kind}{dashes}",
+    ]
+    for secret in secrets:
+        for page in (
+            f"<script>var k = `{secret}`; draw(k);</script>",
+            f"<style>/* {secret} */ .a {{ color: red }}</style>",
+        ):
+            out = routes._template_text_safe(page)
+            assert secret not in out, page
+            assert out.startswith(page[:8]) and out.endswith(page[-9:]), "the tags were eaten"
+
+
+@pytest.mark.parametrize("keep_first", [True, False])
+@pytest.mark.parametrize("length", [30, 36, 39])
+def test_a_key_id_glued_to_a_partial_key_is_masked_as_one_run_beside_a_style(keep_first, length):
+    """The full pass reads the two as one run; rewriting the id first leaves a tail under 40."""
+    key_id = "AKIA" + "IOSFODNN7" + "EXAMPLE"
+    tail = _bare_key()[:length]
+    run = key_id + tail if keep_first else tail + key_id
+    page = f"<p>{run}</p><style>a {{ color: red }}</style>"
+    out = routes._template_text_safe(page)
+    assert out == redact_via_context(page)
+    assert tail not in out
+
+
+def test_a_script_holding_a_masked_credential_still_keeps_its_literal():
+    """The page changes under the scrub here, so the result is read again before it is served."""
+    key_id = "AKIA" + "IOSFODNN7" + "EXAMPLE"
+    page = f"<script>var A = '{_PALETTE}'; var k = '{key_id}';</script><p>{_bare_key()}</p>"
+    out = routes._template_text_safe(page)
+    assert f"var A = '{_PALETTE}';" in out
+    assert key_id not in out
+    assert _bare_key() not in out
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        # A PEM block wraps a nested script opener, so the first end tag after it closes the script.
+        "<script>\n{pem}\n// </script><p>{key}</p>\n</script>",
+        # A labelled value runs through the start tag that follows its label, or the end tag.
+        "aws_secret_access_key=<script>{key}</script>",
+        "aws_secret_access_key=<script/c>{key}</script>",
+        "<script/aws_secret_access_key=>{key}</script>",
+    ],
+)
+def test_a_rule_that_rewrites_the_markup_around_a_script_cannot_turn_its_text_into_prose(template):
+    """A rule that takes tags with it must not leave the text it spared to be read as prose.
+
+    The browser reads the page the rules leave, so the script text is chosen from that page and
+    not from the page before the rules ran.
+    """
+    dashes = "-" * 5
+    pem = (
+        f"{dashes}BEGIN PRIVATE KEY{dashes}\nMIIEowIBAAKCAQEA3Zx8kUoTBqQw0hXvPj9mKpLq2yTnVr7\n"
+        f"<!--<script>\n{dashes}END PRIVATE KEY{dashes}"
+    )
+    page = template.format(pem=pem, key=_bare_key())
+    assert _bare_key() not in routes._template_text_safe(page)
+
+
+def _page_vocabulary():
+    """Tags, comment and script openers, the rules that reach across them, keys, and glued runs."""
+    dashes = "-" * 5
+    keys = [
+        k
+        for k in (
+            base64.b64encode(hashlib.sha256(b"kc-bare-%d" % n).digest()).decode()[:40]
+            for n in range(40)
+        )
+        if k not in redact_via_context(f"<p>{k}</p>")
+    ]
+    assert len(keys) >= 10, "the premise: the full pass masks a key standing alone"
+    key_id = "AKIA" + "IOSFODNN7" + "EXAMPLE"
+    tails = [k[:36] for k in keys[:6]]
+    structure = [
+        "<script>", "</script>", "<style>", "</style>", "<!--", "-->", "<!--<script>", "<p>",
+        "</p>", '<script src="', '">', ">", "<", "\n", " ", "//", "<script ", "<scr", "ipt>",
+        "<noscript>", "<template>", "<textarea>", "</textarea>", "var s = '", "'", ";",
+    ]  # fmt: skip
+    rules = [
+        f"{dashes}BEGIN PRIVATE KEY{dashes}", f"{dashes}END PRIVATE KEY{dashes}",
+        "aws_secret_access_key=", "aws_secret_access_key = ", "password=", "token=",
+        "api_key=", "const password =\n    ", "headers['X-Api-Key'] = '", key_id,
+    ]  # fmt: skip
+    glued = [key_id + t for t in tails] + [t + key_id for t in tails]
+    return structure, rules, glued, keys, tails
+
+
+def test_a_page_without_an_alphabet_or_a_data_uri_is_scrubbed_exactly_as_the_full_pass_does():
+    """Whatever the markup, the scrub differs from the full pass only by the two shapes it keeps.
+
+    The pages are seeded mixes of tags, comment and script openers, the rules that reach across
+    them (a PEM block, a labelled value), keys and keys glued to a key id. None holds an
+    alphabet or a data URI, so every page must come out as the full pass makes it.
+    """
+    structure, rules, glued, keys, _tails = _page_vocabulary()
+    rng = random.Random(20815)
+    differing = []
+    for _ in range(3000):
+        pieces = []
+        for _ in range(rng.randint(3, 16)):
+            pick = rng.random()
+            pieces.append(
+                rng.choice(structure)
+                if pick < 0.4
+                else (
+                    rng.choice(rules)
+                    if pick < 0.65
+                    else rng.choice(glued) if pick < 0.75 else rng.choice(keys)
+                )
+            )
+        page = "".join(pieces)
+        if routes._template_text_safe(page) != redact_via_context(page):
+            differing.append(page)
+    assert not differing, differing[:3]
+
+
+def _in_a_data_uri_payload(page: str, secret: str) -> bool:
+    """Whether every run of *page* that holds *secret* is a payload behind a data URI header."""
+    runs = [m for m in re.finditer(r"[A-Za-z0-9+/]{40,}", page) if secret in m.group()]
+    return bool(runs) and all(
+        len(m.group()) >= 64
+        and re.search(r"data:[^,;]+/[^,;]+(?:;[^,;]+)*;base64,\Z", page[: m.start()], re.I)
+        for m in runs
+    )
+
+
+def test_an_alphabet_and_a_data_uri_survive_and_nothing_else_the_full_pass_masks_does():
+    """The two shapes the scope keeps are kept; every key beside them is masked all the same.
+
+    The one place a key the full pass masks may be served is the stated limit: inside a run of
+    64 characters or more directly behind a ``data:`` header. The test finds that run itself.
+    """
+    structure, rules, glued, keys, tails = _page_vocabulary()
+    shapes = [_PALETTE, "data:image/png;base64," + "QUJD" * 40]
+    rng = random.Random(20816)
+    kept = limit = 0
+    for _ in range(3000):
+        pieces = []
+        for _ in range(rng.randint(3, 16)):
+            pick = rng.random()
+            pieces.append(
+                rng.choice(structure)
+                if pick < 0.35
+                else (
+                    rng.choice(rules)
+                    if pick < 0.55
+                    else (
+                        rng.choice(glued)
+                        if pick < 0.65
+                        else rng.choice(keys) if pick < 0.8 else rng.choice(shapes)
+                    )
+                )
+            )
+        page = "".join(pieces)
+        served = routes._template_text_safe(page)
+        masked_by_main = redact_via_context(page)
+        for secret in (*keys, *tails):
+            if (secret in served) == (secret in masked_by_main):
+                continue
+            assert secret in served and _in_a_data_uri_payload(page, secret), (page, served)
+            limit += 1
+        kept += sum(shape in served for shape in shapes)
+    assert kept > 0, "no alphabet or data URI was ever kept, so this proves nothing"
+    assert limit > 0, "the stated limit never came up, so its test proves nothing"
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "<!-- old <script> tag removed --><p>{key}</p>",
+        '<p title="<style>">{key}</p>',
+        "<textarea><script></textarea><p>{key}</p>",
+        "<title><style></title><p>{key}</p>",
+        "<script data-note='>'>var a = 1;</script><p data-q='<style>'>{key}</p>",
+        "<script>var a = 1;<p>{key}</p>",
+        "<svg><script/></svg><p>{key}</p><script>var a = 1;</script>",
+        "<svg><script><p>{key}</p></script></svg>",
+        "<math><style><p>{key}</p></style></math>",
+        '<p a=x"b="c>d" e<textarea x><script>{key}</script></textarea>',
+        "<math></svg><style><mtext>{key}</mtext></style></math>",
+        '<svg><foreignObject><div></svg></div></foreignObject><script><a title="{key}">x</a></script>',
+        "<select><style></select><p>{key}</p></style>",
+        "<noscript><textarea></noscript><script>{key}</script></textarea></noscript>",
+        "<template><col><style></template><p>{key}</p></style>",
+        "<script\u00a0>var a = 1;</script\u00a0><p>{key}</p>",
+        "<\u017fcript>var a = 1;</\u017fcript><p>{key}</p><style>a{{}}</style>",
+    ],
+)
+def test_prose_a_browser_reads_as_prose_keeps_every_pass_whatever_markup_surrounds_it(template):
+    """A tag the HTML tokenizer would not open must not turn the text after it into code.
+
+    Each page puts a key-shaped run in a paragraph. Reading the page the way a browser does
+    leaves the paragraph as prose, and where the scan cannot tell it reads nothing as code.
+    """
+    key = _bare_key()
+    assert key not in routes._template_text_safe(template.format(key=key))
+
+
+def test_a_real_script_beside_markup_that_only_looks_like_one_keeps_its_literal():
+    page = (
+        f"<!-- <script> --><svg><circle/></svg><select><option>a</option></select>"
+        f"<script>var A = '{_PALETTE}';</script>"
+        f'<p title="<style>">{_bare_key()}</p>'
+    )
+    out = routes._template_text_safe(page)
+    assert f"var A = '{_PALETTE}';" in out
+    assert _bare_key() not in out
+
+
+def test_past_the_bound_a_scripts_text_gets_every_pass_not_fewer():
+    """Handing text to the code function is a relaxation, so a page cannot earn it by length.
+
+    Only the first MAX_CODE_PIECES non-empty elements are handed over. Every element after
+    them goes back to the full pass, and empty elements neither spend the bound nor change
+    what is masked. So adding elements can only move text from the relaxed pass to the strict one.
+    """
+    from kiro_crew import dashboard_frame
+
+    bound = dashboard_frame.MAX_CODE_PIECES
+    key_id = "AKIA" + "IOSFODNN7" + "EXAMPLE"
+    first = f"<script>var FIRST = '{_PALETTE}';</script>"
+    spent = "<script></script><script>var a = 1;</script>" * (bound - 1)
+    past = "<script>var a = 1;</script>" * 4
+    last = f"<script>var LAST = '{_PALETTE}'; var k = '{key_id}'; var b = '{_bare_key()}';</script>"
+    page = first + spent + past + last
+    assert len(dashboard_frame.code_spans(page)) > bound, "the premise: elements past the bound"
+
+    out = routes._template_text_safe(page)
+
+    assert f"var FIRST = '{_PALETTE}';" in out, "the first element lost its literal"
+    assert key_id not in out, "a credential in the last element was served"
+    assert _bare_key() not in out, "the last element kept a key-shaped run the full pass masks"
+    assert f"var LAST = '{_PALETTE}'" not in out, "the last element kept its literal"
+    assert out.count("<script>") == page.count("<script>"), "a tag was eaten"
+
+
+def test_a_page_with_no_script_or_stylesheet_is_scrubbed_as_it_always_was():
+    token = "AKIA" + "IOSFODNN7" + "EXAMPLE"
+    page = f'<p>key {token} and {_bare_key()}</p><b data-dashboard-field="credits"></b>'
+    assert routes._template_text_safe(page) == redact_via_context(page) != page
+
+
+def test_the_raw_body_keeps_a_script_as_written_too():
+    page = f"<script>var A = '{_PALETTE}';</script>"
+    assert routes._safe_body({"html": page, "state": "live"})["html"] == page
+
+
 def test_a_credential_in_a_manifest_string_is_redacted():
     """``title`` and ``description`` are free prose.
 
@@ -965,3 +1356,489 @@ class TestAStoredPageCannotBeEdited:
         assert edited.instance_version == 2
         assert edited.manifest["title"] == "Retitled"
         assert edited.html == PAGE, "a manifest edit moved the page"
+
+
+class TestAStagedPageReachesOnlyItsOwnersPreview:
+    """WHERE A STAGED PAGE CAN BE SEEN, enumerated from the source rather than claimed.
+
+    A staged page is bytes nobody has applied. It carries this crewmate's fold values
+    exactly as the applied page does, and it is written beside the record without moving
+    the version -- so the question that matters is not whether staging is safe but
+    whether a staged page can be SERVED anywhere except to the one person entitled to
+    look at it and say yes.
+
+    Three facts answer it, and each is read off the modules rather than restated:
+
+    1. there is exactly ONE place staged bytes are turned into a record to render, and
+       it sits behind the same owner gate as the applied read;
+    2. every route that emits a page is owner-gated, so there is no second door;
+    3. the link handed back by the staging call is that same owner-gated read, not a
+       route of its own and not a capability token.
+
+    Source-level on purpose. A behavioural test proves one request was refused; what is
+    worth guarding here is that no OTHER caller exists, which is a property of the call
+    graph and is exactly what a later edit breaks silently.
+    """
+
+    def _source(self, module) -> str:
+        import inspect
+
+        return inspect.getsource(module)
+
+    def test_staged_bytes_have_exactly_one_reader_in_the_product(self) -> None:
+        """`instance.staged_preview` is the only way to read what is staged, and the
+        only caller outside the store itself is `member_dashboard._preview_record`."""
+        import pathlib
+
+        from kiro_crew.dashboard.handlers import member_dashboard
+        from kiro_crew.dashboard_templates import instance as instance_store
+
+        root = pathlib.Path(instance_store.__file__).resolve().parents[1]
+        callers = sorted(
+            # `as_posix` so the expected paths below read the same on Windows, where
+            # `str()` spells them with backslashes.
+            path.relative_to(root).as_posix()
+            for path in root.rglob("*.py")
+            if "staged_preview(" in path.read_text(encoding="utf-8")
+        )
+        assert callers == [
+            "dashboard/handlers/member_dashboard.py",
+            "dashboard_templates/instance.py",
+        ], f"a new reader of staged bytes appeared: {callers}"
+        # In the store itself the second caller is `apply_preview`, which CONSUMES the
+        # preview into a version rather than serving it.
+        assert "staged_preview(slug)" in self._source(instance_store.apply_preview)
+        # And in the handler, the one reader is the preview record builder.
+        assert "instance.staged_preview(slug)" in self._source(member_dashboard._preview_record)
+
+    def test_the_preview_record_is_built_only_under_the_preview_query(self) -> None:
+        """`_preview_record` has one call site, and it is guarded by `preview=1`."""
+        from kiro_crew.dashboard.handlers import member_dashboard
+
+        body = self._source(member_dashboard._serve)
+        assert body.count("_preview_record(") == 1
+        guard = 'if request.query.get("preview") == "1":'
+        assert guard in body
+        # The guard precedes the only call, so the staged read is inside the branch.
+        assert body.index(guard) < body.index("_preview_record(")
+
+    def test_every_route_that_emits_a_page_is_owner_gated(self) -> None:
+        """Both page routes, and the refetch that answers their values.
+
+        The preview is served by `_serve`, which neither route reaches before its own
+        `_owner_only` call -- so the staged page inherits the applied page's gate rather
+        than carrying one of its own.
+        """
+        from kiro_crew.dashboard.handlers import member_dashboard
+
+        for handler in (
+            member_dashboard.api_member_dashboard,
+            member_dashboard.api_session_dashboard,
+            member_dashboard.api_member_dashboard_refetch,
+        ):
+            source = self._source(handler)
+            assert "_owner_only(" in source, handler.__name__
+            # Returned on refusal, not merely computed: a gate whose answer is dropped
+            # is not a gate.
+            assert "return owner_denied" in source, handler.__name__
+        # `_serve` is reached only from those two page routes.
+        module_source = self._source(member_dashboard)
+        assert module_source.count("await _serve(request") == 2
+
+    def test_a_non_preview_read_serves_the_applied_record(self) -> None:
+        """The other branch reads the stored record, or the shipped default when the
+        crewmate adopted nothing. Neither is a staged page."""
+        from kiro_crew.dashboard.handlers import member_dashboard
+
+        body = self._source(member_dashboard._serve)
+        assert "instance.read(slug)" in body
+        assert "instance.default_instance(slug)" in body
+        # The applied read sits AFTER the preview branch returns, so the two cannot both
+        # run for one request.
+        assert body.index('if request.query.get("preview") == "1":') < body.index(
+            "instance.read(slug)"
+        )
+
+    def test_the_package_route_cannot_serve_a_staged_page(self) -> None:
+        """A `view.html` package page is read from the artifact store, which has no
+        staged side at all, so the third page producer is outside this question."""
+        from kiro_crew.dashboard.handlers import member_dashboard
+
+        source = self._source(member_dashboard._serve_package)
+        assert "staged_preview" not in source
+        assert "_preview_record" not in source
+
+    def test_the_preview_link_is_the_owner_gated_read(self) -> None:
+        """Not a route of its own and not a capability token: a second door would be a
+        second place to get the gate right, and a token would be a second credential
+        for data its holder can already read.
+
+        The link is the PAGE with this crewmate open and its Dashboard tab on the
+        staged read, named by the exact crew name -- slugification is lossy, so the
+        page and the read it makes both refuse a slug alone.
+        """
+        from urllib.parse import parse_qs, urlparse
+
+        from kiro_crew.dashboard_templates import instance as instance_store
+
+        link = instance_store.preview_url(MEMBER)
+        parsed = urlparse(link)
+        assert parsed.path == "/members", "the link is a JSON read rather than a page"
+        query = parse_qs(parsed.query)
+        # The exact crew name, read back through the decoder because it is encoded.
+        assert query.get("member") == [MEMBER], "the link names a slug, which this read refuses"
+        assert query.get("dashboard") == ["preview"]
+        # No second credential rides along: the gate is the route's own owner check.
+        assert "token" not in query
+        assert instance_store.session_preview_url("slot-1") == (
+            "/api/chat/slots/slot-1/dashboard?preview=1"
+        )
+        for link in (instance_store.preview_url(SLUG), instance_store.session_preview_url("s")):
+            assert "token" not in link and "sig" not in link
+
+    def test_the_staging_route_hands_back_a_link_and_no_page(self) -> None:
+        """`api_dashboard_preview` stages and returns the wire record. It composes
+        nothing, so there is no rendered staged page anywhere but behind the gate."""
+        from kiro_crew.dashboard.handlers import agent_panel
+
+        source = self._source(agent_panel.api_dashboard_preview)
+        assert "stage_preview(" in source
+        assert "rendered_html" not in source
+        assert "render_package_page" not in source
+
+    def test_the_preview_branch_is_reached_before_any_binding_is_resolved(self) -> None:
+        """THE CONVERSE, and the half that is easy to lose: a preview must reach the
+        staged page rather than some other page.
+
+        The tab's preview link carries no `dashboard=`, so a binding resolved before
+        this branch would serve the live PACKAGE page to a person deciding whether to
+        apply a staged one. Pinned as an ORDER, because an order is what a later edit
+        undoes without changing any single line's meaning.
+        """
+        from kiro_crew.dashboard.handlers import member_dashboard
+
+        body = self._source(member_dashboard._serve)
+        decided = 'staged_only = request.query.get("preview") == "1" and not package_slug'
+        guarded = "if not staged_only:"
+        assert decided in body, "the preview decision is no longer taken from the query alone"
+        assert guarded in body, "the binding resolution is no longer guarded by that decision"
+        assert body.index(decided) < body.index(guarded), (
+            "the binding is resolved before the preview branch is decided, so a preview "
+            "can reach the package page again"
+        )
+        # That the resolution really is INSIDE the guard is measured on behaviour
+        # instead: `test_a_preview_read_does_not_even_look_the_binding_up` in
+        # `test_member_dashboard_package_route.py` counts the calls. The resolver's name
+        # is deliberately not spelled here -- that file owns the only two mentions of
+        # it, which is itself a pinned invariant.
+
+    def test_only_three_places_in_the_product_emit_a_page(self) -> None:
+        """The whole-file count, so a fourth producer added later fails here.
+
+        Two are the branches of `_serve` (staged under the preview guard, applied
+        otherwise) and the third is the package route. All three are behind the same
+        owner gate.
+        """
+        import pathlib
+
+        from kiro_crew.dashboard_templates import instance as instance_store
+
+        root = pathlib.Path(instance_store.__file__).resolve().parents[1]
+        emitters: dict[str, int] = {}
+        for path in root.rglob("*.py"):
+            count = path.read_text(encoding="utf-8").count('"rendered_html"')
+            if count:
+                # `as_posix` for the same reason as the reader scan above.
+                emitters[path.relative_to(root).as_posix()] = count
+        assert emitters == {"dashboard/handlers/member_dashboard.py": 3}, emitters
+
+
+# --------------------------------------------------------------------------
+# the STAGED composed page: read back for a look, and nothing installed
+# --------------------------------------------------------------------------
+
+
+def _package(**over) -> dict:
+    """A package the store's own gate accepts, bound to this crewmate."""
+    package = {
+        "kind": "dashboard",
+        "bound_to": f"crewmate:{SLUG}",
+        "model": {
+            "types": {
+                "open_prs": {"type": "number", "source": {"agentic": True}, "label": "Open PRs"},
+                "headline": {"type": "text", "source": {"agentic": True}},
+            }
+        },
+        "view": {
+            "blocks": [
+                {"id": "lead", "type": "stat", "fields": ["open_prs"], "title": "Open"},
+                {"id": "note", "type": "list", "fields": ["headline"]},
+            ]
+        },
+        "theme": {"tokens": {"--accent": "oklch(0.7 0.15 150)"}},
+    }
+    package.update(over)
+    return package
+
+
+class TestTheStagedComposedPage:
+    """A composed package is never staged: ``dashboard_save`` puts it in force.
+
+    So the ``?preview=1`` read only ever serves a staged TEMPLATE. A staging file an
+    older gateway left holding a package payload reads as nothing staged.
+    """
+
+    async def test_a_package_left_staged_by_an_older_gateway_is_nothing_to_preview(
+        self,
+    ) -> None:
+        from kiro_crew.artifact_store.dashboard_package import canonical_package_content
+
+        directory = instance.instance_dir(SLUG)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "preview.json").write_text(
+            json.dumps(
+                {
+                    "schema": instance.SCHEMA_VERSION,
+                    "slug": SLUG,
+                    "package_content": canonical_package_content(json.dumps(_package())),
+                    "staged_ms": instance._now_ms(),
+                }
+            ),
+            encoding="utf-8",
+        )
+        async with _client() as client:
+            resp = await client.get(_q("", preview=1))
+            body = await resp.json()
+        assert resp.status == 404, body
+        assert body["code"] == "no_preview", body
+
+    async def test_a_staged_template_still_answers_its_own_preview(self) -> None:
+        """Both readers answer None for the other's payload, so one page comes back."""
+        instance.stage_preview(SLUG, template_id="fixture-board")
+        async with _client() as client:
+            body = await (await client.get(_q("", preview=1))).json()
+        assert body["preview"] is True
+        assert body["template"]["id"] == "fixture-board"
+        assert "manifest" in body
+
+
+# --------------------------------------------------------------------------
+# when the person last spoke in the page's chat
+# --------------------------------------------------------------------------
+
+#: One instant: the person's reply. Every case states it in UTC and writes it the way
+#: a chat row or the stored stamp carries it.
+SPOKE = "2026-10-13T23:49:04+00:00"
+
+
+class _Window:
+    """The one member of a live chat slot the stamp is read from."""
+
+    def __init__(self, rows: list[dict] | None = None) -> None:
+        self._rows = list(rows or [])
+
+    def loaded_messages(self) -> list[dict]:
+        return list(self._rows)
+
+
+def _human(ts: str, **meta) -> dict:
+    """A row a human send path wrote, with the marker those paths set."""
+    from kiro_crew.history import HUMAN_TURN_META_KEY
+
+    return {
+        "role": "user",
+        "content": "reply",
+        "ts": ts,
+        "meta": {HUMAN_TURN_META_KEY: True, **meta},
+    }
+
+
+def _naive_local(utc: str, zone: str) -> str:
+    """*utc* as the naive local wall clock a row written in *zone* carries."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    return datetime.fromisoformat(utc).astimezone(ZoneInfo(zone)).replace(tzinfo=None).isoformat()
+
+
+class _Log:
+    """A transcript store holding one metadata line per transcript key."""
+
+    def __init__(self, lines: dict[str, dict]) -> None:
+        self.lines = lines
+        self.asked: list[str] = []
+
+    def get_metadata(self, key: str) -> dict:
+        self.asked.append(key)
+        return dict(self.lines.get(key, {}))
+
+
+class _ChatState:
+    """The two things the read takes from ``DashboardState``: live slots and the log."""
+
+    def __init__(self, slots: dict | None = None, log: _Log | None = None) -> None:
+        self.slots = dict(slots or {})
+        self.conversation_log = log
+        self.asked: list[str] = []
+
+    def get_slot(self, name: str):
+        self.asked.append(name)
+        return self.slots.get(name)
+
+
+class TestThePageIsToldWhenThePersonLastSpoke:
+    """The stamp telling a page the person wrote in the chat after a card was written.
+
+    A reply typed in the chat, an option clicked there and a steer into a running turn
+    never pass through the page, and a steer writes no crew-log entry, so the only
+    record of one is the chat slot's own human-marked row.
+    """
+
+    def test_the_newest_row_a_person_wrote_is_the_stamp_a_steer_included(self) -> None:
+        rows = [
+            _human("2026-10-13T23:40:00+00:00"),
+            {"role": "assistant", "content": "two to decide", "ts": "2026-10-13T23:45:00+00:00"},
+            _human(SPOKE, steer=True),
+        ]
+        assert routes._last_user_at_of(_Window(rows)) == SPOKE
+
+    def test_a_user_row_no_person_wrote_is_not_a_reply(self) -> None:
+        """An app wake is a `user` row with no human marker; it must not fold a card."""
+        rows = [
+            _human(SPOKE),
+            {"role": "user", "content": "[wake]", "ts": "2026-10-13T23:55:00+00:00"},
+            {"role": "assistant", "content": "ok", "ts": "2026-10-13T23:56:00+00:00"},
+        ]
+        assert routes._last_user_at_of(_Window(rows)) == SPOKE
+
+    def test_with_no_human_row_in_memory_the_stored_stamp_answers(self) -> None:
+        """A restored row whose window was never loaded, or no live slot at all."""
+        assert routes._last_user_at_of(_Window([]), SPOKE) == SPOKE
+        assert routes._last_user_at_of(None, SPOKE) == SPOKE
+        assert routes._last_user_at_of(None, "") == ""
+        assert routes._last_user_at_of(None, None) == ""
+
+    @pytest.mark.parametrize("zone", ["UTC", "Pacific/Kiritimati", "America/St_Johns"])
+    def test_the_later_instant_wins_and_reaches_the_page_in_utc(self, local_tz, zone) -> None:
+        """A naive row is the writer's local clock. Compared as TEXT against an aware
+        stamp it is in another domain: under +14:00 the row reads a day ahead and wins
+        when it is the earlier instant, and under -03:30 it reads behind and loses when
+        it is the later one."""
+        local_tz(zone)
+        row = _Window([_human(_naive_local(SPOKE, zone))])
+        assert routes._last_user_at_of(row) == SPOKE
+        assert routes._last_user_at_of(row, "2026-10-13T23:48:00+00:00") == SPOKE
+        assert routes._last_user_at_of(row, "2026-10-13T23:50:00+00:00") == (
+            "2026-10-13T23:50:00+00:00"
+        )
+        # A stored stamp in another zone's offset is the same instant, said in UTC.
+        assert routes._last_user_at_of(None, "2026-10-14T13:49:04+14:00") == SPOKE
+
+    def test_the_stamp_is_whole_seconds_like_the_write_time_it_is_compared_with(self) -> None:
+        """A reply and a list the crewmate wrote later in the SAME second compare equal.
+
+        `written_at` is the fold's whole-second spelling of the write, so a stamp with a
+        fraction would read as the later of the two and fold a list written after the
+        reply. Equal is what the page reads as "not answered"."""
+        from datetime import datetime, timezone
+
+        from kiro_crew.crew_log.projection import _panel_iso
+
+        # SPOKE's own second, with the reply 0.3 s into it and the write 0.7 s into it.
+        reply_ms, write_ms = 1791935344300, 1791935344700
+        written = _panel_iso(write_ms)
+        reply = datetime.fromtimestamp(reply_ms / 1000, tz=timezone.utc).isoformat()
+        assert reply.endswith(".300000+00:00") and written == SPOKE
+        assert routes._last_user_at_of(_Window([_human(reply)])) == written
+        # A reply in a LATER second still reads as the later instant.
+        assert routes._last_user_at_of(_Window([_human("2026-10-13T23:49:05.001+00:00")])) == (
+            "2026-10-13T23:49:05+00:00"
+        )
+
+    def test_a_stamp_that_cannot_be_read_is_no_stamp(self, local_tz) -> None:
+        local_tz("Pacific/Kiritimati")
+        assert routes._last_user_at_of(_Window([_human("not a time")])) == ""
+        # Parses, and still cannot be resolved: year 1 at +14:00 is before year 1 UTC.
+        assert routes._last_user_at_of(None, "0001-01-01T00:00:00") == ""
+        # One bad candidate costs only itself.
+        assert routes._last_user_at_of(_Window([_human("not a time")]), SPOKE) == SPOKE
+
+    def test_a_crewmates_page_reads_its_dm_thread(self) -> None:
+        dm = routes._dashboard_slot(MEMBER, SLUG)
+        state = _ChatState({dm: _Window([_human(SPOKE, steer=True)])})
+        assert routes._person_last_spoke(state, SLUG, MEMBER, None) == SPOKE
+        assert state.asked == [dm]
+
+    def test_a_sessions_page_reads_its_own_slot_and_no_crewmates(self) -> None:
+        dm = routes._dashboard_slot(MEMBER, SLUG)
+        state = _ChatState(
+            {"chat-7": _Window([_human(SPOKE)]), dm: _Window([_human("2026-10-14T01:00:00+00:00")])}
+        )
+        assert routes._person_last_spoke(state, "session-key", "", "chat-7") == SPOKE
+        assert state.asked == ["chat-7"]
+
+    def test_a_thread_with_no_live_slot_reads_the_stored_stamp_from_its_file(self) -> None:
+        from kiro_crew.dashboard.chat_utils import slot_transcript_key
+
+        dm = routes._dashboard_slot(MEMBER, SLUG)
+        log = _Log({slot_transcript_key(dm): {"_type": "metadata", "last_user_at": SPOKE}})
+        state = _ChatState({}, log)
+        assert routes._person_last_spoke(state, SLUG, MEMBER, None) == SPOKE
+        assert log.asked == [slot_transcript_key(dm)]
+
+    def test_no_state_or_a_failed_read_is_no_stamp(self) -> None:
+        class _Broken(_Log):
+            def get_metadata(self, key: str) -> dict:
+                raise OSError("unreadable")
+
+        assert routes._person_last_spoke(None, SLUG, MEMBER, None) == ""
+        assert routes._person_last_spoke(_ChatState({}, _Broken({})), SLUG, MEMBER, None) == ""
+
+    async def test_the_composed_page_carries_the_stamp(self, monkeypatch) -> None:
+        """Through the route: `_serve` reads it off the loop and hands it to the page."""
+        from kiro_crew import dashboard_feed
+
+        class FakeFeed:
+            def __init__(self, slot, unit="", panel_record=None):
+                pass
+
+            def subscribe(self, manifest):
+                return []
+
+            def read(self, manifest, agentic=None):
+                out = dashboard_feed.FieldRead()
+                out.fields = {"credits": 1.5}
+                return out
+
+            def unsubscribe(self):
+                pass
+
+        from kiro_crew.crew_log import projection
+
+        monkeypatch.setattr(dashboard_feed, "DashboardFeed", FakeFeed)
+        monkeypatch.setattr(
+            projection, "read_slot_projection", lambda slot, name: SimpleNamespace(value={})
+        )
+        dm = routes._dashboard_slot(MEMBER, SLUG)
+        instance.adopt(SLUG, "fixture-board")
+        state = _ChatState({dm: _Window([_human(SPOKE, steer=True)])})
+        async with _client(state) as client:
+            body = await (await client.get(_q(""))).json()
+        island = body["rendered_html"].split('id="kirocrew-dashboard-data">', 1)[1]
+        read = json.loads(island.split("</script>", 1)[0])
+        assert read["last_user_at"] == SPOKE
+
+        # The STAGED page a person previews is composed by the same read, so it is told
+        # too: a preview that showed answered cards asking would preview another page.
+        instance.stage_preview(SLUG, template_id="fixture-board")
+        async with _client(state) as client:
+            body = await (await client.get(_q("", preview="1"))).json()
+        assert body["preview"] is True
+        island = body["rendered_html"].split('id="kirocrew-dashboard-data">', 1)[1]
+        assert json.loads(island.split("</script>", 1)[0])["last_user_at"] == SPOKE
+
+        # No gateway state at all is no stamp, and the page is served all the same.
+        async with _client() as client:
+            body = await (await client.get(_q(""))).json()
+        island = body["rendered_html"].split('id="kirocrew-dashboard-data">', 1)[1]
+        assert json.loads(island.split("</script>", 1)[0])["last_user_at"] == ""

@@ -42,6 +42,7 @@ from kiro_crew.acp_backends import (
 from kiro_crew.providers.mirrors.base import AgentConfigMirror
 from kiro_crew.providers.mirrors.claude_code import ClaudeCodeMirror
 from kiro_crew.providers.mirrors.codex import CodexMirror
+from kiro_crew.providers.mirrors.deepseek import DeepSeekMirror
 from kiro_crew.providers.mirrors.goose import GooseMirror
 from kiro_crew.providers.mirrors.opencode import OpenCodeMirror
 
@@ -202,6 +203,7 @@ MIRRORS: dict[str, type[AgentConfigMirror]] = {
     ACP_BACKEND_CODEX: CodexMirror,
     ACP_BACKEND_OPENCODE: OpenCodeMirror,
     ACP_BACKEND_GOOSE: GooseMirror,
+    ACP_BACKEND_DEEPSEEK: DeepSeekMirror,
 }
 
 #: Every backend this build can spell, and how its MCP surface is reached.
@@ -284,25 +286,26 @@ PROJECTIONS: dict[str, McpProjection] = {
         per_tool_deny=PerToolDeny.SETTINGS_FILE,
     ),
     ACP_BACKEND_PI: McpProjection(
-        kind=ProjectionKind.NO_CHANNEL,
+        kind=ProjectionKind.BROKER_ONLY,
         reason=(
-            "pi-acp ACCEPTS the session/new mcpServers array without error, stores it on "
-            "its session state, and never hands it to the pi process: its initialize "
-            "result advertises mcpCapabilities of http:false and sse:false, its own "
-            "documentation lists MCP forwarding as not wired, and a stdio server placed "
-            "in the array produced no error and no tool (verified live). That is worse "
-            "than a refused array, because a projection written into it would make the "
-            "dashboard report Crew tools as mounted on a session where none can be "
-            "called -- which is why pi is outside ACP_BACKENDS_SESSION_MCP_ARRAY. The "
-            "shared gateway's broker stubs are stdio elements too and land in the same "
-            "inert array. A pi session therefore holds none of Crew's own tools, "
-            "gateway on or off"
-        ),
-        channel=(
-            "the adapter forwarding the array to the pi process (an open upstream "
-            "change does this by loading a bridge extension into pi), or an extension "
-            "of Crew's that bridges MCP the way the gate extension bridges permissions "
-            "-- the one channel this harness is shown to read today"
+            "pi-acp accepts the session/new mcpServers array, stores it on its session "
+            "state, and never hands it to the pi process, so the array is not the "
+            "channel. Crew's own gate extension is: the launch writes the same "
+            "composition deepseek is sent -- the member mounts and the pooled broker "
+            "stubs _pooled_mcp_servers appends for a backend outside MIRRORS -- to an "
+            "owner-only handoff file bound to the session nonce and sealed with a key only "
+            "that spawn's environment carries "
+            "(acp.harness.pi.pi_mcp_handoff_payload), and the extension registers each "
+            "entry with pi's built-in MCP support (pi.registerMcpServer; the release "
+            "that carries it is PI_MIN_VERSION). Captured end to end rather than inferred: "
+            "test/fixtures/acp_frames/pi/mcp-stdio-mount-live.jsonl shows the server "
+            "asked initialize/tools/list/tools/call, the call gated by "
+            "session/request_permission first, and the result reaching the turn. So a pi "
+            "session holds Crew's pooled tools, reachably. What it does not hold is the "
+            "servers its own agent spec declares, or the spec's per-tool deny set, "
+            "because no mirror translates them. A same-named server in pi's own mcp.json "
+            "outranks an extension's registration; the extension refuses that name's "
+            "tools"
         ),
         tracking="docs/request-for-change/rfc-agent-config-mirror.md#5-migration",
     ),
@@ -341,28 +344,20 @@ PROJECTIONS: dict[str, McpProjection] = {
         per_tool_deny=PerToolDeny.WHOLE_SERVER,
     ),
     ACP_BACKEND_DEEPSEEK: McpProjection(
-        kind=ProjectionKind.BROKER_ONLY,
-        reason=(
-            "deepseek accepts stdio entries in the session/new mcpServers array, which "
-            "is why it IS in ACP_BACKENDS_SESSION_MCP_ARRAY and why it is not a "
-            "no-channel: the broker stubs _pooled_mcp_servers appends for a backend "
-            "outside MIRRORS are shaped as stdio elements "
-            "(mcp_gateway.session_servers._acp_server_entry emits command/args/env) and "
-            "that is the shape this harness mounts. Captured end to end rather than "
-            "inferred: test/fixtures/acp_frames/deepseek/mcp-stdio-mount-live.jsonl sends "
-            "one such element pointing at a real stdio MCP server, session/new returns a "
-            "sessionId, the server is asked initialize/tools/list/tools/call, and the "
-            "turn carries the resulting tool_call and its result. So a deepseek session "
-            "holds Crew's pooled tools, and holds them reachably. What it does not hold "
-            "is the servers its own agent spec declares, or the spec's per-tool deny "
-            "set, because no mirror translates them. One hazard rides along, in "
-            "mcp-stdio-rollback-live.jsonl: an element whose command cannot start fails "
-            "the WHOLE session rather than being dropped. Crew answers the commonest "
-            "cause, a command that does not exist, before the request: acp.mcp_startable "
-            "leaves the element out and the session's MCP report names it as failed "
-            "(ACP_BACKENDS_PRUNE_UNSTARTABLE_MCP)"
-        ),
-        tracking="docs/request-for-change/rfc-agent-config-mirror.md#5-migration",
+        kind=ProjectionKind.MIRROR,
+        reason="deepseek.py -- the session/new mcpServers array, on the stdio element "
+        "shape measured end to end in test/fixtures/acp_frames/deepseek/"
+        "mcp-stdio-mount-live.jsonl (mounted, then initialize, tools/list and tools/call "
+        "asked by dsh itself). Until this mirror the backend was BROKER_ONLY: it held "
+        "Crew's pooled stubs but not the servers its own agent spec declares. One hazard "
+        "rides along, in mcp-stdio-rollback-live.jsonl: an element whose command cannot "
+        "start fails the WHOLE session rather than being dropped. Crew answers the "
+        "commonest cause, a command that does not exist, before the request: "
+        "acp.mcp_startable leaves the element out and the session's MCP report names it "
+        "as failed (ACP_BACKENDS_PRUNE_UNSTARTABLE_MCP)",
+        # No per-call deny path is verified for this harness, so a narrowed server is
+        # withheld whole, the direction that cannot leave a switched-off tool reachable.
+        per_tool_deny=PerToolDeny.WHOLE_SERVER,
     ),
 }
 

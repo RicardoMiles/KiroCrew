@@ -18,13 +18,39 @@
  * matching assertion (the mutation check).
  */
 import { describe, it, expect } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 
 const here = dirname(fileURLToPath(import.meta.url))
-const chatPageSrc = readFileSync(resolve(here, '../pages/ChatPage.tsx'), 'utf8')
-const sidebarSrc = readFileSync(resolve(here, '../pages/ChatSidebar.tsx'), 'utf8')
+// ChatPage composes owners under pages/chat/page/ (and its useChatPage* siblings), so the pins read the page and those owners.
+const chatPageSrc = [
+  readFileSync(resolve(here, '../pages/ChatPage.tsx'), 'utf8'),
+  ...readdirSync(resolve(here, '../pages/chat/page'))
+    .filter(f => /\.tsx?$/.test(f) && !/\.test\./.test(f))
+    .sort()
+    .map(f => readFileSync(resolve(here, '../pages/chat/page', f), 'utf8')),
+  ...readdirSync(resolve(here, '../pages'))
+    .filter(f => /^useChatPage.*\.ts$/.test(f) && !/\.test\./.test(f))
+    .sort()
+    .map(f => readFileSync(resolve(here, '../pages', f), 'utf8')),
+].join('\n')
+const sidebarSrc = readFileSync(resolve(here, '../pages/chat-sidebar/SessionRow.tsx'), 'utf8')
+/** The sidebar's own files joined: the shell and the owners under pages/chat-sidebar/
+ *  it composes (the row and its status builders live in chat-sidebar/SessionRow.tsx). */
+function sidebarSource(): string {
+  const files = [resolve(here, '../pages/ChatSidebar.tsx')]
+  const walk = (dir: string) => {
+    for (const name of readdirSync(dir).sort()) {
+      const p = resolve(dir, name)
+      if (statSync(p).isDirectory()) walk(p)
+      else if (/\.(ts|tsx)$/.test(name) && !/\.test\./.test(name)) files.push(p)
+    }
+  }
+  walk(resolve(here, '../pages/chat-sidebar'))
+  return files.map(f => readFileSync(f, 'utf8')).join('\n')
+}
+const sidebarSurface = sidebarSource()
 
 describe('ChatPage – crew-bound offer gates', () => {
   it('derives the crew-bound flag from the shared predicate on the active slot', () => {
@@ -72,7 +98,7 @@ describe('ChatSidebar – the interrupted row shares the composer’s predicate'
   // per-call-site re-implementation this PR exists to remove, and it is what the
   // review caught: the row was gated inline while the predicate sat one file away.
   it('builds the interrupted label from slotIsRemoteBound, not an inline field read', () => {
-    expect(sidebarSrc).toMatch(/import \{[^}]*\bslotIsRemoteBound\b[^}]*\} from '\.\.\/store\/dashboardSlice'/)
+    expect(sidebarSrc).toMatch(/import \{[^}]*\bslotIsRemoteBound\b[^}]*\} from '(?:\.\.\/)+store\/dashboardSlice'/)
     expect(sidebarSrc).toMatch(/const label = slotIsRemoteBound\(s\)/)
   })
 
@@ -80,9 +106,9 @@ describe('ChatSidebar – the interrupted row shares the composer’s predicate'
     // Scoped to the row builder, because the crew CHIP legitimately reads
     // `executor === 'remote'` (paired with instance_id) to answer a different
     // question: which crew the row runs on, not whether an action is refused.
-    const start = sidebarSrc.indexOf("key: 'interrupted'")
+    const start = sidebarSurface.indexOf("key: 'interrupted'")
     expect(start).toBeGreaterThan(-1)
-    const builder = sidebarSrc.slice(start, sidebarSrc.indexOf('},', sidebarSrc.indexOf('return (', start)))
+    const builder = sidebarSurface.slice(start, sidebarSurface.indexOf('},', sidebarSurface.indexOf('return (', start)))
     expect(builder).not.toMatch(/s\.executor === 'remote'/)
   })
 })

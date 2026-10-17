@@ -32,6 +32,7 @@ from kiro_crew.agent_discovery import (
     expand_skill_uri,
     parsed_agent_specs,
     skill_resource_uris,
+    skill_uri_for_path,
 )
 from kiro_crew.config.loader import KiroCrewConfig, config_dir
 from kiro_crew.config.paths import kiro_agents_dir
@@ -470,9 +471,11 @@ async def read_bounded_json(
     415 and the declared-oversize 413 return BEFORE a single byte is read, a
     caller that does not return every error this helper hands back must pass
     ``require_json_content_type=False``, or it inherits an unread stream that
-    nothing bounds. Every other caller in the tree returns the error
-    unconditionally (``chat_pins`` rewrites a 400's code and then returns it),
-    so the Teams route is the only opt-out.
+    nothing bounds. Every other caller in the tree answers every error it gets
+    (``chat_pins``, ``session_storage`` and ``artifacts`` rewrite a 400 into
+    their own shape; ``hooks`` defaults an ``invalid_json`` 400, which comes
+    back only after the whole body was read), so the Teams route is the only
+    opt-out.
 
     Which also means: this gate is a SECOND barrier, not the first one. Every
     other unsafe-method ``/api/`` route is already refused cross-origin by
@@ -482,19 +485,26 @@ async def read_bounded_json(
     to be exploitable. Extending the refusal to the Teams route is a separate
     decision about an external contract, not part of this one.
 
-    The other self-authenticating webhook, ``POST /api/hooks/agent``, reads
-    through ``handlers/hooks.py::_json_object`` and is untouched by this.
+    The other self-authenticating webhook, ``POST /api/hooks/agent``, reads raw
+    bytes through ``handlers/hooks.py::_read_hook_body`` (it must HMAC the exact
+    bytes) and is not a caller, so this gate does not reach it.
 
-    NOT yet the dashboard's only such guard. Four siblings survive and diverge:
-    ``handlers_channel._json_object`` (same ``invalid_json``/``body_not_object``
-    codes, but raises ``HTTPBadRequest`` instead of returning the response),
-    ``handlers/hooks.py::_json_object`` (``default_empty=True`` collapses a
-    MALFORMED body to defaults), ``handlers/session_storage.py::_json_body``
-    (deliberately different: an empty body is legitimate there, and it
-    documents why), and ``handlers/artifacts.py::_read_json_body`` (raises
-    ``ArtifactValidationError``, carries its own cap). Folding or narrowing each
-    is still outstanding -- claiming one owner before that is done would be a
-    claim the tree does not support.
+    The four module-local JSON body guards read through this helper and keep
+    only their module's answer shape:
+    ``handlers_channel._json_object`` (raises, via
+    :func:`bounded_json_error_as_exception`), ``handlers/hooks.py::_json_object``
+    (``default_empty`` defaults an absent or ``invalid_json`` body, never a 415
+    or 413), ``handlers/session_storage.py::_json_body`` (absent is ``{}``,
+    malformed is its own ``invalid_body`` 400), and
+    ``handlers/artifacts.py::_read_json_body`` (``ArtifactValidationError`` for
+    the 400s, the 415 raised). So a handler that picks any of them gets the
+    media-type gate.
+
+    What this does NOT cover: handlers that still call ``await request.json()``
+    directly, and the builtin apps' own body helpers. Those parse whatever media
+    type is declared, behind ``csrf_middleware``'s Origin barrier only. A
+    multipart or raw-bytes route (uploads, the session import) is correctly not
+    a caller.
 
     The cap is enforced BEFORE decoding: a Content-Length precheck rejects an
     oversized declared body, and the stream is then read incrementally so a
@@ -576,6 +586,39 @@ async def read_bounded_json(
             {"error": "body must be a JSON object", "code": "body_not_object"}, status=400
         )
     return body, None
+
+
+def bounded_json_error_code(error: web.Response) -> str | None:
+    """The ``code`` of a :func:`read_bounded_json` refusal *error*.
+
+    For the callers that answer one refusal their own way (a defaulted
+    ``invalid_json``, a module-specific message) while passing the rest through.
+    Telling ``invalid_json`` from ``body_not_object`` needs the code: both are 400.
+    """
+    try:
+        code = json.loads(error.text or "").get("code")
+    except (ValueError, AttributeError):
+        return None
+    return code if isinstance(code, str) else None
+
+
+def bounded_json_error_as_exception(error: web.Response) -> web.HTTPException:
+    """The :func:`read_bounded_json` refusal *error*, as an exception to raise.
+
+    For the callers whose contract is to RAISE rather than return a response
+    (``handlers_channel._json_object``, the 415 from
+    ``handlers/artifacts.py::_read_json_body``). aiohttp answers a raised
+    ``HTTPException`` with its own status and body, so the client sees the same
+    status, ``code`` and JSON the returning callers send. Keeping the mapping
+    here means a raising caller cannot drop the 415 by translating it into the
+    wrong status.
+    """
+    kwargs: dict[str, Any] = {"text": error.text, "content_type": "application/json"}
+    if error.status == 415:
+        return web.HTTPUnsupportedMediaType(**kwargs)
+    if error.status == 413:
+        return web.HTTPRequestEntityTooLarge(max_size=0, actual_size=0, **kwargs)
+    return web.HTTPBadRequest(**kwargs)
 
 
 # Chunk size for draining an OUTBOUND HTTP response to EOF. Matches the
@@ -1907,6 +1950,51 @@ def requesting_slot_project(state: DashboardState, session_key: str = "") -> Pat
     return _slot_project(slot)
 
 
+def session_project_for_spawn_gate(state: DashboardState, session_key: str) -> list[Path]:
+    """Every project directory *session_key*'s own kiro-cli may be running in.
+
+    For the spawn gate's parent-spec read (``subagent.parent_project_dirs``),
+    which applies the spec of EACH directory returned. A sub-agent parent
+    (``subagent:<id>``) answers its run's cwd. A chat parent answers the cwd its
+    LIVE session is bound to (``provider.cwd``) AND the project of the slot whose
+    effective session key IS *session_key*: a ``set_project`` change only
+    stages the slot's project and resets the runtime on the next message, so
+    until then the running agent still loaded its spec from the old directory.
+    Deliberately NOT :func:`active_project_dir`: its "the one project every slot
+    shares" fallback names a directory this session may never have run in.
+    Dict reads only (no I/O), so it is safe from the worker thread the gate's
+    read runs on.
+    """
+    if not session_key:
+        return []
+    if session_key.startswith("subagent:"):
+        manager = getattr(state, "subagents", None)
+        agents = getattr(manager, "_agents", None) or {}
+        info = agents.get(session_key.removeprefix("subagent:"))
+        cwd = getattr(info, "cwd", "") if info is not None else ""
+        return [Path(cwd)] if isinstance(cwd, str) and cwd else []
+    found: list[Path] = []
+    sessions = getattr(state, "sessions", None)
+    get_provider = getattr(sessions, "get_provider", None)
+    if callable(get_provider):
+        live_cwd = getattr(get_provider(session_key), "cwd", "")
+        if isinstance(live_cwd, str) and live_cwd:
+            found.append(Path(live_cwd))
+    from kiro_crew.dashboard.chat_utils import effective_session_key
+
+    for slot in list((getattr(state, "_slots", {}) or {}).values()):
+        try:
+            if effective_session_key(slot) != session_key:
+                continue
+        except Exception:  # noqa: BLE001 - a slot-like object without a key is not this session
+            continue
+        staged = _slot_project(slot)
+        if staged is not None and staged not in found:
+            found.append(staged)
+        break
+    return found
+
+
 def _resolve_active_project(state: DashboardState, session_key: str) -> Path | None:
     """The three-step resolution shared by the two public accessors."""
     slots = getattr(state, "_slots", {}) or {}
@@ -2863,19 +2951,6 @@ def enumerate_skill_catalog(state: DashboardState, session_key: str = "") -> dic
     return walk_skill_catalog(state, session_key).entries
 
 
-def _skill_uri_for_path(skill_md: Path) -> str:
-    """Render a discovered ``SKILL.md`` path as a ``skill://`` resource URI.
-
-    Paths under ``$HOME`` are emitted in ``~/`` form: kiro-cli expands it, and
-    it keeps the written agent spec portable across machines and home dirs.
-    """
-    try:
-        rel_home = skill_md.relative_to(Path.home())
-    except ValueError:
-        return f"{SKILL_URI_PREFIX}{skill_md.as_posix()}"
-    return f"{SKILL_URI_PREFIX}~/{rel_home.as_posix()}"
-
-
 def skill_key_for_uri(
     uri: str,
     agent_path: Path,
@@ -2937,7 +3012,10 @@ def skill_uri_for_key(
     skill_md = entries.get(key)
     if skill_md is None:
         return None
-    return _skill_uri_for_path(skill_md)
+    # The one renderer the builtin-agent installers call too, so the editor's
+    # mappings and theirs cannot drift into two forms ``expand_skill_uri`` treats
+    # differently.
+    return skill_uri_for_path(skill_md)
 
 
 def agent_skill_views(

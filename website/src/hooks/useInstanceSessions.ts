@@ -90,6 +90,8 @@ interface PeerSlot {
   title?: string
   running?: boolean
   pending_approval?: boolean
+  /** An unanswered question card is waiting on the slot. */
+  needs_input?: boolean
   /** ISO-8601. Moves only when a turn starts or ends — the ranking/display rung. */
   last_turn_ts?: string
   /** ISO-8601 of the newest saved row of any role; advances on every streamed tool call. */
@@ -144,6 +146,7 @@ export interface InstanceSessionRow {
   running: boolean
   messages: number
   pending_approval?: boolean
+  needs_input?: boolean
   /** The peer that OWNS this session — what makes the badge and remote activation
    *  fire, and the only thing `isPeerRow()` reads. Required here (not optional as
    *  on `Slot`) because a row this hook emits always came from some peer.
@@ -425,13 +428,15 @@ export function useInstanceSessions(
           last_ts: str(s.last_ts),
           created: str(s.created),
           agent: str(s.agent),
-          // An offline crew's row is a cached answer: its last `running` and
-          // `pending_approval` are not true now, so they are dropped.
+          // An offline crew's row is a cached answer: its last `running`,
+          // `pending_approval` and `needs_input` are not true now, so they are dropped.
           running: live && s.running === true,
           messages: 0,
           // Normalized like `running`: a truthy non-boolean from a peer would
-          // otherwise raise a pending-approval badge the peer never claimed.
+          // otherwise raise a pending-approval badge or a question the peer never
+          // claimed.
           pending_approval: live && s.pending_approval === true,
+          needs_input: live && s.needs_input === true,
           peer_id: inst.id,
           peer_name: name,
           row_identity: str(s.row_identity),

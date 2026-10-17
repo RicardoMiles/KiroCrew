@@ -66,6 +66,61 @@ def _user_agent() -> str:
 
 _DEFAULT_TIMEOUT_SECS = 30
 
+# Named ranges the stats endpoint rejects (it answers 400) but the summaries
+# endpoint accepts, mapped to the summaries endpoint's own spelling.
+_SINGLE_DAY_RANGES = {"today": "Today", "yesterday": "Yesterday"}
+
+
+def sum_seconds_by_name(days: list[dict], key: str) -> list[tuple[str, float]]:
+    """Sum one summaries breakdown (``languages``, ``projects``) by name.
+
+    Returns ``(name, seconds)`` pairs, largest first. Shared by the stats fold
+    below and the dashboard's billable-hours export.
+    """
+    totals: dict[str, float] = {}
+    for day in days:
+        for entry in day.get(key) or []:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            seconds = entry.get("total_seconds")
+            if isinstance(name, str) and isinstance(seconds, (int, float)):
+                totals[name] = totals.get(name, 0.0) + float(seconds)
+    return sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
+
+
+def _merge_entries(days: list[dict], key: str) -> list[dict[str, Any]]:
+    """The stats-shaped ``[{name, total_seconds}]`` form of one breakdown."""
+    return [{"name": name, "total_seconds": secs} for name, secs in sum_seconds_by_name(days, key)]
+
+
+def _stats_from_summaries(days: list[dict]) -> dict[str, Any]:
+    """Fold daily summaries into the subset of the stats shape the view reads.
+
+    A summary's ``grand_total`` counts the "Other" language; the stats
+    endpoint's ``total_seconds`` does not, and carries the full figure in the
+    ``*_including_other_language`` fields instead. Mirror that split so a day
+    reads the same way as any other range.
+    """
+    languages = _merge_entries(days, "languages")
+    total_with_other = 0.0
+    for day in days:
+        grand = day.get("grand_total")
+        seconds = grand.get("total_seconds") if isinstance(grand, dict) else None
+        if isinstance(seconds, (int, float)):
+            total_with_other += float(seconds)
+    other = sum(e["total_seconds"] for e in languages if e["name"] == "Other")
+    total = max(total_with_other - other, 0.0)
+    count = max(len(days), 1)
+    return {
+        "total_seconds": total,
+        "total_seconds_including_other_language": total_with_other,
+        "daily_average": total / count,
+        "daily_average_including_other_language": total_with_other / count,
+        "languages": languages,
+        "projects": _merge_entries(days, "projects"),
+    }
+
 
 class WakaTimeAuthError(Exception):
     """Raised by :meth:`verify` when the credential is rejected (401/403).
@@ -288,6 +343,10 @@ class WakaTimeClient:
         params = {"start": start, "end": end}
         if project:
             params["project"] = project
+        return await self._fetch_summary_days(params)
+
+    async def _fetch_summary_days(self, params: dict[str, str]) -> list[dict]:
+        """GET summaries for ``params``; raise unless the body has a data list."""
         result = await self._api("GET", "/users/current/summaries", params=params)
         data = result.get("data") if isinstance(result, dict) else None
         if not isinstance(data, list):
@@ -316,7 +375,16 @@ class WakaTimeClient:
         raises :class:`WakaTimeUnavailableError` rather than degrading to a false
         empty result. Used where an empty payload must not be mistaken for real
         zero data.
+
+        ``today`` and ``yesterday`` are served from the summaries endpoint,
+        because the stats endpoint answers 400 for them.
         """
+        summaries_range = _SINGLE_DAY_RANGES.get(wakatime_range)
+        if summaries_range is not None:
+            # The stats endpoint rejects single-day ranges with a 400, so a
+            # day comes from summaries, folded into the stats shape.
+            days = await self._fetch_summary_days({"range": summaries_range})
+            return _stats_from_summaries(days)
         result = await self._api("GET", f"/users/current/stats/{wakatime_range}")
         data = result.get("data") if isinstance(result, dict) else None
         if not isinstance(data, dict):

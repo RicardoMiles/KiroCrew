@@ -20,12 +20,18 @@ import logging
 import math
 import re
 import unicodedata
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
 from kiro_crew import mcp_apps_render, session_directive
-from kiro_crew.acp.harness_tool_names import MAX_HARNESS_TOOL_NAME_LEN, qualified_harness_tool_id
+from kiro_crew.acp.harness_tool_names import (
+    CLAUDE_READ_ONLY_BUILTINS,
+    GOOSE_READ_ONLY_BUILTINS,
+    MAX_HARNESS_TOOL_NAME_LEN,
+    qualified_harness_tool_id,
+)
 from kiro_crew.acp.types import (
     EVENT_PERMISSION_REQUEST,
     EVENT_TEXT_CHUNK,
@@ -64,7 +70,13 @@ from kiro_crew.acp.types import (
     JsonRpcMessage,
     RefusalInfo,
 )
-from kiro_crew.acp_backends import ACP_BACKENDS_META_IDENTITY
+from kiro_crew.acp_backends import (
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_DEEPSEEK,
+    ACP_BACKEND_GOOSE,
+    ACP_BACKEND_PI,
+    ACP_BACKENDS_META_IDENTITY,
+)
 from kiro_crew.agent_files import kas_wire_agent_id
 from kiro_crew.mcp_gateway.tool_surface import mcp_identity_name, mcp_identity_unreadable
 from kiro_crew.metrics.tool_calls import note_tool_call_started, record_tool_call_finished
@@ -839,6 +851,21 @@ def parse_text_chunk(update: dict[str, Any]) -> tuple[str | None, bool]:
     return None, False
 
 
+# A real id is well under this (claude's are ~60 chars); anything longer is not
+# one and is not worth persisting onto every transcript row.
+_MESSAGE_ID_MAX_CHARS = 256
+
+
+def parse_message_id(update: object) -> str:
+    """The ``messageId`` a message/thought chunk update carries, or ``""``."""
+    if not isinstance(update, dict):
+        return ""
+    message_id = update.get("messageId")
+    if not isinstance(message_id, str) or len(message_id) > _MESSAGE_ID_MAX_CHARS:
+        return ""
+    return message_id
+
+
 # claude-agent-acp has no out-of-band compaction notification: where kiro-cli
 # sends ``_kiro.dev/compaction/status`` and KAS sends its summarization kinds
 # under ``_meta.kiro``, the Claude adapter reports compaction as PLAIN
@@ -1579,6 +1606,36 @@ def gate_envelope(tool_call: dict[str, Any], nonce: str | None) -> dict[str, Any
     }
 
 
+#: The server-name characters pi keeps in an MCP tool name; any other is ``_``.
+_PI_MCP_NAME_UNSAFE = re.compile(r"[^A-Za-z0-9_]")
+
+
+def pi_mcp_title(tool_name: str, mcp_servers: Iterable[str]) -> str:
+    """A pi ``mcp__<server>__<tool>`` name in the server's own spelling.
+
+    pi writes every server character outside ``[A-Za-z0-9_]`` as ``_``, so a Crew
+    server ``kirocrew-core`` arrives as ``mcp__kirocrew_core__send_message``. Matched
+    against the servers Crew handed the session (longest first, the first of equal
+    length winning, as pi registers the first of two names it counts as one), the
+    title becomes ``mcp__kirocrew-core__send_message`` -- what every other harness
+    states -- so a governance or deny rule written as ``@kirocrew-core`` binds to it.
+    A name no handed-off server prefixes is returned as it came.
+    """
+    if not tool_name.startswith("mcp__"):
+        return tool_name
+    rest = tool_name[len("mcp__") :]
+    best = ""
+    for server in mcp_servers:
+        if not isinstance(server, str) or not server or len(server) <= len(best):
+            continue
+        prefix = f"{_PI_MCP_NAME_UNSAFE.sub('_', server)}__"
+        if rest.startswith(prefix) and len(rest) > len(prefix):
+            best = server
+    if not best:
+        return tool_name
+    return f"mcp__{best}__{rest[len(_PI_MCP_NAME_UNSAFE.sub('_', best)) + 2 :]}"
+
+
 def scoped_tool_cache_key(cache_scope: str, tool_call_id: str) -> str:
     """The key a per-tool cache entry is stored under, for ONE emitting origin.
 
@@ -1662,6 +1719,109 @@ TOOL_CALL_CACHE_MAX_KEY_CHARS = 512
 #: refused rather than the path cut -- a truncated path would name a different
 #: file to the target gate.
 TOOL_CALL_CACHE_MAX_PATH_CHARS = 4096
+
+#: Most tool calls the liveness bookkeeping holds at once -- the session
+#: handle's attribution map (``AcpSessionHandle._active_tool_calls``) and the
+#: ``AcpClient``'s open-call set alike. It is the provenance caches' count bound
+#: by name, not a second literal: all three bound the same population, the calls
+#: of one turn with no terminal result yet, and a turn cannot legitimately have
+#: this many open. Past it the oldest entry is evicted and the eviction counted.
+MAX_ACTIVE_TOOL_CALLS = TOOL_CALL_CACHE_MAX_ENTRIES
+
+#: The prefix a digested liveness key carries. Reserved: a raw id spelling it is
+#: digested as well (:func:`liveness_key`), so the prefix names a digest and
+#: nothing else.
+LIVENESS_DIGEST_PREFIX = "sha256:"
+
+
+def liveness_key(tool_call_id: object) -> str:
+    """The key the liveness bookkeeping holds for a call.
+
+    A ``toolCallId`` is backend-authored and bounded on the wire only by the
+    transport frame cap. An id within :data:`TOOL_CALL_CACHE_MAX_KEY_CHARS` is
+    kept as it is; a longer one is held as its digest, so the key is bounded
+    without the two ids a long key could collide on being conflated -- the same
+    id maps to the same digest at dispatch, at its streamed output and at its
+    terminal. An id that itself spells the digest prefix is digested too,
+    whatever its length, so no raw id can equal another call's digest key:
+    every key that starts with the prefix is a digest, and two digests agree
+    only when the ids do. A value that is not a string (a JSON number,
+    ``None``) is no key: the result parser hands the frame's ``toolCallId``
+    through as it arrived, and a harness that spells one as a number must not
+    crash the turn here.
+    """
+    if not isinstance(tool_call_id, str):
+        return ""
+    if len(tool_call_id) <= TOOL_CALL_CACHE_MAX_KEY_CHARS and not tool_call_id.startswith(
+        LIVENESS_DIGEST_PREFIX
+    ):
+        return tool_call_id
+    return (
+        LIVENESS_DIGEST_PREFIX
+        + hashlib.sha256(tool_call_id.encode("utf-8", "surrogatepass")).hexdigest()
+    )
+
+
+class InFlightIdSet:
+    """The ``AcpClient``'s bounded set of open tool-call ids.
+
+    That transport asks one question of its calls -- *is any still open* -- to
+    arm the tool-stall clock and disarm the stale clock, so it keeps ids only,
+    never a state. The ids are backend-authored, so the set is bounded like the
+    handle's attribution map: each id is held under :func:`liveness_key`, at
+    most :data:`MAX_ACTIVE_TOOL_CALLS` are held (insertion order is dispatch
+    order, so the OLDEST is evicted first and the call just dispatched is always
+    kept), and every eviction is counted until :meth:`clear`. Once a row has
+    been evicted an empty set does not prove that nothing runs, which is what
+    :attr:`possibly_open` reads; the counter is what the turn says out loud.
+    The empty id a backend omits is a member like any other, as it was in the
+    plain set this replaces.
+    """
+
+    __slots__ = ("_ids", "_max_ids", "_evicted_count")
+
+    def __init__(self, max_ids: int = MAX_ACTIVE_TOOL_CALLS) -> None:
+        self._ids: dict[str, None] = {}
+        self._max_ids = max_ids
+        self._evicted_count = 0
+
+    def add(self, tool_call_id: object) -> None:
+        key = liveness_key(tool_call_id)
+        if key not in self._ids and len(self._ids) >= self._max_ids:
+            self._ids.pop(next(iter(self._ids)))
+            self._evicted_count += 1
+        self._ids[key] = None
+
+    def discard(self, tool_call_id: object) -> None:
+        self._ids.pop(liveness_key(tool_call_id), None)
+
+    def difference_update(self, tool_call_ids: Iterable[object]) -> None:
+        for tool_call_id in tool_call_ids:
+            self.discard(tool_call_id)
+
+    def clear(self) -> None:
+        self._ids.clear()
+        self._evicted_count = 0
+
+    def __contains__(self, tool_call_id: object) -> bool:
+        return liveness_key(tool_call_id) in self._ids
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._ids)
+
+    def __len__(self) -> int:
+        return len(self._ids)
+
+    @property
+    def evicted_count(self) -> int:
+        """Ids evicted at the cap since the last :meth:`clear`."""
+        return self._evicted_count
+
+    @property
+    def possibly_open(self) -> bool:
+        """Whether a call may still be running: one is held, or one was evicted."""
+        return bool(self._ids) or self._evicted_count > 0
+
 
 #: Marker a caller-owned overflow record carries once it holds
 #: ``TOOL_CALL_CACHE_MAX_ENTRIES`` distinct scope digests: from then on EVERY
@@ -1953,11 +2113,12 @@ def _permission_tool_id(params: dict[str, Any]) -> str:
 def harness_tool_name(update: dict[str, Any]) -> str:
     """The tool's own name as a ``tool_call`` frame states it, or "".
 
-    goose writes it in ``_meta.goose.toolCall.toolName``; opencode writes it as the
-    first frame's ``title`` (``bash``), where later updates carry the command. Read
-    from that first frame only, and only as an identifier: a title with whitespace
-    or any other prose character is not a name and yields "". Which backend's
-    table the name is looked up in is decided by the permission event's caller
+    goose writes it in ``_meta.goose.toolCall.toolName`` and claude-agent-acp in
+    ``_meta.claudeCode.toolName``; opencode writes it as the first frame's
+    ``title`` (``bash``), where later updates carry the command. Read from that
+    first frame only, and only as an identifier: a title with whitespace or any
+    other prose character is not a name and yields "". Which backend's table the
+    name is looked up in is decided by the permission event's caller
     (:func:`kiro_crew.acp.harness_tool_names.qualified_harness_tool_id`), so the
     title of a backend with no table is never read as a name.
     """
@@ -1965,6 +2126,11 @@ def harness_tool_name(update: dict[str, Any]) -> str:
     goose = meta.get("goose") if isinstance(meta, dict) else None
     call = goose.get("toolCall") if isinstance(goose, dict) else None
     name = call.get("toolName") if isinstance(call, dict) else None
+    claude = meta.get("claudeCode") if isinstance(meta, dict) else None
+    if name is None and isinstance(claude, dict):
+        # claude-agent-acp builds its title from the call's arguments (a search
+        # query, a path), so only its own stamp may name the tool.
+        name = claude.get("toolName") or ""
     if name is None:
         name = update.get("title")
     # Bounded by MAX_HARNESS_TOOL_NAME_LEN, not KAS's 128: an opencode MCP title
@@ -1997,6 +2163,8 @@ def build_permission_event(
     harness_tool_name_cache: dict[str, str] | None = None,
     harness_backend: str = "",
     harness_mcp_servers: tuple[str, ...] = (),
+    side_read_only: bool = False,
+    deepseek_read_only_issue: str = "the harness composition was not read back",
 ) -> tuple[AcpEvent | None, dict[str, str] | None]:
     """Build an ``EVENT_PERMISSION_REQUEST`` from a ``session/request_permission``.
 
@@ -2015,8 +2183,13 @@ def build_permission_event(
     and ``harness_backend`` give a backend that states no ``_meta.kiro.toolId`` a
     ``harness_tool_id`` anyway: the tool name its preceding ``tool_call`` frame
     stated, qualified by the backend (``goose#shell``). Only a backend with a name
-    table (:mod:`kiro_crew.acp.harness_tool_names`) gets one; every other backend's
-    event is built exactly as before. ``harness_mcp_servers`` are the server names
+    table (:mod:`kiro_crew.acp.harness_tool_names`) gets one. On a claude or goose
+    Side Chat session (``side_read_only``) the same cache gives
+    ``harness_builtin_tool`` instead: the kiro-cli read built-in the call stands
+    for (:data:`~kiro_crew.acp.harness_tool_names.CLAUDE_READ_ONLY_BUILTINS`,
+    :data:`~kiro_crew.acp.harness_tool_names.GOOSE_READ_ONLY_BUILTINS`). Every
+    other session's event is built exactly as before.
+    ``harness_mcp_servers`` are the server names
     Crew placed on the session, so an opencode MCP tool's fused name is split.
 
     Single source of truth shared by ``AcpClient`` and ``AcpSessionHandle`` so
@@ -2055,6 +2228,10 @@ def build_permission_event(
     # below are consulted under the same key the preceding ``tool_call`` frame wrote.
     envelope = gate_envelope(tool_call, gate_envelope_nonce)
     if envelope is not None:
+        # pi spells a Crew server's tools in its own alphabet; the title is put back
+        # in the server's spelling so title-derived rules (governance, deny) bind.
+        if harness_backend == ACP_BACKEND_PI:
+            envelope["title"] = pi_mcp_title(envelope["title"], harness_mcp_servers)
         tool_call = {
             "toolCallId": envelope["toolCallId"] or tool_call.get("toolCallId", ""),
             "title": envelope["title"],
@@ -2406,6 +2583,58 @@ def build_permission_event(
         _harness_tool_id = qualified_harness_tool_id(
             harness_backend, harness_tool_name_cache.get(_ck, ""), harness_mcp_servers
         )
+    # claude-agent-acp states no tool name on the permission request itself, so
+    # the kiro-cli built-in a claude read tool stands for comes only from the name
+    # its preceding tool_call frame stamped. Only a Side Chat session gets it: the
+    # name is what the READ_ONLY gate accepts as a read, and in any other session
+    # it would also bind kiro-cli-named deny and governance rules to claude calls.
+    _harness_builtin_tool = ""
+    if (
+        side_read_only
+        and harness_backend == ACP_BACKEND_CLAUDE
+        and harness_tool_name_cache is not None
+        and tool_call_id
+    ):
+        _harness_builtin_tool = CLAUDE_READ_ONLY_BUILTINS.get(
+            harness_tool_name_cache.get(_ck, ""), ""
+        )
+    # goose states its tool on the tool_call frame as an (extension, tool) pair.
+    # The pair is read as goose wrote it: the extension from the trusted identity
+    # cache and the tool name before any prefix is stripped, so a server named
+    # ``developer`` serving ``tree`` (stated ``developer__tree``) is not the
+    # builtin. A matched pair is the harness's own extension, not an MCP server,
+    # so it carries no server -- as the builtin shell pair already does -- and the
+    # READ_ONLY gate proves it from ``harness_builtin_tool``. Side Chat only.
+    elif (
+        side_read_only
+        and harness_backend == ACP_BACKEND_GOOSE
+        and harness_tool_name_cache is not None
+        and tool_call_id
+        and _mcp_identity_trusted
+    ):
+        _harness_builtin_tool = GOOSE_READ_ONLY_BUILTINS.get(
+            (_mcp_server_name, harness_tool_name_cache.get(_ck, "")), ""
+        )
+        if _harness_builtin_tool:
+            _mcp_server_name = ""
+            # goose states no ACP kind for its own tools, and its permission
+            # request fills the gap with ``other`` (captured live). The proven
+            # pair is the read, so that placeholder is read as ``read``; any kind
+            # goose does state is kept, and a non-read one still refuses the call.
+            if tool_kind in ("", "other"):
+                tool_kind = "read"
+
+    # dsh's permission frame names only the toolCallId, so which dsh tool a
+    # request is for comes only from the name its preceding tool_call frame
+    # stated. The gate reads it on a READ_ONLY turn alone, and only once the
+    # launch proved stock dsh registers the read tools (``deepseek_read_only_issue``
+    # empty); until then the event carries the issue and the name stays unread.
+    _deepseek_tool_name = ""
+    _deepseek_read_only_issue = ""
+    if harness_backend == ACP_BACKEND_DEEPSEEK:
+        _deepseek_read_only_issue = deepseek_read_only_issue
+        if not deepseek_read_only_issue and harness_tool_name_cache is not None and tool_call_id:
+            _deepseek_tool_name = harness_tool_name_cache.get(_ck, "")
 
     # The agent's stated reason for the call, shown beside the approval. The
     # same agent-authored display text a tool_call frame carries, read the same
@@ -2443,6 +2672,9 @@ def build_permission_event(
         diff_path=_diff_path,
         spawn_target=_spawn_target,
         harness_tool_id=_harness_tool_id,
+        harness_builtin_tool=_harness_builtin_tool,
+        deepseek_tool_name=_deepseek_tool_name,
+        deepseek_read_only_issue=_deepseek_read_only_issue,
         tool_purpose=_purpose,
     )
     return event, recorded
@@ -3704,6 +3936,7 @@ def parse_session_update(
                 AcpEvent(
                     kind=EVENT_THINKING_CHUNK if is_thinking else EVENT_TEXT_CHUNK,
                     text=text,
+                    message_id=parse_message_id(update),
                 )
             )
         return events

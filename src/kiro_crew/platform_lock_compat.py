@@ -511,7 +511,8 @@ def try_acquire_lock_or_raise(fd: int, *, exclusive: bool = False) -> bool:
     filesystem that cannot lock at all (``ENOLCK``, ``EINVAL`` on some network
     mounts) as permanently busy. A caller that retries on busy would retry
     forever; this one raises that ``OSError`` instead. POSIX busy is
-    ``EWOULDBLOCK``/``EAGAIN``; Windows busy is ``EACCES``/``EDEADLOCK``.
+    ``EWOULDBLOCK``/``EAGAIN``, which Python raises as :class:`BlockingIOError`;
+    Windows busy is ``EACCES``/``EDEADLOCK``.
     """
     from kiro_crew.platform_compat import IS_POSIX
 
@@ -524,10 +525,6 @@ def try_acquire_lock_or_raise(fd: int, *, exclusive: bool = False) -> bool:
             return True
         except BlockingIOError:
             return False
-        except OSError as exc:
-            if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN):
-                return False
-            raise
     # msvcrt has no shared lock; LK_NBLCK is a non-blocking exclusive lock.
     try:
         os.lseek(fd, 0, os.SEEK_SET)

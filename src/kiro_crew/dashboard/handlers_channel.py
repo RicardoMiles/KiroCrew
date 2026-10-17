@@ -102,19 +102,36 @@ def _mgr(request: web.Request) -> ChannelManager:
 
 
 async def _json_object(request: web.Request) -> dict:
-    """Parse a JSON request body and require a top-level object."""
-    try:
-        body = await request.json()
-    except Exception:
-        raise web.HTTPBadRequest(
-            text='{"error":"invalid JSON","code":"invalid_json"}',
-            content_type="application/json",
-        )
-    if not isinstance(body, dict):
-        raise web.HTTPBadRequest(
-            text=('{"error":"request body must be a JSON object",' '"code":"body_not_object"}'),
-            content_type="application/json",
-        )
+    """Parse a JSON request body and require a top-level object.
+
+    Reads through :func:`read_bounded_json`, so a body without a JSON content
+    type is refused 415 before it is read. Raises instead of returning, which is
+    this module's contract: the refusal goes out as an ``HTTPException`` with the
+    helper's own status and ``code``.
+
+    Uncapped (``max_bytes=None``) on purpose: a channel message carries user
+    prose, and these routes never had a byte cap below the app-wide
+    ``client_max_size``. Adding one here would be a new limit, not a refactor.
+    """
+    # Body-scope import: importing ``handlers._shared`` runs the whole
+    # ``handlers`` package ``__init__``, which this module has never depended on
+    # at import time; only a body read needs it.
+    from kiro_crew.dashboard.handlers._shared import (
+        bounded_json_error_as_exception,
+        bounded_json_error_code,
+        read_bounded_json,
+    )
+
+    body, error = await read_bounded_json(request, max_bytes=None)
+    if error is not None:
+        if bounded_json_error_code(error) == "body_not_object":
+            # Same code as the helper; this module's message, kept for clients.
+            raise web.HTTPBadRequest(
+                text=('{"error":"request body must be a JSON object",' '"code":"body_not_object"}'),
+                content_type="application/json",
+            )
+        raise bounded_json_error_as_exception(error)
+    assert body is not None
     return body
 
 

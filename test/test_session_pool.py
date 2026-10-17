@@ -16,7 +16,6 @@ import pytest
 from kiro_crew import platform_compat
 from kiro_crew.acp.session_handle import WatchdogSettings
 from kiro_crew.start_priority import PrioritySemaphore, StartPriority
-from kiro_crew.testing.wait import async_wait_until
 
 
 @pytest.fixture(autouse=True)
@@ -199,10 +198,11 @@ class TestFillWarmPool:
         # cannot be cancelled -- so sibling tests holding those threads (a real
         # `taskkill` or descendant scan on Windows, a wedged PTY close) make
         # this kill queue behind them for as long as they run. A private
-        # executor owns the capacity this assertion depends on, so the only
-        # wait left is for the dispatched call to reach its worker thread: a
-        # signal under a lost-run bound, not a bet on the shared pool's spare
-        # capacity.
+        # executor owns the capacity this assertion depends on; draining it with
+        # shutdown(wait=True) also guarantees the worker thread has returned and
+        # call_args is recorded before the assertion reads it. unittest.mock
+        # increments call_count before writing call_args, so waiting on
+        # call_count alone is a data race on any scheduler.
         with (
             ThreadPoolExecutor(max_workers=1) as private_executor,
             patch("kiro_crew.session._sync_kill_provider") as mock_kill,
@@ -210,10 +210,7 @@ class TestFillWarmPool:
         ):
             with pytest.raises(asyncio.CancelledError):
                 await mgr._fill_warm_pool()
-            await async_wait_until(
-                lambda: mock_kill.call_count,
-                describe=lambda: f"hard kill not dispatched; calls={mock_kill.mock_calls!r}",
-            )
+            await asyncio.to_thread(private_executor.shutdown, wait=True)
             mock_kill.assert_called_once_with(provider)
         assert mgr._warm_pool.qsize() == 0
 
@@ -639,6 +636,22 @@ class TestGetOrCreatePoolIntegration:
         # Factory called for cold start, cwd forwarded
         factory.assert_called_once()
         assert factory.call_args.kwargs.get("cwd") == "/Users/alice/workspace/proj"
+
+    @pytest.mark.asyncio
+    async def test_skips_pool_for_a_side_read_only_session(self):
+        """A pooled child was started without the Side Chat read-only shape. A
+        side key is stateless, so the session cold-starts and the factory
+        receives the flag."""
+        mgr, factory = _make_manager(pool_agent="kirocrew")
+        pooled = _make_provider()
+        mgr._warm_pool.put_nowait((pooled, time.monotonic()))
+        mgr._drain_and_claim = AsyncMock(return_value=pooled)
+
+        await mgr.get_or_create("side:parent:1", agent="kirocrew", side_read_only=True)
+
+        mgr._drain_and_claim.assert_not_awaited()
+        factory.assert_called_once()
+        assert factory.call_args.kwargs.get("side_read_only") is True
 
     @pytest.mark.asyncio
     async def test_claims_pool_with_model_override_and_switches(self):
@@ -1776,7 +1789,7 @@ class TestDiscardReaping:
             # Model a real ACP provider: the tracked PID lives at
             # provider._client._pid AND the client records the pid's start
             # identity, exactly as AcpClient does after start
-            # (client.py: self._start_time = get_process_start_id(self._pid)).
+            # (client_start.py: self._start_time = get_process_start_id(self._pid)).
             # _sync_kill_provider verifies that recorded id against the live one
             # before signalling the root; a stand-in without it is refused as
             # unverifiable and the survivor would leak, which is not the
@@ -1814,7 +1827,7 @@ class TestDiscardReaping:
             # Mimic an ACP provider: the tracked PID lives at
             # provider._client._pid, and the client records that pid's start
             # identity the way AcpClient does after start
-            # (client.py: self._start_time = get_process_start_id(self._pid)).
+            # (client_start.py: self._start_time = get_process_start_id(self._pid)).
             # _sync_kill_provider re-verifies it before signalling the root.
             provider._client = SimpleNamespace(
                 _pid=proc.pid, _start_time=platform_compat.get_process_start_id(proc.pid)

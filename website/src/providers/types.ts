@@ -116,6 +116,18 @@ export interface NormalizedProviderHook {
   source?: string
 }
 
+/** A configured hook that validated but reaches no provider hook config.
+ *  `reason` is a wire value from the gateway (`disabled`, `confirm`,
+ *  `trigger`, `agent_action`); `command` holds an agent action's prompt. */
+export interface NormalizedUnsentHook {
+  name: string
+  trigger: string
+  matcher: string
+  actionType: string
+  command: string
+  reason: string
+}
+
 export interface NormalizedPlugin {
   id: string
   name: string
@@ -176,8 +188,9 @@ export interface ProviderAdapter {
   /** The model a NEW session on this KiroCrew agent would run on ('' = the
    *  backend picks). Takes a KiroCrew agent name, not a kiro agent template:
    *  the per-agent default is stored per agent, and several agents can share
-   *  one template. */
-  resolveModel(agentName: string): Promise<string>
+   *  one template. `app` is the app that owns the session, when one does: its
+   *  own model setting is then part of the answer. */
+  resolveModel(agentName: string, app?: string): Promise<string>
   /** The provider-level default model for NEW sessions ('' when none is set).
    *  Distinct from resolveModel, which resolves a specific agent template. */
   resolveDefaultModel(): Promise<string>
@@ -189,6 +202,10 @@ export interface ProviderAdapter {
   fetchUsage(): Promise<NormalizedUsage>
 
   fetchProviderHooks(): Promise<Record<string, NormalizedProviderHook[]>>
+  /** Hooks the user configured that Crew accepted but left out of the
+   *  provider's own hook config, each with the reason. Optional: a provider
+   *  that drops nothing has none to report. */
+  fetchUnsentProviderHooks?(): Promise<NormalizedUnsentHook[]>
 
   listPlugins(): Promise<NormalizedPlugin[]>
   installPlugin(pkg: string, type: 'agent' | 'skill' | 'mcp'): Promise<{ ok: boolean; error?: string }>

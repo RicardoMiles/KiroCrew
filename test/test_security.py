@@ -1375,6 +1375,459 @@ class TestTokenParamValueRedaction:
         assert "?token=" not in out
 
 
+class TestTokenParamExemptUrlPrefixes:
+    """Companion URL prefixes whose ``?token=`` value pass 4 leaves alone.
+
+    NEUTRAL PLACEHOLDER PREFIX ONLY: a companion's real approval host never
+    appears in the public repo.
+    """
+
+    _PREFIX = "https://approve.example.com/auth"
+    _TOKEN = "eyJ3b3JrZmxvd0lkIjoiMDAwMDAwMDAtMDAwMC00MDAwLTgwMDAtMDAwMDAwMDAwMDAwIn0%3D"
+
+    class _StubCredentialPolicy:
+        def __init__(self, prefixes: object):
+            self._prefixes = prefixes
+
+        def redact(self, text: str) -> str:
+            from kiro_crew.security import redact
+
+            return redact(text)
+
+        def exempt_exact_hosts(self) -> "frozenset[str]":
+            # The display battery also runs the exfil pass; exempt its heuristics
+            # so the cache test isolates pass 4.
+            return frozenset({"approve.example.com"})
+
+        def token_param_exempt_url_prefixes(self) -> object:
+            if isinstance(self._prefixes, Exception):
+                raise self._prefixes
+            return self._prefixes
+
+    def _install(self, prefixes: object) -> None:
+        import dataclasses
+
+        from kiro_crew.config import KiroCrewConfig
+        from kiro_crew.platform.bootstrap import build_default_context
+        from kiro_crew.platform.context import set_context
+
+        base = build_default_context(KiroCrewConfig())
+        set_context(dataclasses.replace(base, credentials=self._StubCredentialPolicy(prefixes)))
+
+    @property
+    def _url(self) -> str:
+        return f"{self._PREFIX}?token={self._TOKEN}"
+
+    def test_default_redacts(self) -> None:
+        out, warnings = redact_credentials(self._url)
+        assert self._TOKEN not in out
+        assert warnings == [f"Redacted token parameter value ({len(self._TOKEN)} chars)"]
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "{u}",
+            "Approve {u}",
+            "[link]({u})",
+            "<{u}>",
+            '"{u}"',
+            "'{u}'",
+            "`{u}`",
+            "*{u}*",
+        ],
+    )
+    def test_exempt_prefix_keeps_value(self, text: str) -> None:
+        self._install(frozenset({self._PREFIX}))
+        rendered = text.format(u=self._url)
+        assert redact_credentials(rendered) == (rendered, [])
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "[Approve](https://evil.example/?next=({u}))",
+            "[Approve](//evil.example/?next=[x]({u}))",
+            "[Approve](/redirect?next=[x]({u}))",
+            "https://evil.example/?next=({u})",
+            "https://evil.example/?next=[{u}]",
+            "https://evil.example/?next=<{u}>",
+            'https://evil.example/?next="{u}"',
+            "https://evil.example/?next='{u}'",
+            "https://evil.example/?next=`{u}`",
+            "https://evil.example/?next=*{u}*",
+        ],
+    )
+    def test_prefix_nested_in_another_url_is_not_exempt(self, text: str) -> None:
+        self._install(frozenset({self._PREFIX}))
+        assert self._TOKEN not in redact_credentials(text.format(u=self._url))[0]
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '<a href="https://evil.example/?next=\t{u}">Approve</a>',
+            '<a href="https://evil.example/?next=\n{u}">Approve</a>',
+            '<a href="https://evil.example/?next=\r{u}">Approve</a>',
+            '<a href="https://evil.example/?next= {u}">Approve</a>',
+            "<https://evil.example/?next= {u}>",
+            'href="//evil.example/?next=\t{u}"',
+            'href="https:\\evil.example/?next=\t{u}"',
+            'href="https:evil.example/?next=\t{u}"',
+        ],
+    )
+    def test_browser_destination_embedding_is_not_exempt(self, text: str) -> None:
+        self._install(frozenset({self._PREFIX}))
+        assert self._TOKEN not in redact_credentials(text.format(u=self._url))[0]
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "[Approve](<&sol;&sol;evil.example/?next= {u}>)",
+            "[Approve](<&#104;ttps&#58;&#47;&#47;evil.example/?next= {u}>)",
+            '<a href="&#x2F;&#x2F;evil.example/?next=\t{u}">Approve</a>',
+            "&amp; {u}",
+            "<x> {u}",
+        ],
+    )
+    def test_encoded_or_tagged_destination_is_not_exempt(self, text: str) -> None:
+        """A renderer decodes character references inside ``<...>`` and attributes, so
+        the raw-text guard treats any ``&`` or ``<`` before the prefix as a
+        destination signal instead of decoding it (double-encoding and renderer
+        differences make decoding a moving target). Doubt means MORE redaction.
+        """
+        self._install(frozenset({self._PREFIX}))
+        assert self._TOKEN not in redact_credentials(text.format(u=self._url))[0]
+
+    def test_multiple_standalone_exempt_links_keep_both_values(self) -> None:
+        self._install(frozenset({self._PREFIX}))
+        text = f"- [First]({self._url})\n- [Second]({self._url})"
+        assert redact_credentials(text) == (text, [])
+
+    def test_multiple_autolinked_exempt_links_keep_both_values(self) -> None:
+        """An exempt URL's own ``<`` opener is blanked with it, so it is not a tag signal."""
+        self._install(frozenset({self._PREFIX}))
+        text = f"- <{self._url}>\n- <{self._url}>"
+        assert redact_credentials(text) == (text, [])
+
+    def test_prose_label_before_exempt_link_keeps_value(self) -> None:
+        self._install(frozenset({self._PREFIX}))
+        text = f"Approve: {self._url}"
+        assert redact_credentials(text) == (text, [])
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://approve.example.com.evil.example/auth?token={t}",
+            "https://x.approve.example.com/auth?token={t}",
+            "https://user@approve.example.com/auth?token={t}",
+            "http://approve.example.com/auth?token={t}",
+            "https://approve.example.com/other?token={t}",
+            "https://approve.example.com/auth/x?token={t}",
+            "https://approve.example.com/auth?a=1&token={t}",
+            "https://approve.example.com/auth?TOKEN={t}",
+            "https://approve.example.com/auth&#63;token={t}",
+            "xhttps://approve.example.com/auth?token={t}",
+            "https://redirect.example/?next=https://approve.example.com/auth?token={t}",
+            "https://redirect.example/https://approve.example.com/auth?token={t}",
+            "https://redirect.example/#https://approve.example.com/auth?token={t}",
+            "x:https://approve.example.com/auth?token={t}",
+            "x@https://approve.example.com/auth?token={t}",
+        ],
+    )
+    def test_other_shapes_still_redacted(self, url: str) -> None:
+        self._install(frozenset({self._PREFIX}))
+        assert self._TOKEN not in redact_credentials(url.format(t=self._TOKEN))[0]
+
+    def test_earlier_pass_claim_keeps_whole_value_redacted(self) -> None:
+        self._install(frozenset({self._PREFIX}))
+        out = redact_credentials(f"{self._PREFIX}?token={self._TOKEN}AKIAIOSFODNN7EXAMPLE")[0]
+        assert self._TOKEN not in out
+        assert "AKIAIOSFODNN7EXAMPLE" not in out
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "[A]({u}),[B](https://svc.example/cb?token=SECRET)",
+            "[A]({u})[B](https://svc.example/cb?token=SECRET)",
+            "{u}?token=SECRET",
+            "{u}/cb?token=SECRET",
+            "{u}:SECRET",
+            "{u}(SECRET)",
+            "{u}[SECRET]",
+        ],
+    )
+    def test_value_run_past_the_token_is_not_exempt(self, text: str) -> None:
+        """`_TOKEN_PARAM_VALUE_CLASS` admits `)`, `,`, `(`, `[`, `:` and `?`, so one
+        pass-4 match can swallow a second URL after the exempt token. The exemption
+        covers one unreserved/base64/percent-encoded run plus trailing closers only;
+        anything else redacts the WHOLE value, which is also its re-redaction fixed point.
+        """
+        self._install(frozenset({self._PREFIX}))
+        out, warnings = redact_credentials(text.format(u=self._url))
+        assert "SECRET" not in out
+        assert self._TOKEN not in out
+        assert len(warnings) == 1 and warnings[0].startswith("Redacted token parameter value (")
+        assert redact_credentials(out) == (out, [])
+
+    @pytest.mark.parametrize("trail", [")", ").", "),", "]", "]:", "?", "!", ";"])
+    def test_trailing_closers_after_the_token_stay_exempt(self, trail: str) -> None:
+        self._install(frozenset({self._PREFIX}))
+        text = f"Open {self._url}{trail} then wait"
+        assert redact_credentials(text) == (text, [])
+
+    @pytest.mark.parametrize(
+        "prefixes",
+        [
+            frozenset({"https://approve.example.com"}),
+            frozenset({"approve.example.com/auth"}),
+            frozenset({"http://approve.example.com/auth"}),
+            frozenset({"https://approve.example.com/auth?"}),
+            frozenset({b"https://approve.example.com/auth"}),
+            None,
+            RuntimeError("adapter bug"),
+        ],
+    )
+    def test_malformed_or_failing_seam_degrades_to_redaction(self, prefixes: object) -> None:
+        self._install(prefixes)
+        assert self._TOKEN not in redact_credentials(self._url)[0]
+
+    def test_pre_method_adapter_degrades_to_redaction(self) -> None:
+        import dataclasses
+
+        from kiro_crew.config import KiroCrewConfig
+        from kiro_crew.platform.bootstrap import build_default_context
+        from kiro_crew.platform.context import set_context
+
+        class _Old:
+            def redact(self, text: str) -> str:
+                return text
+
+            def exempt_exact_hosts(self) -> "frozenset[str]":
+                return frozenset()
+
+        base = build_default_context(KiroCrewConfig())
+        set_context(dataclasses.replace(base, credentials=_Old()))
+        assert self._TOKEN not in redact_credentials(self._url)[0]
+
+    def test_stream_windows_never_apply_the_exemption(self) -> None:
+        from kiro_crew.security import REDACTED_CREDENTIAL_TAG, StreamRedactor
+
+        self._install(frozenset({self._PREFIX}))
+        split_messages = (
+            ("[Approve](https://evil.example/?next=(", f"{self._url})) "),
+            ('<a href="https://evil.example/?next= ', f'{self._url}">Approve</a>'),
+        )
+        for chunks in split_messages:
+            redactor = StreamRedactor()
+            streamed = "".join(redactor.feed(chunk) for chunk in chunks) + redactor.flush()
+            assert self._TOKEN not in streamed
+            assert REDACTED_CREDENTIAL_TAG in streamed
+
+    def test_plain_approval_link_is_redacted_only_while_streaming(self) -> None:
+        from kiro_crew.security import REDACTED_CREDENTIAL_TAG, StreamRedactor
+
+        self._install(frozenset({self._PREFIX}))
+        redactor = StreamRedactor()
+        streamed = redactor.feed(f"{self._url} ") + redactor.flush()
+        assert self._TOKEN not in streamed
+        assert REDACTED_CREDENTIAL_TAG in streamed
+        assert redact_credentials(self._url) == (self._url, [])
+
+    def test_stream_suspension_resets_after_custom_redactor_exception(self) -> None:
+        from kiro_crew.security import StreamRedactor
+
+        self._install(frozenset({self._PREFIX}))
+
+        def raising_redactor(text: str) -> str:
+            assert self._TOKEN not in redact_credentials(self._url)[0]
+            raise RuntimeError("redactor failed")
+
+        redactor = StreamRedactor(raising_redactor)
+        with pytest.raises(RuntimeError, match="redactor failed"):
+            redactor.feed("safe text ")
+        assert redact_credentials(self._url) == (self._url, [])
+
+    def test_display_cache_key_covers_the_prefix_set(self) -> None:
+        from kiro_crew.dashboard import chat_utils
+
+        chat_utils._clear_display_redaction_cache()
+        assert self._TOKEN not in chat_utils._redact_for_display(self._url)
+        self._install(frozenset({self._PREFIX}))
+        assert chat_utils._redact_for_display(self._url) == self._url
+        chat_utils._clear_display_redaction_cache()
+
+    def test_repeated_exempt_links_stay_linear(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Every scanner operation examines only a constant multiple of the input."""
+        from kiro_crew.security import redaction as redaction_module
+
+        work = {"boundary": 0, "destination": 0, "scheme": 0}
+        calls = {"boundary": 0, "destination": 0}
+        real_boundary = redaction_module._TokenParamExemptScan.boundary
+        real_destination = redaction_module._token_param_destination_signal
+        real_scheme = redaction_module._token_param_has_scheme_before
+
+        def counting_boundary(scan: object, sep: int, start: int) -> bool:
+            ws_cursor = scan.ws_cursor
+            result = real_boundary(scan, sep, start)
+            calls["boundary"] += 1
+            work["boundary"] += 4 * max(0, sep - ws_cursor)
+            if scan.last_ws + 1 >= scan.left_floor:
+                work["boundary"] += max(0, start - scan.last_ws - 1)
+            return result
+
+        def counting_destination(text: str, start: int, end: int) -> bool:
+            calls["destination"] += 1
+            work["destination"] += end - start
+            return real_destination(text, start, end)
+
+        def counting_scheme(text: str, start: int, colon: int) -> bool:
+            i = colon - 1
+            while i >= start and text[i] in redaction_module._TOKEN_PARAM_SCHEME_CHARS:
+                work["scheme"] += 1
+                i -= 1
+            return real_scheme(text, start, colon)
+
+        monkeypatch.setattr(redaction_module._TokenParamExemptScan, "boundary", counting_boundary)
+        monkeypatch.setattr(
+            redaction_module, "_token_param_destination_signal", counting_destination
+        )
+        monkeypatch.setattr(redaction_module, "_token_param_has_scheme_before", counting_scheme)
+
+        self._install(frozenset({self._PREFIX}))
+        link = f"{self._PREFIX}?token=x"
+        cases = (
+            (f"{link} " * 20_000, True),
+            ("& " + f"{link} " * 20_000, False),
+            ("a" * 200_000 + " " + link, True),
+            ("a1" * 100_000 + " " + link, True),
+            ("a: " * 70_000 + link, True),
+            ("a:" * 100_000 + link, False),
+        )
+        assert redaction_module._TOKEN_PARAM_DESTINATION_SIGNAL_RE.pattern == r"//|\\|&|<|:(?=\S)"
+        for text, kept in cases:
+            before = sum(work.values())
+            out, _warnings = redact_credentials(text)
+            assert (out == text) is kept
+            assert sum(work.values()) - before <= 8 * len(text)
+        assert calls["boundary"] > 0
+        assert calls["destination"] > 0
+
+    @staticmethod
+    def _reference_token_param_exempt(
+        text: str,
+        m: "re.Match[str]",
+        prefixes: tuple[str, ...],
+        earlier_exempt_urls: list[tuple[int, int]],
+    ) -> tuple[int, int] | None:
+        """The seam's guards as first written: each candidate re-reads its whole prefix."""
+        from kiro_crew.security.redaction import (
+            _TOKEN_PARAM_DESTINATION_SIGNAL_RE,
+            _TOKEN_PARAM_EXEMPT_OPENERS,
+            _TOKEN_PARAM_EXEMPT_TRAIL,
+            _TOKEN_PARAM_EXEMPT_VALUE_RE,
+        )
+
+        def boundary(start: int) -> bool:
+            left = text[max(text.rfind(c, 0, start) for c in " \t\r\n") + 1 : start]
+            if "://" in left:
+                return False
+            markdown_opener = re.fullmatch(r"\[[^][]*\]\(", left) is not None
+            return not left or left in _TOKEN_PARAM_EXEMPT_OPENERS or markdown_opener
+
+        def preceding_context(start: int) -> bool:
+            pieces: list[str] = []
+            cursor = 0
+            for exempt_start, exempt_end in (*earlier_exempt_urls, (start, start)):
+                if exempt_start > 0 and text[exempt_start - 1] == "<":
+                    exempt_start -= 1
+                pieces.extend((text[cursor:exempt_start], " " * (exempt_end - exempt_start)))
+                cursor = exempt_end
+            return _TOKEN_PARAM_DESTINATION_SIGNAL_RE.search("".join(pieces)) is None
+
+        sep = m.start()
+        if not text.startswith("?token=", sep):
+            return None
+        run = _TOKEN_PARAM_EXEMPT_VALUE_RE.match(text, m.start(1))
+        if run is None or not set(text[run.end() : m.end(1)]) <= _TOKEN_PARAM_EXEMPT_TRAIL:
+            return None
+        for prefix in prefixes:
+            start = sep - len(prefix)
+            if (
+                start >= 0
+                and text.startswith(prefix, start)
+                and boundary(start)
+                and preceding_context(start)
+            ):
+                return start, run.end()
+        return None
+
+    def test_incremental_guards_match_the_whole_prefix_reference(self) -> None:
+        """The cursor-based guards answer exactly as the whole-prefix statements do.
+
+        Every pass-4 match of each text is put to both, in order, and also every
+        other match, since the plan skips matches an earlier pass already claimed.
+        """
+        from kiro_crew.security.redaction import (
+            _TOKEN_PARAM_RE,
+            _token_param_exempt,
+            _TokenParamExemptScan,
+        )
+
+        long_prefix = f"https://go.example/{self._PREFIX}"
+        prefixes = tuple(sorted((self._PREFIX, long_prefix)))
+        link = f"{self._PREFIX}?token=x"
+        pieces = [
+            link,
+            f"<{link}>",
+            f"[Approve]({link})",
+            f"[Approve]({link}),",
+            f"({link})",
+            f"'{link}'",
+            f"{long_prefix}?token=x",
+            f"<{long_prefix}?token=x>",
+            f"{link}?token=SECRET",
+            "https://svc.example/cb?token=SECRET",
+            f"https://evil.example/?next=({link})",
+            f"[Approve](/redirect?next=[x]({link}))",
+            f'<a href="https://evil.example/?next= {link}">Approve</a>',
+            "&amp;",
+            "&sol;&sol;evil.example",
+            "<x>",
+            "x:",
+            "x:y",
+            "foo:",
+            "1abc:d",
+            "a1" * 5 + ":x",
+            ": y",
+            "+.-a:b",
+            "\\",
+            "//",
+            "Approve:",
+            "plain words",
+            "",
+        ]
+        separators = [" ", "\n", "\t", "", "<", ">", ")", "](", "/", ":"]
+        rng = random.Random(20261008)
+        texts = [
+            sep.join([a, b, c]) for a in pieces for b in pieces for c in pieces for sep in " \n"
+        ]
+        texts.extend(
+            rng.choice(separators).join(rng.choice(pieces) for _ in range(rng.randint(1, 9)))
+            for _ in range(3000)
+        )
+        texts.extend(sep.join([link, link, link]) for sep in separators)
+        for text in texts:
+            for stride in (1, 2):
+                scan = _TokenParamExemptScan(text)
+                earlier: list[tuple[int, int]] = []
+                for i, m in enumerate(_TOKEN_PARAM_RE.finditer(text)):
+                    if i % stride:
+                        continue
+                    expected = self._reference_token_param_exempt(text, m, prefixes, earlier)
+                    assert _token_param_exempt(text, m, prefixes, scan) == expected, (text, m)
+                    if expected is not None:
+                        earlier.append(expected)
+                        scan.accept(expected)
+
+
 class TestRedactCredentialsBase64:
     """Tests for base64-encoded credential detection."""
 
@@ -7300,14 +7753,15 @@ class TestAdaptiveHomeTargetsExpiry:
 
 
 class TestEnvDumpGrepAwsNarrowing:
-    """The env-dump-piped-to-grep deny fires on a credential dump and nothing else.
+    """The env-dump filter rules distinguish grep's text selectors from awk and sed.
 
-    The same regex backs two tiers -- the always-on keystone
+    Each regex backs two tiers -- the always-on keystone
     (``_ENV_CRED_SHARED_RULE_IDS``, checked here through
     ``is_sensitive_bash_command``) and the disableable
-    ``credential-exfil-env-grep-aws`` catalog rule (checked through its real
-    ``_DenyMatcher``). Both are asserted so a fix on one tier cannot leave the block
-    standing on the other under a different message. The direct-``printenv`` sibling
+    ``credential-exfil-env-grep-aws`` / ``credential-exfil-env-awk-sed-aws`` catalog rules
+    (checked through their real ``_DenyMatcher``). Both are asserted so a fix on one
+    tier cannot leave the block standing on the other under a different message.
+    The direct-``printenv`` sibling
     rule is pinned alongside, and every case is also run through the FULL gate: a
     shape one rule stops refusing while a sibling still refuses it is not fixed.
 
@@ -7333,7 +7787,21 @@ class TestEnvDumpGrepAwsNarrowing:
         "export -p | grep AWS_",
         "env | sort | grep AWS_",
         "env | awk '/AWS_/'",
+        # Awk evaluates these as code, not as literal hyphenated text selectors.
+        "env | awk 'AWS-length(\"x\") {print}'",
+        "env | awk 'AWS+0'",
+        "env | awk 'AWS<1'",
+        "env | gawk 'AWS-x'",
+        "env | mawk 'AWS-x'",
+        "env | nawk 'AWS-x'",
+        "printenv | awk 'aws-account-id=5'",
         "env | sed -n '/AWS_SECRET/p'",
+        # sed lets any character delimit an address or an ``s`` command, so the
+        # ``-`` after ``AWS`` here is a delimiter and the regex sed runs is ``AWS``.
+        "env | sed -n '\\-AWS-p'",
+        "env | sed -n '\\,AWS,p'",
+        "env | sed -n 's-AWS-x-p'",
+        "printenv | sed -n '\\-aws-Ip'",
         # An alternation inside the grep pattern, with the prefix on either side.
         "/bin/sh -c 'env | grep -E \"^(AWS_|SANDBOX|AIM)\"'",
         "env | grep -E '^(SANDBOX|AWS_)'",
@@ -7355,6 +7823,19 @@ class TestEnvDumpGrepAwsNarrowing:
         "env | grep AWS_SECU",
         "printenv | grep AWS_A",
         "env | grep -i aws_s",
+        # A hyphen the operand can make OPTIONAL is not a literal ``AWS-``: each of
+        # these selects every ``AWS_`` variable, so only a hyphen followed by a name
+        # character ends the bare-prefix branch. A ``.`` is the any-character
+        # wildcard, so it selects ``AWS_`` exactly as ``_`` does.
+        "env | grep -E 'AWS-?'",
+        "env | grep 'AWS-*'",
+        "env | grep 'AWS-\\?'",
+        "env | grep -E 'AWS-{0,1}'",
+        "env | grep 'AWS.'",
+        "env | grep AWS.SECRET",
+        # A hyphenated token beside a real selector does not excuse the selector.
+        "env | grep -e aws-vault -e AWS_SECRET",
+        "printenv | grep -E 'aws-cli|AWS_SESSION_TOKEN'",
         # The selecting stage is not the first stage after the dump.
         "env | grep -v PATH | grep AWS_SECRET",
         "env | tr ' ' '\\n' | grep AWS_SECRET",
@@ -7413,6 +7894,9 @@ class TestEnvDumpGrepAwsNarrowing:
         "env | mawk /AWS_/",
         "env | nawk /AWS_/",
         "env | gsed -n /AWS_/p",
+        # The prefixed sed spellings keep sed's boundary: the hyphen is a delimiter.
+        "env | gsed -n '\\-AWS-p'",
+        "env | ssed -n '\\-AWS-p'",
         "env | /usr/bin/grep AWS_",
         "env | /usr/bin/gawk /AWS_/",
         "env | xargs grep AWS_",
@@ -7426,6 +7910,14 @@ class TestEnvDumpGrepAwsNarrowing:
     # match to one statement would allow each of them -- and would also allow the
     # quoted-separator dumps in ``DENIED``, which is the direction that matters.
     RESIDUAL_OVER_BLOCK = (
+        # A line regex cannot tell an awk regex literal from an expression.
+        "env | awk '/aws-vault/'",
+        "env | awk '{print}' | grep aws-vault",
+        # Nor a sed ``-`` that is a literal from one that is a delimiter, so sed
+        # keeps main's boundary and the sed form of the CloudFront case stays
+        # refused, as it is on main; the grep form is the one narrowed.
+        "env | sed -n '/aws-vault/p'",
+        "set -o pipefail; aws s3 ls s3://bucket/ --recursive | sed -n '/aws-account-id=/p'",
         # A later pipeline stage's text read as the filter's operand (``echo``
         # ignores stdin, so nothing from the dump is actually selected).
         "env | grep PATH | echo AWS_SECRET",
@@ -7459,6 +7951,18 @@ class TestEnvDumpGrepAwsNarrowing:
         # ``AWS_1``, so selecting one cannot print a credential.
         "env | grep AWS1",
         "env | grep AWS_1",
+        # A hyphen followed by a name character is a literal ``AWS-`` in the operand,
+        # which no secret-bearing name or credential value contains. The first is a
+        # CloudFront/S3 access-log key (``AWSLogs/aws-account-id=<id>/CloudFront/``)
+        # filtered out of a recursive listing under a ``set -o pipefail`` prologue.
+        "set -o pipefail; aws s3 ls s3://bucket/ --recursive"
+        " | grep AWSLogs/aws-account-id=123456789012/CloudFront/",
+        "env | grep -i aws-vault",
+        # The prefixed grep spellings read the operand as text too.
+        "env | egrep aws-vault",
+        "printenv | zgrep 'aws-account-id='",
+        "printenv | grep aws-cli",
+        "env | grep AWS-1",
         # No filter at all.
         "env | cut -d= -f1 | sort",
         "docker exec kirocrew printenv KIROCREW_PORT",
@@ -7545,16 +8049,24 @@ class TestEnvDumpGrepAwsNarrowing:
         return security._deny_matcher(rule.pattern)
 
     @classmethod
-    def _catalog_matcher(cls):
-        return cls._rule_matcher("credential-exfil-env-grep-aws")
-
-    def test_catalog_rule_and_keystone_share_one_regex(self) -> None:
-        from kiro_crew import security
-
-        rule = next(
-            r for r in security.BUILTIN_DENIED_RULES if r.id == "credential-exfil-env-grep-aws"
+    def _catalog_matches(cls, cmd: str) -> bool:
+        return any(
+            cls._rule_matcher(rule_id).match(cmd)
+            for rule_id in ("credential-exfil-env-grep-aws", "credential-exfil-env-awk-sed-aws")
         )
-        assert rule.pattern == security._ENV_DUMP_GREP_AWS_PATTERN
+
+    @pytest.mark.parametrize(
+        "rule_id, pattern_name",
+        [
+            ("credential-exfil-env-grep-aws", "_ENV_DUMP_GREP_AWS_PATTERN"),
+            ("credential-exfil-env-awk-sed-aws", "_ENV_DUMP_AWK_SED_AWS_PATTERN"),
+        ],
+    )
+    def test_catalog_rule_and_keystone_share_one_regex(self, rule_id, pattern_name) -> None:
+        from kiro_crew.security import denied_rules
+
+        rule = next(r for r in security.BUILTIN_DENIED_RULES if r.id == rule_id)
+        assert rule.pattern == getattr(denied_rules, pattern_name)
         # The keystone names the CATALOG RULE, so there is no parallel pattern
         # constant it could be edited away from -- and it resolves from
         # ``BUILTIN_DENIED_RULES``, not the user's effective set, so opting the
@@ -7600,7 +8112,12 @@ class TestEnvDumpGrepAwsNarrowing:
         assert seen[:1] == [security._ENV_DUMP_GREP_AWS_PATTERN]
 
     @pytest.mark.parametrize(
-        "rule_id", ["credential-exfil-env-grep-aws", "credential-exfil-printenv-aws"]
+        "rule_id",
+        [
+            "credential-exfil-env-grep-aws",
+            "credential-exfil-env-awk-sed-aws",
+            "credential-exfil-printenv-aws",
+        ],
     )
     def test_catalog_rule_is_published_not_silently_disabled(self, rule_id: str) -> None:
         # ``_DenyMatcher`` disables a pattern that fails ``is_safe_user_regex`` with
@@ -7619,7 +8136,7 @@ class TestEnvDumpGrepAwsNarrowing:
     @pytest.mark.parametrize("cmd", DENIED)
     def test_credential_dumps_are_denied_on_both_tiers(self, cmd: str) -> None:
         assert self._keystone(cmd), cmd
-        assert self._catalog_matcher().match(cmd), cmd
+        assert self._catalog_matches(cmd), cmd
         assert is_sensitive_bash_command(cmd) is not None, cmd
 
     @pytest.mark.parametrize("cmd", RESIDUAL_OVER_BLOCK)
@@ -7629,12 +8146,12 @@ class TestEnvDumpGrepAwsNarrowing:
         # later attempt to reclaim them has to argue with the quoted-separator dumps
         # in ``DENIED`` rather than delete a comment.
         assert self._keystone(cmd), cmd
-        assert self._catalog_matcher().match(cmd), cmd
+        assert self._catalog_matches(cmd), cmd
 
     @pytest.mark.parametrize("cmd", ALLOWED)
     def test_benign_commands_pass_both_tiers(self, cmd: str) -> None:
         assert not self._keystone(cmd), cmd
-        assert not self._catalog_matcher().match(cmd), cmd
+        assert not self._catalog_matches(cmd), cmd
 
     # A markdown body handed to a non-shell MCP tool is scanned with the command
     # rules, so prose that reads as a filter would refuse the whole call.
@@ -7692,7 +8209,7 @@ class TestEnvDumpGrepAwsNarrowing:
         # the value ``grep`` would then print is the same credential.
         cmd = f"env | grep AWS_{truncation}"
         assert self._keystone(cmd), cmd
-        assert self._catalog_matcher().match(cmd), cmd
+        assert self._catalog_matches(cmd), cmd
 
     @pytest.mark.parametrize("letter", ["B", "C", "D", "E", "M", "P", "R", "T"])
     def test_a_non_secret_initial_is_not_a_truncation(self, letter: str) -> None:
@@ -7700,7 +8217,7 @@ class TestEnvDumpGrepAwsNarrowing:
         # word makes a one-character selector a credential read.
         cmd = f"env | grep AWS_{letter}"
         assert not self._keystone(cmd), cmd
-        assert not self._catalog_matcher().match(cmd), cmd
+        assert not self._catalog_matches(cmd), cmd
 
     def test_selector_boundaries_admit_digits(self) -> None:
         # ``(?![A-Za-z_])`` would end the bare prefix at a digit and deny a selector no

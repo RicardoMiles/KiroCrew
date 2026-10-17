@@ -25,7 +25,7 @@ too, each because the real one would leave the test or make it unobservable:
   under the data home for a restart; the fake records each spool.
 * per test, ``session_store_for_turn`` (to refuse member memory),
   ``charge_turn_failure`` (to see which provider is charged),
-  ``open_turn_crew_log`` (the real emitter is ``test_discord``'s e2e subject) and
+  ``open_turn_crew_log`` (the real emitter is ``test_discord_mirroring``'s e2e subject) and
   ``build_directive_consumer`` (to see whether one is built); the ceiling tests
   install a one-turn ``turn_ceiling`` ceiling, which conftest resets.
 
@@ -938,6 +938,13 @@ class TestTheReinjectionFlag:
 _ROOM = ChannelLink("weixin", channel_id="ROOM", thread_id=None)
 
 
+def _bound_as_room(stored: Any) -> bool:
+    """The origin bind stores this location, signed for the session's key."""
+    from kiro_crew.mirror_admission import verify_mirror_admission
+
+    return stored == _ROOM and verify_mirror_admission(KEY, stored)
+
+
 class TestTheOriginBind:
     @pytest.mark.parametrize(
         ("drift", "on_loop"),
@@ -957,7 +964,7 @@ class TestTheOriginBind:
         sessions = _Threaded()
         _answer(_turns(sessions, drift=drift), asker=_asker(origin=_ROOM))
 
-        assert sessions.origin_links[KEY] is _ROOM and sessions.mirror_links[KEY] is _ROOM
+        assert sessions.origin_links[KEY] is _ROOM and _bound_as_room(sessions.mirror_links[KEY])
         # asyncio.run drives the loop on THIS thread.
         assert (threads == [threading.get_ident()]) is on_loop
 
@@ -1747,7 +1754,7 @@ class TestDriveTurn:
         sessions = _Threaded()
         turn = _channel_turn(RecordingRenderer(), origin_conversation=_ROOM)
         asyncio.run(drive_turn(turn, sessions=sessions, ctx_builder=RecordingCtxBuilder()))
-        assert sessions.origin_links[KEY] is _ROOM and sessions.mirror_links[KEY] is _ROOM
+        assert sessions.origin_links[KEY] is _ROOM and _bound_as_room(sessions.mirror_links[KEY])
         assert threads and threading.get_ident() not in threads
 
     def test_a_restricted_shutdown_refusal_never_spools(self, spooled) -> None:

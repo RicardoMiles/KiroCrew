@@ -563,6 +563,8 @@ class TestHookGateKwargs:
         "mcp_identity_trusted": "mcp_identity_trusted",
         "mcp_identity_unreadable": "mcp_identity_unreadable",
         "kas_builtin_ids": "kas_builtin_ids",
+        "harness_builtin_tool": "harness_builtin_tool",
+        "deepseek_tool_name": "deepseek_tool_name",
         "spawn_target": "spawn_target",
     }
 
@@ -586,6 +588,8 @@ class TestHookGateKwargs:
             mcp_identity_trusted=True,
             mcp_identity_unreadable=True,
             kas_builtin_ids=True,
+            harness_builtin_tool="web_fetch",
+            deepseek_tool_name="read",
             spawn_target="helper",
         )
         kwargs = hook_gate_kwargs(event)
@@ -600,6 +604,8 @@ class TestHookGateKwargs:
             "mcp_identity_trusted": True,
             "mcp_identity_unreadable": True,
             "kas_builtin_ids": True,
+            "harness_builtin_tool": "web_fetch",
+            "deepseek_tool_name": "read",
             "spawn_target": "helper",
         }
         assert set(kwargs) == set(self.EVENT_FIELD_BY_KWARG)
@@ -627,6 +633,8 @@ class TestHookGateKwargs:
             "mcp_identity_trusted": False,
             "mcp_identity_unreadable": False,
             "kas_builtin_ids": False,
+            "harness_builtin_tool": "",
+            "deepseek_tool_name": "",
             "spawn_target": "",
         }
         noisy = hook_gate_kwargs(
@@ -639,6 +647,7 @@ class TestHookGateKwargs:
                 mcp_server_name=None,
                 tool_name=None,
                 mcp_identity_trusted=None,
+                harness_builtin_tool=None,
                 spawn_target=None,
             )
         )
@@ -1039,7 +1048,7 @@ class TestHookGateKwargs:
             "subagent_manager/run.py",
             "task_executor.py",
             "task_planner.py",
-            "telegram/transport_dispatch.py",
+            "telegram/dispatch/turn_engine.py",
             "apps/builtins/auto_improvement/spine/agent_runner.py",
         }, sorted(helper_sites)
         # Every pinned exception still exists; a deleted site must leave the

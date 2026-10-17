@@ -7,7 +7,7 @@ where the code lives:
 
 * the SURFACE: every name the module bound, with its kind, signature and value;
 * ``toolsSettings.subagent.availableAgents``: a kiro-cli-owned allowlist Crew reads at
-  its own spawn gate (``subagent.py``), carried byte-for-byte through every read,
+  its own spawn gate (``subagent_parts/agent_policy.py``), carried byte-for-byte through every read,
   normalize, rebuild, derived-agent and atomic-write path;
 * the tool-less guest spec, including its model fallback and install order;
 * the conductor prompts and grant tuples, which are spec bytes too.
@@ -66,7 +66,7 @@ BASE_SURFACE: dict[str, str] = {
     "_CONDUCTOR_AGENT_FILENAME": "value str 923f5ca0627d569f",
     "_CONDUCTOR_CORE_GRANTS": "value tuple 7152a6eb169c7c40",
     "_CONDUCTOR_DASHBOARD_GRANTS": "value tuple 0b859d2b54e84503",
-    "_CONDUCTOR_SYSTEM_PROMPT": "value str 4524763079d80c96",
+    "_CONDUCTOR_SYSTEM_PROMPT": "value str 1209a2f6c77c3e84",
     "_CREW_ONLY_HOOK_EVENTS": "value frozenset 9d900cfb866f983a",
     "_DEFAULT_KIRO_HOOKS_DIR": "value host",
     "_DEFAULT_SPEC_OBSERVATION_ATTEMPTS": "value int 4e07408562bedb8b",
@@ -74,7 +74,7 @@ BASE_SURFACE: dict[str, str] = {
     "_FORK_REFRESH_WAIT_SECS": "value float db58b6c40698d737",
     "_GUEST_AGENT_FILENAME": "value str b1766e070226dc68",
     "_HEARTBEAT_AGENT_FILENAME": "value str 42387f9e3eabbf0e",
-    "_HEARTBEAT_SYSTEM_PROMPT": "value str 9054896452b91851",
+    "_HEARTBEAT_SYSTEM_PROMPT": "value str 63259f9ea08bdf5e",
     "_HOME_DERIVING_ENV_KEYS": "value frozenset 816c277fc333b3e0",
     "_HOOK_EVENT_CANONICAL": "value dict a09f334fa63b1a4f",
     "_HOOK_HEADER_RE": "value Pattern 905320879920c153",
@@ -115,7 +115,7 @@ BASE_SURFACE: dict[str, str] = {
     # catalog. The readable pin for this tuple is
     # ``test_the_member_grants_extend_the_conductor_grants``, which spells the whole set
     # out; this digest is the byte-level half and moves with it.
-    "_MEMBER_PANEL_GRANTS": "value tuple bf985b450bc18937",
+    "_MEMBER_PANEL_GRANTS": "value tuple fe49f85f5f3b65f6",
     "_NATIVE_PROMPT_STUB": "value str cf6d81ff1d0b3797",
     "_PIPELINE_CONDUCTOR_AGENT_FILENAME": "value str 3b5e111de6d1d305",
     "_PIPELINE_CONDUCTOR_CORE_GRANTS": "value tuple 1ad9ce711e266082",
@@ -925,6 +925,7 @@ def test_the_member_grants_extend_the_conductor_grants_in_order() -> None:
         "@kirocrew-panel/dashboard_fields",
         "@kirocrew-panel/dashboard_types",
         "@kirocrew-panel/dashboard_write",
+        "@kirocrew-panel/dashboard_save",
         "@kirocrew-panel/dashboard_templates",
         "@kirocrew-panel/dashboard_preview",
         "@kirocrew-panel/dashboard_apply",

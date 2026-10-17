@@ -17,8 +17,17 @@ import { renderWithProviders } from './helpers'
 import CrewDynamicDashboard, {
   ACT_MESSAGE_TYPE,
   DASHBOARD_FALLBACK_REFETCH_MS,
+  DATA_MESSAGE_TYPE,
   READY_MESSAGE_TYPE,
 } from '../pages/members/CrewDynamicDashboard'
+
+/** A composed body carrying its read in the data island, as `compose_body` builds it. */
+function withIsland(credits: number): string {
+  return (
+    `<script type="application/json" id="kirocrew-dashboard-data">${JSON.stringify({ fields: { credits } })}</script>` +
+    `<p>${credits} credits</p>`
+  )
+}
 import { handleDashboardMoved } from '../hooks/useWebSocket'
 import { LANG_STORAGE_KEY } from '../i18n/detect'
 
@@ -227,14 +236,29 @@ describe('CrewDynamicDashboard', () => {
     // Holding such a read back leaves the tab frozen on whatever it opened with.
     const read = vi
       .spyOn(api, 'memberDashboard')
-      .mockResolvedValueOnce(page({ rendered_html: '<!doctype html><p>12 credits</p>' }))
-      .mockResolvedValue(page({ rendered_html: '<!doctype html><p>31 credits</p>' }))
+      .mockResolvedValueOnce(page({ rendered_html: withIsland(12) }))
+      .mockResolvedValue(page({ rendered_html: withIsland(31) }))
     const { queryClient } = mount()
     await waitFor(() => expect(mints.some((m) => m.includes('12 credits'))).toBe(true))
+    const frame = (await screen.findByTestId('crew-dashboard-iframe')) as HTMLIFrameElement
+    const win = frame.contentWindow as Window
+    const posted = vi.spyOn(win, 'postMessage')
+    // The document says its page redraws on a refill (every builtin does).
+    act(() => {
+      window.dispatchEvent(new MessageEvent('message', { data: { type: READY_MESSAGE_TYPE, refill: true }, source: win }))
+    })
 
     await queryClient.invalidateQueries({ queryKey: DASHBOARD_KEY })
     await waitFor(() => expect(read.mock.calls.length).toBeGreaterThan(1))
-    await waitFor(() => expect(mints.some((m) => m.includes('31 credits'))).toBe(true))
+    // REFILLED IN PLACE, not reloaded: the open document gets the new read and no
+    // second document is minted -- a new mint per read is the flicker.
+    await waitFor(() =>
+      expect(posted).toHaveBeenCalledWith(
+        expect.objectContaining({ type: DATA_MESSAGE_TYPE, read: expect.objectContaining({ fields: { credits: 31 } }) }),
+        '*',
+      ),
+    )
+    expect(mints.some((m) => m.includes('31 credits'))).toBe(false)
     // Same version, so this was never a new page and nothing was withheld.
     expect(screen.queryByTestId('crew-dashboard-kept-band')).not.toBeInTheDocument()
   })
@@ -340,6 +364,81 @@ describe('CrewDynamicDashboard', () => {
     expect(await screen.findByTestId('crew-dashboard-none')).toBeInTheDocument()
     expect(screen.queryByTestId('crew-dashboard-empty')).toBeNull()
     expect(screen.queryByTestId('crew-dashboard-empty-retry')).toBeNull()
+  })
+
+  // The read the gateway actually answers for a crewmate that adopted nothing:
+  // `state: "empty"` with the DEFAULT template (project-report) composed in. The
+  // tab shows the suggestions page instead of that default.
+  const unadopted = () => page({
+    state: 'empty',
+    suggestions: true,
+    state_reason: "no template adopted; showing the default 'project-report'",
+    instance_version: 0,
+    rendered_html: '<!doctype html><title>report</title><p>default report</p>',
+  })
+
+  it('shows the suggestions page, not the default template, for a crewmate with no adopted page', async () => {
+    vi.spyOn(api, 'memberDashboard').mockResolvedValue(unadopted())
+    mount()
+    expect(await screen.findByTestId('crew-dashboard-suggestions')).toBeInTheDocument()
+    expect(screen.queryByTestId('crew-dashboard-frame')).toBeNull()
+    expect(screen.queryByTestId('crew-dashboard-loading')).toBeNull()
+    expect(mints.some((m) => m.includes('default report'))).toBe(false)
+  })
+
+  it('puts a suggested prompt into the chat box through onAct', async () => {
+    vi.spyOn(api, 'memberDashboard').mockResolvedValue(unadopted())
+    const onAct = vi.fn()
+    renderWithProviders(
+      <CrewDynamicDashboard target={{ kind: 'member', slug: 'oncall', member: 'oncall' }} displayName="On Call" onAct={onAct} />,
+    )
+    const prompts = await screen.findAllByTestId('crew-dashboard-suggestion')
+    expect(prompts).toHaveLength(3)
+    fireEvent.click(prompts[0])
+    expect(onAct).toHaveBeenCalledWith(expect.stringMatching(/dashboard/i))
+  })
+
+  it('withholds the prompts when there is no chat box to put them in', async () => {
+    vi.spyOn(api, 'memberDashboard').mockResolvedValue(unadopted())
+    mount()
+    expect(await screen.findByTestId('crew-dashboard-suggestions')).toBeInTheDocument()
+    expect(screen.queryByTestId('crew-dashboard-suggestions-prompts')).toBeNull()
+  })
+
+  it('keeps drawing an ADOPTED page, never the suggestions page', async () => {
+    vi.spyOn(api, 'memberDashboard').mockResolvedValue(page({ state: 'live' }))
+    mount()
+    expect(await screen.findByTestId('crew-dashboard-frame')).toBeInTheDocument()
+    expect(screen.queryByTestId('crew-dashboard-suggestions')).toBeNull()
+  })
+
+  it('draws the page it was sent when the gateway does not say suggestions', async () => {
+    // The shipped page named for the crewmate (`kirocrew-conductor` gets its board)
+    // reads `empty` without the flag: the gateway decides, the tab does not re-derive.
+    vi.spyOn(api, 'memberDashboard').mockResolvedValue(
+      page({ ...unadopted(), suggestions: false, template: { id: 'kirocrew-conductor', version: 1 } }),
+    )
+    renderWithProviders(
+      <CrewDynamicDashboard target={{ kind: 'member', slug: 'kirocrew-conductor', member: 'kirocrew-conductor' }} displayName="Conductor" />,
+    )
+    expect(await screen.findByTestId('crew-dashboard-frame')).toBeInTheDocument()
+    expect(screen.queryByTestId('crew-dashboard-suggestions')).toBeNull()
+  })
+
+  it('a bound package with nothing applied keeps its own empty state', async () => {
+    vi.spyOn(api, 'memberDashboard').mockResolvedValue(
+      page({ state: 'empty', html: '', rendered_html: undefined, dashboard: 'my-pkg' }),
+    )
+    mount()
+    expect(await screen.findByTestId('crew-dashboard-none')).toBeInTheDocument()
+    expect(screen.queryByTestId('crew-dashboard-suggestions')).toBeNull()
+  })
+
+  it('a session target with nothing adopted still draws the default page', async () => {
+    vi.spyOn(api, 'sessionDashboard').mockResolvedValue(unadopted() as never)
+    renderWithProviders(<CrewDynamicDashboard target={{ kind: 'session', slot: 'chat-7' }} displayName="Root" />)
+    expect(await screen.findByTestId('crew-dashboard-frame')).toBeInTheDocument()
+    expect(screen.queryByTestId('crew-dashboard-suggestions')).toBeNull()
   })
 
   it('never draws the raw template when the stored copy does not parse', async () => {
@@ -605,13 +704,21 @@ describe('a preview link: the STAGED page, labelled as one', () => {
     const read = vi
       .spyOn(api, 'memberDashboard')
       .mockRejectedValue(new ApiError(404, 'nothing is staged to preview', '{"code":"no_preview"}'))
-    const onGone = vi.fn()
-    mountPreview(onGone)
+    mountPreview()
     expect(await screen.findByTestId('crew-dashboard-preview-gone')).toHaveTextContent('This preview has closed.')
     expect(screen.queryByTestId('crew-dashboard-error')).toBeNull()
     expect(screen.queryByTestId('crew-dashboard-error-retry')).toBeNull()
     expect(read).toHaveBeenCalledTimes(1)
+  })
+
+  it('tells a listening host and draws nothing, so the host can hand over with no flash', async () => {
+    vi.spyOn(api, 'memberDashboard')
+      .mockRejectedValue(new ApiError(404, 'nothing is staged to preview', '{"code":"no_preview"}'))
+    const onGone = vi.fn()
+    mountPreview(onGone)
     await waitFor(() => expect(onGone).toHaveBeenLastCalledWith(true))
+    expect(screen.queryByTestId('crew-dashboard-preview-gone')).toBeNull()
+    expect(screen.queryByTestId('crew-dashboard-error')).toBeNull()
   })
 
   it('any other 404 is a load failure, not a preview that ended', async () => {

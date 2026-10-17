@@ -7,8 +7,7 @@ boot-time re-hoist from the config watcher, readiness badges, and the replay of
 the durable inbound spool.
 
 The per-channel hoists, ``_register_config_appliers`` and
-``_start_channel_transports`` stay in the facade: the hot-reload and readiness
-audits parse them there.
+``_start_channel_transports`` are in ``channel_boot``.
 
 Composed by :mod:`kiro_crew.slack.gateway`, whose globals its functions run on;
 see :mod:`kiro_crew.slack.gateway_runtime`.

@@ -240,9 +240,10 @@ _SLOT_SCOPED_EVENTS = frozenset({
     "approval", "approval_resolved", "question_card",
     # Subagent lifecycle. Every one of these is fired through
     # ``SubagentManager._fire_event`` and reaches the wire via
-    # ``broadcast_ws(etype, ...)`` with a VARIABLE etype (slack/gateway.py's
-    # ``_subagent_event``), so a guard that scans broadcast call sites for string
-    # literals cannot see them -- ``TestFireEventNamesAreClassified`` reads the
+    # ``broadcast_ws(etype, ...)`` with a VARIABLE etype (the ``_subagent_event``
+    # closure in slack/gateway_runtime/subagent_wiring.py), so a guard that scans
+    # broadcast call sites for string literals cannot see them --
+    # ``TestFireEventNamesAreClassified`` reads the
     # emitter's own literals instead. Each payload carries id + slot.
     "subagent_spawn", "subagent_done", "subagent_tool", "subagent_chunk",
     "subagent_snapshot", "subagent_status", "subagent_queued",
@@ -309,6 +310,17 @@ _OWNER_ONLY_EVENTS = MEMBER_LOG_EVENTS | frozenset({
     # A live-observation request to one owner tab (``handlers/guide.py``): ids
     # only, but which controls the agent is asking about is the operator's own.
     "guide_observe",
+    # One crewmate's dashboard field values
+    # (``handlers/member_dashboard_fields.FIELD_FRAME``). Sent through
+    # ``broadcast_ws_owners``, so an app token is already outside the socket set
+    # it reaches, and the classification guard does not scan that fan-out --
+    # classified anyway, for the reason the comment above this set gives: the
+    # frame carries work-ledger and crew-log values, which is what the whole
+    # ``/api/members`` surface withholds from an app, so the denial should be the
+    # intentional one with its own audit reason rather than the unknown-event
+    # floor, and a later literal broadcast of this name must not silently start
+    # reaching an app token.
+    "dashboard_fields",
 })
 
 

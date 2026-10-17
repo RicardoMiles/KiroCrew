@@ -2442,6 +2442,17 @@ class TestProbeCache:
         # an "outdated" row.
         assert probed_at > 0
 
+    def test_cache_expired_error_returns_outdated_without_error(self) -> None:
+        # An aged failure reports no error text: the dashboard reads an error on
+        # an ``outdated`` row as a probe refused before spawn, and an aged
+        # failure is not one.
+        server = McpServerInfo(name="test-srv", command="x", status="error", tools=[], error="boom")
+        _cache_probe(server)
+        _probe_cache["test-srv"].probed_at = time.monotonic() - 2000
+        status, _tools, error, _probed_at, _mode = _get_cached("test-srv")
+        assert status == "outdated"
+        assert error == ""
+
     def test_cache_error_preserved(self) -> None:
         server = McpServerInfo(
             name="err-srv", command="x", status="error", tools=[], error="timeout"
@@ -3666,7 +3677,7 @@ class TestProbeServerConsentGate:
 #: against a declaration under ``<home>/run``. On Windows that classification
 #: returns ``None`` by design and the probe honours the declaration -- see
 #: ``test_on_windows_a_declared_temp_is_honored_because_nothing_seals_run`` in
-#: ``test_sandbox_argv.py`` -- so the refusal these tests assert cannot happen
+#: ``test_sandbox_argv_launcher_plan.py`` -- so the refusal these tests assert cannot happen
 #: there. Skipped rather than run under a patched platform: path semantics
 #: differ, and a POSIX-pinned run on Windows would mask a real failure.
 _NEEDS_A_SEALING_BACKEND = pytest.mark.skipif(
@@ -7018,5 +7029,8 @@ class TestProbeRefusesSecretReferences:
         from kiro_crew.mcp_quarantine import FAILING_STATUSES
 
         assert out.status not in FAILING_STATUSES and out.status != "ok"
+        # The dashboard shows an ``outdated`` row's error as its not-probed
+        # reason, so this refusal is pinned to exactly that shape.
+        assert out.status == "outdated"
         assert "API_TOKEN" in out.error
         assert "NAME" not in out.error.replace("API_TOKEN", "")

@@ -32,6 +32,7 @@ import pytest
 from source_corpus import repo_root
 
 from conftest import MockSlackClient
+from kiro_crew._facade_compose import compose as facade_compose
 from kiro_crew.acp.client import AcpError, AcpProcessDied, AcpPromptBusy, AcpTimeoutError
 from kiro_crew.acp.types import STOP_REASON_COMPACTION_FAILED
 from kiro_crew.config.loader import ACTIVATION_REVIEW
@@ -1507,7 +1508,7 @@ _GOLDEN_DIGESTS: dict[str, str] = {
     "cmd_sessions": "637197868fc541a4013406679648954e232c2467f86a34afcee2c9c09ba8bf15",
     "cmd_status": "99a5ab8189db5fc1241f21fd9fbc161a6696609d0597bd78cd183b445e00a763",
     "cmd_stop_no_session": "de5c5a671702ba32d7a8fef5d2528b07a3803d772f21f8d5a0aa64206f5b1d42",
-    "cmd_stop_running": "7a8a362aa0e8c73282bfcaefe11938c8112f066fbfa8a6bcbdafc0ddb04ab91f",
+    "cmd_stop_running": "1698b578b632c700afdb4c0a717b6ae66493a42dda13e6a9be522506f133262e",
     "cmd_ta_and_project": "0c1a7c878d745efc579eff89b6ebc4de99cb1fdfadecb29560afa5942a370443",
     "cmd_title": "d2d928c6a0e2a5a6b1b0cafe0cad309a92d321947c1e42e4f35de7b240b40bd5",
     "cmd_unknown_bang": "3ac3bfd77e7207cdf6a0a2d5c394d7acdcf42c7833ef8f49d17bdd4ff17ddc4a",
@@ -2176,15 +2177,20 @@ def test_a_moved_function_reads_its_source_from_its_owner() -> None:
     assert inspect.getsourcefile(handler.post_linked_approval) == _owner("approvals").__file__
 
 
-def test_the_compose_copy_matches_its_siblings() -> None:
-    """Each composition keeps its own copy of the technique so no package imports
-    another's, and the copies stay identical."""
-
-    def body(rel: str) -> str:
-        text = (_SRC / "kiro_crew" / rel / "__init__.py").read_text(encoding="utf-8")
-        return text[text.index("def compose(") :]
-
-    assert body("slack/handler_runtime") == body("hook_runtime")
+def test_the_facade_composes_through_the_shared_helper() -> None:
+    """The facade composes its owners with the one shared helper,
+    ``kiro_crew._facade_compose.compose``, calling it exactly once, and the owner
+    package keeps no copy of its own: its ``__init__`` defines no function."""
+    assert handler._facade_compose is facade_compose
+    source = Path(handler.__file__).read_text(encoding="utf-8")
+    assert source.count("\n_facade_compose(\n") == 1
+    package = ast.parse(Path(handler_runtime.__file__).read_text(encoding="utf-8"))
+    defined = [
+        node.name
+        for node in package.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    ]
+    assert defined == []
 
 
 # ── one edge ──────────────────────────────────────────────────────────────────
@@ -2588,7 +2594,7 @@ def test_the_facade_still_carries_what_the_source_guards_read() -> None:
         assert needle in source, needle
     assert source.count("save_conversation_turn_off_loop(") >= 7  # test_persist_off_loop
     for needle in (
-        "admit_inbound_callback(",  # test_update_check_install_aware
+        "admit_inbound_callback(",  # test_update_check_install_aware_background_work
         "mint_options_token(",  # test_options_click_validation
         "_options_owner =",  # test_slack_options_lifecycle
         "maybe_handle_keyword_command",  # test_slack_options_lifecycle

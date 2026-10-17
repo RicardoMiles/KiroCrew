@@ -75,7 +75,7 @@ Four costs follow from that shape.
 #:   reachable; nothing bounds WHAT is sent.
 ```
 
-`send_to_target` in [`src/kiro_crew/dashboard/session_control.py`](../../src/kiro_crew/dashboard/session_control.py) hands the body to `enqueue_or_run_prompt` — the same call the human composer uses. A worker's text would therefore *be* the conductor's next prompt, executed under the conductor's grants. Granting it downward turns every worker into an operator of its parent.
+`send_to_target` in [`src/kiro_crew/dashboard/session_control_parts/session_messaging.py`](../../src/kiro_crew/dashboard/session_control_parts/session_messaging.py) hands the body to `enqueue_or_run_prompt` — the same call the human composer uses. A worker's text would therefore *be* the conductor's next prompt, executed under the conductor's grants. Granting it downward turns every worker into an operator of its parent.
 
 So the requirement is not "a channel from worker to conductor". It is a channel that cannot carry an instruction.
 
@@ -132,7 +132,7 @@ Both agents reach the store through the dashboard HTTP API with a server-resolve
 
 ### Identity: resolved, never asserted
 
-Every one of the six tools resolves the caller with `require_strict_session_key` in [`src/kiro_crew/mcp_core.py`](../../src/kiro_crew/mcp_core.py). Strict means the gateway-injected caller block, the `KIROCREW_SESSION_KEY` environment variable, or the HMAC host-pid sidecar — and explicitly *not* the lenient resolver's `/proc` ancestor walk, because a subagent walking its ancestry would resolve to its parent's identity. `session_ledger_read` and `issue_radar_crew_read` already depend on exactly this property; the failure text and diagnosis helper are reused unchanged.
+Every one of the six tools resolves the caller with `require_strict_session_key` in [`src/kiro_crew/mcp_core_parts/identity.py`](../../src/kiro_crew/mcp_core_parts/identity.py). Strict means the gateway-injected caller block, the `KIROCREW_SESSION_KEY` environment variable, or the HMAC host-pid sidecar — and explicitly *not* the lenient resolver's `/proc` ancestor walk, because a subagent walking its ancestry would resolve to its parent's identity. `session_ledger_read` and `issue_radar_crew_read` already depend on exactly this property; the failure text and diagnosis helper are reused unchanged.
 
 No tool takes a session key, a conductor id, or an item id from the worker side. The server derives all three.
 
@@ -322,7 +322,7 @@ key whichever party wrote it. The entry carries `actor`, `by`, `action` and only
 fields that action set; an omitted field means "unchanged".
 
 The `work` fold in
-[`src/kiro_crew/crew_log/projection.py`](../../src/kiro_crew/crew_log/projection.py),
+[`src/kiro_crew/crew_log/projection_work.py`](../../src/kiro_crew/crew_log/projection_work.py),
 registered in the projection registry beside the session folds, replays those entries
 across the conductor's and its workers' units into the shape the readers already
 consume: the conductor header and every item in creation order, each with its event

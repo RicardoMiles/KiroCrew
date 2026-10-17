@@ -955,7 +955,7 @@ class TestWriteStructuredMemory:
         specific cause -- here which confidence won. Dropping it left an operator
         with ``conflict`` and no way to tell a confidence loss from a queued
         proposal, so the warning must carry the reason and name the table that
-        holds the stored and rejected values.
+        holds the audit row, saying which values that row keeps.
         """
         vs = MagicMock()
         vs.set_semantic.return_value = (
@@ -968,8 +968,13 @@ class TestWriteStructuredMemory:
         assert "Existing entry has higher confidence (0.90 vs 0.60)" in caplog.text
         # The pointer is scoped to audited causes: VALUE_SIZE and VALUE_ENCODING are
         # outside ``_AUDITABLE_REJECT_CODES``, so a blanket promise of a row would send
-        # an operator to an audit record that was never written.
-        assert "audited causes carry both values in memory_events" in caplog.text
+        # an operator to an audit record that was never written. Only a conflict_skip
+        # row stores both values; log_reject_event stores the rejected value alone.
+        assert (
+            "memory_events records the rejected value for audited causes;"
+            " a conflict_skip row, when written, records both"
+        ) in caplog.text
+        assert "carry both values" not in caplog.text
 
     def test_semantic_is_capped(self) -> None:
         vs = MagicMock()

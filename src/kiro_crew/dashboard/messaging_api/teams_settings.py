@@ -58,9 +58,10 @@ async def api_teams_config_get(request: web.Request) -> web.Response:
         _channel_sdk_status, "teams"
     )
     tc = cfg.teams
-    # Credential resolution mirrors the boot path (slack/gateway.py) exactly: the
-    # env credential wins over config.json for all three values, so the panel
-    # reports the identity the channel will actually run as.
+    # Credential resolution mirrors the boot path (``_hoist_teams`` in
+    # slack/gateway_runtime/channel_boot.py) exactly: the env credential wins over
+    # config.json for all three values, so the panel reports the identity the
+    # channel will actually run as.
     app_id = creds.get(CRED_MICROSOFT_APP_ID, "") or tc.app_id
     app_password = creds.get(CRED_MICROSOFT_APP_PASSWORD, "") or tc.app_password
     tenant_id = creds.get(CRED_MICROSOFT_APP_TENANT_ID, "") or tc.tenant_id
@@ -303,8 +304,9 @@ async def _teams_config_save(request: web.Request) -> web.Response:
     # The fallbacks come from a config snapshot taken OUTSIDE the config lock and
     # are advisory only: they decide what to verify, never what to write. The
     # authoritative read-modify-write is still Phase 2 under the lock. Resolution
-    # order mirrors the boot path (slack/gateway.py) — the env credential wins —
-    # so the check exercises the credentials the channel will actually use.
+    # order mirrors the boot path (``_hoist_teams`` in
+    # slack/gateway_runtime/channel_boot.py) — the env credential wins — so the
+    # check exercises the credentials the channel will actually use.
     verify_warning = ""
     #: The exact (app_id, password, tenant) Azure accepted, or None when nothing was
     #: verified. Re-confirmed under the config lock before anything is written.

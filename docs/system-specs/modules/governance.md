@@ -46,7 +46,7 @@ and extensible (adding a scope is data, not engine code).
 can reorder strictness or redefine matching):
 
 - `_ORDINAL_SCALES`: `approval = yolo < auto < interactive`;
-  `sandbox = off < standard < cc < strict` (verified against `sandbox.py`).
+  `sandbox = off < standard < cc < strict` (verified against `sandbox_tiers.py`).
 - `_MATCHERS` — exactly **five**: `identifier` (case-insensitive), `command`
   (case-sensitive `fnmatchcase`), `path`, `host`, and `mcp` (a `@server` grant covers
   `@server/tool`). There is no `bundle_id` or `cu_action` matcher: naming either in a
@@ -259,8 +259,8 @@ pins ride in the policy file for it:
   enterprise ceiling). It never refuses to *boot*: bricking a fleet on a policy
   typo would remove the surface an admin needs to fix it. An unparseable floor
   imposes none, for the same reason. What "takes the update" means depends on
-  the install (`slack/gateway.py` `_check_for_updates` and
-  `_check_for_updates_via_provider`):
+  the install (`slack/gateway_runtime/update_schedule.py` `_check_for_updates`
+  and `_check_for_updates_via_provider`):
   - **A policy provider** (`check_command` below) applies whenever the check
     reports a version.
   - **A git checkout** on a primary branch applies only toward a build whose
@@ -1731,8 +1731,9 @@ disposition:
   evaluates the `channels` scope on the host surface with `fail_closed=True` (its
   audit row names the direction, `outbound:<channel>`), writes a governed allow
   `critical=True`, and fails closed. Discord re-checks it in
-  `discord/client.py` after each REST wait and in `discord/transport_dispatch.py`
-  before the approval-verdict edit, so a policy installed during a send stops it.
+  `discord/client.py` after each REST wait and in
+  `discord/transport_dispatch_interactions.py` before the approval-verdict edit, so a
+  policy installed during a send stops it.
   Detail: [messaging.md](messaging.md).
 - **Slack workspace admission (`slack.enterprise`)** audits via `log_api_access`
   (not `log_governance_decision`) and its posture probe fails **closed** (returns
@@ -2079,7 +2080,9 @@ read-your-writes should add it deliberately, with its own tests.
   cron *capability* on/off gate in `mcp_cron._vet_cron_capability_governance`.
   Both run at `cron_add` (authoring) AND again at fire time — for EVERY job
   kind — via the shared `mcp_cron.vet_job_at_fire_time(job)` entry point
-  called from `slack.gateway._cron_callback` immediately before execution:
+  reached through `_await_cron_fire_time_gate` immediately before execution, from
+  `_cron_callback` (`slack/gateway_runtime/cron_fire.py`, the message and goal-reminder
+  gates) and from `_cron_run_command` / `_cron_run_script` (`cron_exec.py`):
   `command` jobs re-run the capability gate + the `commands` ceiling + the
   command-body COMPOSITION scan (`mcp_cron._vet_shell_command`, audited under
   the `cron_command_body` scope), `script`
@@ -2126,7 +2129,9 @@ read-your-writes should add it deliberately, with its own tests.
   spelling, which a recipient predicate over conversation ids can never match —
   and the handler re-decides recipient authorization against the resolved
   conversation id, SEL-audited, immediately after; the `channels` governance
-  decision itself always precedes the resolve's network side effect); the per-transport **startup** gate in
+  decision itself always precedes the resolve's network side effect); the
+  proactive owner DM in `dashboard.messaging_api.channel_delivery._deliver_channel_dm`
+  runs the same two-step on the same ladder; the per-transport **startup** gate in
   `slack.gateway._channel_transport_permitted` (a `channels` deny for a member
   keeps that transport — `slack`/`wecom`/`telegram`/`discord`/`webex` — from
   connecting at boot; resolved under `session_key=HOST_SESSION_KEY` so a
@@ -2259,9 +2264,9 @@ upgrade for a policy that loads today.
 (`AcpEvent.tool_kind` / `.raw_tool_params`); the call sites thread them
 (`llm_helpers`, `subagent`, `task_executor`, `task_planner`, dashboard
 `chat_runner`, slack `handler`). **The `EVENT_PERMISSION_REQUEST` event the gate
-runs on must carry `raw_tool_params`** — `acp/client.py` caches the structured
+runs on must carry `raw_tool_params`** — `acp/client_tool_events.py` caches the structured
 rawInput at the ToolCall notification (`_tool_call_params`, keyed by
-`toolCallId`) and attaches it to the later permission event, because that
+`toolCallId`) and `acp/client_permissions.py` attaches it to the later permission event, because that
 message itself carries only a truncated title. Without this the two arg-derived
 scopes would be inert in production.
 
@@ -3447,7 +3452,7 @@ server would refuse.
 ### Which tool-approval modes a deployment may select — `approval_modes`
 
 The dashboard approval-mode picker offers four modes: `normal` (interactive —
-ask for every tool), `trust_reads` (auto-approve read-only shell commands; every other tool call, MCP included, still asks), `trust` (auto-approve
+ask for every tool), `trust_reads` (auto-approve read-only shell commands except any that runs `git`; every other tool call, MCP included, still asks), `trust` (auto-approve
 the active slot), and `yolo` (auto-approve every tool everywhere). The
 `approval_modes` `SCOPE_CATALOG` row (a `ScopedRuleset` on the `identifier`
 matcher — data-only shape, no evaluator change, mirroring `agent_backend`
@@ -3488,7 +3493,7 @@ the posture is worse than one that fails to load.
 **Enforced at every `yolo` surface**, because a mode is only actually off if every
 path that can arm it — and every path that HONOURS an existing grant — refuses:
 
-- `dashboard/chat_handlers.py::api_chat_mode` — the explicit mode switch. Refuses
+- `dashboard/chat_api/slot_approval.py::api_chat_mode` — the explicit mode switch. Refuses
   with `403` + `mode_disabled_by_policy` **before any mutation**.
 - `safety_override` arming — `_commit_activation` and `activate_scoped`,
   fail-closed, so YOLO stays blocked however it is armed (dashboard, Slack `!yolo`,
@@ -3652,7 +3657,8 @@ carve-out stay as code. It expects `CONTRACT_VERSION == 1` (pinned pre-launch).
   `read_policy_trust_root` (the side-effect-free trust-root reader).
 - `platform/update_governance.py` — the shared update seam (`resolve_remote_url`,
   `update_blocked_reason`, `update_required`, `min_version`) called by
-  `dashboard/handlers/updates.py`, `cli_server.py` and `slack/gateway.py`.
+  `dashboard/handlers/updates.py`, `cli_server.py` and the gateway's update owners
+  (`slack/gateway_runtime/update_schedule.py`, `slack/gateway_runtime/update_apply.py`).
 - `platform/policy_distribution.py` — central distribution: source resolution
   (env ∘ the policy's `distribution` block), the append-only
   `register_policy_fetcher` transport seam, the last-known-good cache, the
@@ -3686,11 +3692,11 @@ carve-out stay as code. It expects `CONTRACT_VERSION == 1` (pinned pre-launch).
 - `dashboard/handlers_system.py` — `GET /api/governance/channels`.
 - `dashboard/handlers/security.py` — `GET /api/governance/policy` (posture-only
   serialization).
-- chokepoints: `sandbox.py`, `mcp_cron.py`, `subagent.py`, `mcp_core.py`,
+- chokepoints: `sandbox.py`, `mcp_cron.py`, `subagent_parts/agent_policy.py`, `mcp_core.py`,
   plus the audit-only seam `computer_use/gate.py` (not a governance chokepoint:
   `require_computer_use` always proceeds and audits, and `apply_observation_ceiling`
   passes the payload through).
-- `cli.py` / `cli_commands.py` — the `policy` command.
+- `cli_parser_admin.py` (its arguments), `cli.py` (dispatch) / `cli_commands.py` — the `policy` command.
 
 ## Tests
 
@@ -3707,8 +3713,10 @@ is announced once, and that a tier intersect is audited once per pair),
 `test_governance_self_protection.py` (keystone), `test_governance_profiles.py`
 (resolution + binding + hot-reload + fail-closed reload dispositions),
 `test_governance_gate.py` (Plane A enforcement + audit),
-`test_governance_chokepoints.py` (sandbox/cron/spawn/helpers + egress-reserved +
-the per-transport inbound gates), `test_governance_channels_endpoint.py`
+`test_governance_chokepoints_scope_gates.py` (sandbox/cron/spawn/helpers + the
+per-transport inbound gates + the capability, app and publish chokepoints),
+`test_governance_chokepoints.py` (filesystem/egress at the host gate + the
+degraded and fail-closed chokepoints), `test_governance_channels_endpoint.py`
 (`/api/governance/channels`, incl. the eval-error→`null` distinction),
 `test_governance_policy_viewer.py` (`/api/governance/policy` posture-only, incl.
 `test_detail_never_leaks_rule_contents` and `TestScopeAttribution` — that a

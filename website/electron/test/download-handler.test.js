@@ -85,10 +85,15 @@ describe("uniqueSavePath", () => {
   it("skips a reserved path even when it does not yet exist on disk", () => {
     // Nothing on disk, but "export.zip" is already claimed by an in-flight
     // download -> the next request must pick "export (1).zip", not reuse it.
+    // The reservation set is keyed by fsPathKey (as the real caller seeds it),
+    // and the platform is pinned so the lookup is deterministic on every OS:
+    // on a case-insensitive volume (darwin/win32) fsPathKey lower-cases the
+    // candidate, so a raw-path reservation would miss and wrongly reuse the
+    // name.
     const fs = { existsSync: () => false };
-    const reserved = new Set([path.join(DOWNLOADS, "export.zip")]);
+    const reserved = new Set([fsPathKey(path.join(DOWNLOADS, "export.zip"), "darwin")]);
     assert.equal(
-      uniqueSavePath(fs, DOWNLOADS, "export.zip", 1000, reserved),
+      uniqueSavePath(fs, DOWNLOADS, "export.zip", 1000, reserved, "darwin"),
       path.join(DOWNLOADS, "export (1).zip"),
     );
   });

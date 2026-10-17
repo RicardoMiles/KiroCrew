@@ -114,6 +114,7 @@ from kiro_crew.eval.judge import LLMJudge
 from kiro_crew.eval.runner import EvalRunner, format_results, score_by_dimension
 from kiro_crew.eval.scenario import AssertionType, load_scenario, load_scenarios
 from kiro_crew.external_text import external_text_requires_redaction
+from kiro_crew.hidden_leaf_staging import EnvStagingRefused
 from kiro_crew.history import ConversationLog
 from kiro_crew.hooks import safe_read_file
 from kiro_crew.learn import LessonStore
@@ -343,6 +344,17 @@ def _internal_secret(port: int) -> str:
     return read_local_secret(port, dial_host="127.0.0.1")
 
 
+def _spawn_row_text(row: dict[str, object]) -> str:
+    """A ``spawn list`` row's id and task, as one terminal line.
+
+    Both are agent-authored, so neither may carry a live control sequence or a
+    newline that forges another row.
+    """
+    row_id = safe_terminal_line(str(row["id"]))
+    task = safe_terminal_line(str(row.get("task") or ""))[:60]
+    return f"{row_id}  {task}"
+
+
 def _spawn(args: argparse.Namespace) -> None:
     """Dispatch spawn subcommands: run, list."""
     base = f"http://127.0.0.1:{args.port}"
@@ -376,9 +388,7 @@ def _spawn(args: argparse.Namespace) -> None:
             # Accepted, no run yet (or waiting to resume one): a distinct icon,
             # so this is never read as a run in progress.
             tag = "resuming" if q.get("resuming") is True else "queued, not started"
-            print(
-                f"  🕒 {q['id']}  {str(q.get('task') or '')[:60]}  — {tag}: {queued_wait_text(q)}"
-            )
+            print(f"  🕒 {_spawn_row_text(q)}  — {tag}: {queued_wait_text(q)}")
         if partial:
             print("  (the queued list is partial; more spawns may be queued)")
         for a in agents:
@@ -390,7 +400,7 @@ def _spawn(args: argparse.Namespace) -> None:
                 status, note = "🔐", "  — waiting for spawn approval"
             else:
                 status, note = "⏳", ""
-            print(f"  {status} {a['id']}  {a.get('task', '')[:60]}{note}")
+            print(f"  {status} {_spawn_row_text(a)}{note}")
         return
 
     if action == "run":
@@ -401,8 +411,24 @@ def _spawn(args: argparse.Namespace) -> None:
 
 
 def _spawn_run(args: argparse.Namespace, base: str) -> None:
-    """Spawn a subagent via the dashboard API."""
-    data = json.dumps({"task": args.task}).encode()
+    """Spawn a subagent via the dashboard API.
+
+    ``--agent`` and ``--crew`` travel as the request's ``agent`` and ``crew``
+    fields, the ones the native ``spawn_run`` tool sends, so the gateway's
+    admission resolves and refuses them for both callers alike. A blank name
+    is refused here: the gateway reads an empty field as "no pin", which would
+    run the default the caller did not ask for.
+    """
+    body: dict[str, str] = {"task": args.task}
+    for flag in ("agent", "crew"):
+        name = getattr(args, flag, None)
+        if name is None:
+            continue
+        if not name.strip():
+            print(f"Error: --{flag} needs a name")
+            sys.exit(1)
+        body[flag] = name
+    data = json.dumps(body).encode()
     req = urllib.request.Request(
         f"{base}/api/spawn",
         data=data,
@@ -1521,9 +1547,15 @@ def _handle_agent(args: argparse.Namespace) -> None:
         )
         for name, agent in cfg.agents.items():
             marker = " *" if name == default else ""
+            # The loader keeps a malformed ``memory_store`` binding as written
+            # (pinning it to the default would attach the member to the shared
+            # store), so show the defect here instead of failing the listing.
+            memory_store = agent.memory_store
+            if not isinstance(memory_store, str):
+                memory_store = f"(invalid: {type(memory_store).__name__})"
             print(
                 f"{name + marker:<20} {agent.kiro_agent:<20} "
-                f"{agent.workspace:<15} {agent.memory_store:<15} "
+                f"{agent.workspace:<15} {memory_store:<15} "
                 f"{getattr(agent, 'source', 'kirocrew'):<12} "
                 f"{_agent_list_label(agent.display_name)}".rstrip()
             )
@@ -1607,6 +1639,10 @@ def _handle_agent(args: argparse.Namespace) -> None:
         else:
             print(f"Created agent: {args.name}")
         print(f"Workspace: {created.workspace}")
+        from kiro_crew.member_mate_tools import GRANTED, grant_mate_tools_to_new_member
+
+        if grant_mate_tools_to_new_member(args.name) == GRANTED:
+            print("Added the crewmate's own tools (kirocrew-mate) to its private copy")
 
     elif action == "update":
         if args.name not in cfg.agents:
@@ -5195,7 +5231,9 @@ def _handle_secrets(args: argparse.Namespace) -> None:
         # nonzero exit — never an uncaught traceback.
         try:
             report = migrate_env_secrets(dry_run=not args.apply)
-        except MigrationConflictError as exc:
+        except (MigrationConflictError, EnvStagingRefused) as exc:
+            # EnvStagingRefused is an OSError, so it is caught first: the vault is
+            # fine and the message names the staging directory and its fix.
             print(f"error: {exc}", file=sys.stderr)
             sys.exit(1)
         except (OSError, ValueError) as exc:

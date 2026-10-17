@@ -31,8 +31,10 @@ from kiro_crew.dashboard.chat_utils import (
 )
 from kiro_crew.dashboard.handlers.memory import _store_unavailable_response
 from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
+from kiro_crew.dashboard.relay_archive import is_relay_archive
 from kiro_crew.dashboard.slot_ownership import deny_app_slot_access
 from kiro_crew.dashboard.state import (
+    _MAX_SLOT_MESSAGES,
     MAX_LIVE_SLOTS,
     VALID_MEMORY_MODES,
     DashboardState,
@@ -166,6 +168,43 @@ async def resolve_fork_source(
     which is the shape every refusal in this module has; callers that are not
     HTTP handlers translate it (``session_control.fork_session``).
     """
+    # A relay archive -- a slot bound to a peer crew (``executor == "remote"``)
+    # -- is READ-ONLY: there is no relay to run its turns on, and every send /
+    # turn-restarting path refuses it (see ``relay_archive``). Forking must
+    # refuse it too: ``fork_slot`` builds the child with ``get_or_create_slot``,
+    # which does not carry ``executor`` / ``instance_id`` / ``remote_slot``, so
+    # the child would be born LOCAL and runnable -- and then run the peer crew's
+    # agent on THIS machine, failing with ``agent "<peer default>" not found``
+    # because that agent is not configured here. Refuse the fork for the same
+    # reason the run paths do, with the same code, so the user is told to open
+    # the crew's own session instead. Earliest check and fail closed: a
+    # half-written binding is an archive too (``is_relay_archive`` keys on
+    # ``executor`` alone), and must never be laundered into a local run through
+    # a copy.
+    if is_relay_archive(slot):
+        sel().log_api_access(
+            caller=audit_caller,
+            operation=audit_operation,
+            outcome="denied",
+            source="dashboard",
+            resources=f"slot={slot.key},executor={getattr(slot, 'executor', '')!r}",
+            error="source slot is a read-only relay archive",
+        )
+        # Literal body (not ``RELAY_ARCHIVE_ERROR`` / ``RELAY_ARCHIVE_CODE``): the
+        # error-code contract scanner reads only a string-literal ``code``, and
+        # every refusal in this module is a literal for that reason. The literals
+        # mirror ``relay_archive`` and ``test_relay_archive`` asserts they match
+        # ``RELAY_ARCHIVE_CODE`` so the two cannot drift apart.
+        return web.json_response(
+            {
+                "error": (
+                    "this chat ran on a remote crew and is read-only now; "
+                    "open the crew's own session to keep going"
+                ),
+                "code": "relay_archive_read_only",
+            },
+            status=409,
+        )
     # The child inherits the parent's mode, so the parent's value is what the
     # slot constructor validates against ``VALID_MEMORY_MODES``. The API checks
     # the field on the way in, but rehydration copies the transcript header's
@@ -921,6 +960,22 @@ async def fork_slot(
     elif at_index is not None:
         visible = visible[: at_index + 1]
 
+    # The destination's append trims from the FRONT at capacity, and nothing has
+    # reached disk during the copy, so those evicted rows are unrecoverable.
+    if len(visible) > _MAX_SLOT_MESSAGES:
+        return web.json_response(
+            {
+                # No count and no ceiling: a row number is not an affordance in a
+                # transcript that numbers nothing, so the text names the ACTION.
+                "error": (
+                    "conversation too large to fork. Fork at a message "
+                    "(at_message_index or at_message_id) to copy a smaller slice."
+                ),
+                "code": "fork_corpus_too_large",
+            },
+            status=400,
+        )
+
     # A fork of a member DM thread is an ordinary chat, never a second "member"
     # slot: the fork mints a chat-* key, so member mode would make it invisible
     # everywhere (excluded from Sessions by surface mode, and absent from the
@@ -1015,6 +1070,9 @@ async def fork_slot(
     # context (agent resolution, steering files, CWD) instead of falling back to
     # the config/workspace default on first message.
     new_slot.project = slot.project
+    # Keep the app-owned agent binding with the agent it binds: the fork runs as
+    # the same app agent, so the per-turn shadow check must still apply to it.
+    new_slot.app_agent_owner = slot.app_agent_owner
     # Inherit the sidebar folder so the fork appears next to its parent in the UI.
     new_slot.folder_id = slot.folder_id
     # Inherit tags (copied, so later edits to either slot's list stay independent).

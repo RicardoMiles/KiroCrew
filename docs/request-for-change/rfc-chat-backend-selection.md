@@ -103,7 +103,7 @@ rule a provider switch applies to every slot (`server_runtime/config_watch.py`).
 A switch that is refused or rolled back restores both.
 
 A switch while a turn is in flight is refused with 409, as
-`api_chat_slot_model` in `src/kiro_crew/dashboard/chat_handlers.py` refuses a
+`api_chat_slot_model` in `src/kiro_crew/dashboard/chat_api/slot_model.py` refuses a
 model switch that would tear down a streaming turn. Setting the backend the
 slot already has is a no-op.
 
@@ -113,7 +113,7 @@ The pick is persisted with the slot's other metadata, so it survives a gateway
 restart. When the session is created, the pick reaches the factory through
 `get_or_create(..., backend_override=)`, which records it as
 `session.backend_override`. `allocation_identity` in
-`src/kiro_crew/session_lifecycle.py` already carries that field to a reset or
+`src/kiro_crew/session_lifecycle_parts/parked_queue.py` already carries that field to a reset or
 compaction successor, so those keep the chat's backend with no new code.
 
 ### 4. Agent surface

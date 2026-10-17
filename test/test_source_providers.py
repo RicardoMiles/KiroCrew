@@ -2726,6 +2726,33 @@ async def test_fetch_gitlab_rereads_merge_state_until_the_provider_settles_it(
 
 
 @pytest.mark.asyncio
+async def test_fetch_gitlab_merge_state_reread_passes_the_host(monkeypatch) -> None:
+    """The re-read is a ``glab`` call, and ``_run_provider`` refuses any ``glab``
+    call without a host. A re-read that drops it is denied, the loop swallows
+    the refusal and the panel shows ``unknown`` for an MR GitLab had settled."""
+    monkeypatch.setattr(source, "_MERGE_STATE_REREAD_DELAY_SECS", 0)
+    detail_hosts: list[str] = []
+
+    async def fake_run(*argv: str, host: str = "", **_kwargs: int):
+        command = " ".join(argv)
+        if command.endswith("merge_requests/42"):
+            detail_hosts.append(host)
+            if len(detail_hosts) == 1:
+                return {"iid": 42, "detailed_merge_status": "checking"}
+            return {"iid": 42, "detailed_merge_status": "mergeable"}
+        return []
+
+    monkeypatch.setattr(source, "_run_json", fake_run)
+
+    data = await source._fetch_gitlab(
+        source.parse_source_url("https://gitlab.com/acme/repo/-/merge_requests/42")
+    )
+
+    assert detail_hosts == ["gitlab.com", "gitlab.com"]
+    assert (data["mergeable"], data["mergeStateStatus"]) == ("mergeable", "clean")
+
+
+@pytest.mark.asyncio
 async def test_fetch_gitlab_degrades_to_unknown_when_reread_cannot_settle(monkeypatch) -> None:
     monkeypatch.setattr(source, "_MERGE_STATE_REREAD_DELAY_SECS", 0)
     detail_reads: list[str] = []
@@ -3850,6 +3877,92 @@ async def test_refresh_check_status_issues_pending_follow_up_force(monkeypatch) 
 
 
 @pytest.mark.asyncio
+async def test_follow_up_forced_read_burns_the_floor(monkeypatch) -> None:
+    """A follow-up forced read that starts is floor-stamped.
+
+    Without the stamp, a turn boundary inside the floor that lands while the
+    follow-up is in flight queues another unstamped follow-up, so forced reads
+    run back to back for as long as turns keep ending during reads.
+    """
+    url = "https://github.com/acme/repo/pull/95"
+    source._check_cache.clear()
+    source._check_inflight.clear()
+    source._check_forced_at.clear()
+    source._check_force_pending.clear()
+    source._status_delta_sinks.clear()
+    real_refresh = source._refresh_check_status
+    monkeypatch.setattr(
+        source, "_fetch_check_status", AsyncMock(return_value={"state": "open"})
+    )
+    # Started follow-ups stay "in flight" until the test clears them.
+    monkeypatch.setattr(source, "_refresh_check_status", AsyncMock(return_value=None))
+    source._check_cache[url] = (source.time.monotonic(), {"state": "open"})
+    source._check_inflight.add(url)
+    try:
+        # Turn boundary while a paced read is in flight: one follow-up is queued.
+        assert source.request_check_refresh_now([url]) == [url]
+        assert url in source._check_force_pending
+        # The read completes and the follow-up forced read really starts.
+        await real_refresh(url)
+        assert url in source._check_inflight
+        assert url not in source._check_force_pending
+        assert url in source._check_forced_at
+        # A second boundary inside the floor, during the follow-up, is paced: it
+        # queues no further follow-up and starts no other forced read.
+        source.request_check_refresh_now([url])
+        assert url not in source._check_force_pending
+        # After the floor it is eligible again.
+        source._check_forced_at[url] = (
+            source.time.monotonic() - source._CHECK_FORCE_MIN_INTERVAL_SECS - 1
+        )
+        assert source.request_check_refresh_now([url]) == [url]
+        assert url in source._check_force_pending
+    finally:
+        source._check_cache.clear()
+        source._check_inflight.clear()
+        source._check_forced_at.clear()
+        source._check_force_pending.clear()
+
+
+@pytest.mark.asyncio
+async def test_deferred_follow_up_caches_the_result_already_due(monkeypatch) -> None:
+    """A follow-up deferred by a full pending cap leaves the entry due.
+
+    The read that completed may predate the turn's final push, so it must not be
+    cached as fresh for a full TTL when its corrective follow-up could not start.
+    """
+    url = "https://github.com/acme/repo/pull/96"
+    source._check_cache.clear()
+    source._check_inflight.clear()
+    source._check_forced_at.clear()
+    source._check_force_pending.clear()
+    source._status_delta_sinks.clear()
+    monkeypatch.setattr(
+        source, "_fetch_check_status", AsyncMock(return_value={"state": "open"})
+    )
+    real_refresh = source._refresh_check_status
+    spawned = AsyncMock(return_value=None)
+    monkeypatch.setattr(source, "_refresh_check_status", spawned)
+    source._check_cache[url] = (source.time.monotonic() - 120, {"state": "open"})
+    for n in range(source._CHECK_PENDING_MAX):
+        source._check_inflight.add(f"https://github.com/acme/other/pull/{n}")
+    source._check_force_pending.add(url)
+    try:
+        await real_refresh(url)
+        spawned.assert_not_called()
+        assert url not in source._check_force_pending
+        assert url not in source._check_forced_at
+        entry = source._check_cache[url]
+        assert entry[1] == {"state": "open"}
+        assert source._chip_refresh_due(entry, source.time.monotonic(), force=False)
+    finally:
+        source._check_cache.clear()
+        source._check_inflight.clear()
+        source._check_forced_at.clear()
+        source._check_force_pending.clear()
+
+
+@pytest.mark.asyncio
 async def test_chip_refresh_damps_projection_flap(monkeypatch) -> None:
     """A URL whose chip status keeps flapping must stop driving the invalidation loop.
 
@@ -4862,9 +4975,9 @@ async def test_gitlab_allowlist_never_reads_config_on_the_event_loop(monkeypatch
     in a worker thread; the sync accessor every URL parse uses is cache-only."""
     calls: list[str] = []
 
-    def fake_load() -> tuple[frozenset[str], frozenset[str], bool, frozenset[str]]:
+    def fake_load() -> tuple[frozenset[str], frozenset[str], bool, frozenset[str], frozenset[str]]:
         calls.append("load")
-        return frozenset({"gitlab.acme.internal"}), frozenset(), True, frozenset()
+        return frozenset({"gitlab.acme.internal"}), frozenset(), True, frozenset(), frozenset()
 
     monkeypatch.setattr(source, "_load_source_link_settings", fake_load)
     monkeypatch.setattr(source, "_gitlab_hosts_snapshot", frozenset())
@@ -5203,14 +5316,16 @@ async def test_concurrent_allowlist_refresh_cannot_restore_a_revoked_host(monkey
     release = source.asyncio.Event()
     loads = {"n": 0}
 
-    def slow_stale_load() -> tuple[frozenset[str], frozenset[str], bool, frozenset[str]]:
+    def slow_stale_load() -> (
+        tuple[frozenset[str], frozenset[str], bool, frozenset[str], frozenset[str]]
+    ):
         loads["n"] += 1
         # asyncio.Event is not thread-safe: this runs in a worker thread, so the
         # set() must be marshalled back onto the loop.
         loop.call_soon_threadsafe(started.set)
         # Block inside the worker thread so a second waiter queues on the lock.
         source.asyncio.run_coroutine_threadsafe(_noop(), loop).result(timeout=5)
-        return frozenset({"gitlab.acme.internal"}), frozenset(), True, frozenset()
+        return frozenset({"gitlab.acme.internal"}), frozenset(), True, frozenset(), frozenset()
 
     async def _noop() -> None:
         await release.wait()
@@ -5652,6 +5767,150 @@ async def test_auto_merge_github_refuses_when_no_method_allowed(monkeypatch) -> 
     run.assert_awaited_once()
 
 
+def _github_already_mergeable_node(merge_state: str) -> dict:
+    """A GitHub node response for an open PR GitHub would refuse to arm.
+
+    ``CLEAN``/``UNSTABLE`` mean every required check is settled, so nothing is
+    left for ``enablePullRequestAutoMerge`` to wait on and GitHub refuses it with
+    ``Pull request is in clean/unstable status``.
+    """
+    return {
+        "data": {
+            "repository": {
+                "squashMergeAllowed": True,
+                "mergeCommitAllowed": True,
+                "rebaseMergeAllowed": True,
+                "pullRequest": {
+                    "id": "PR_node1",
+                    "headRefOid": "deadbeef00",
+                    "isDraft": False,
+                    "state": "OPEN",
+                    "mergeStateStatus": merge_state,
+                },
+            }
+        }
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("merge_state", ["CLEAN", "UNSTABLE", "HAS_HOOKS"])
+async def test_auto_merge_github_already_mergeable_refusal_is_answerable(
+    monkeypatch, merge_state: str
+) -> None:
+    """An already-mergeable GitHub PR raises an ANSWERABLE refusal, not a 503.
+
+    GitHub refuses ``enablePullRequestAutoMerge`` once a PR is already mergeable
+    (``CLEAN``/``UNSTABLE``). Dispatching the arming mutation blind would turn that
+    normal, user-actionable state into ``gh: Pull request ... is in unstable
+    status`` surfaced as an HTTP 503 ``provider_error``. Instead the GitHub branch
+    mirrors the GitLab immediate-merge handshake: it raises ``ConfirmationRequired``
+    (HTTP 400, answerable), and merges NOTHING until the caller confirms.
+    """
+    run = AsyncMock(return_value=_github_already_mergeable_node(merge_state))
+    monkeypatch.setattr(source, "_run_json", run)
+
+    with pytest.raises(source.ConfirmationRequired, match="merged now"):
+        await source.enable_pull_request_auto_merge("https://github.com/acme/repo/pull/12")
+
+    # Only the precondition read happened: the blind arming mutation that 503s
+    # must never be dispatched for this state.
+    run.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("merge_state", ["CLEAN", "UNSTABLE", "HAS_HOOKS"])
+async def test_auto_merge_github_merges_already_mergeable_only_when_confirmed(
+    monkeypatch, merge_state: str
+) -> None:
+    """With consent, an already-mergeable GitHub PR is merged NOW, not armed.
+
+    The confirm answer dispatches ``mergePullRequest`` (immediate merge), never
+    ``enablePullRequestAutoMerge`` -- which GitHub would reject for this state.
+    """
+    node = _github_already_mergeable_node(merge_state)
+    run = AsyncMock(side_effect=[node, {}])
+    monkeypatch.setattr(source, "_run_json", run)
+    url = "https://github.com/acme/repo/pull/12"
+    source._CACHE[url] = (0.0, 21, {"provider": "github"})
+
+    try:
+        result = await source.enable_pull_request_auto_merge(
+            url, confirm_immediate_merge=True
+        )
+        assert result == "squash"
+    finally:
+        source._CACHE.clear()
+
+    mutation_argv = run.await_args_list[1].args
+    assert any("mergePullRequest" in part for part in mutation_argv)
+    assert not any("enablePullRequestAutoMerge" in part for part in mutation_argv)
+    assert "pullRequestId=PR_node1" in mutation_argv
+    assert "mergeMethod=SQUASH" in mutation_argv
+    # The merge is pinned to the exact head the read returned, so a push landing
+    # between the read and this dispatch makes GitHub reject it rather than
+    # merging a head the operator never saw.
+    assert any("expectedHeadOid" in part for part in mutation_argv)
+    assert "head=deadbeef00" in mutation_argv
+    assert url not in source._CACHE
+
+
+@pytest.mark.asyncio
+async def test_auto_merge_github_refuses_immediate_merge_without_a_head_oid(
+    monkeypatch,
+) -> None:
+    """A confirmed immediate merge needs the read head to pin to; absent it, refuse.
+
+    ``expectedHeadOid`` is required for the pin, so a node response that carries no
+    ``headRefOid`` must raise rather than dispatch an unpinned merge.
+    """
+    node = _github_already_mergeable_node("CLEAN")
+    node["data"]["repository"]["pullRequest"].pop("headRefOid")
+    run = AsyncMock(side_effect=[node, {}])
+    monkeypatch.setattr(source, "_run_json", run)
+
+    with pytest.raises(source.SourceProviderError, match="head commit"):
+        await source.enable_pull_request_auto_merge(
+            "https://github.com/acme/repo/pull/12", confirm_immediate_merge=True
+        )
+
+    # Only the precondition read happened; no unpinned merge was dispatched.
+    run.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("merge_state", ["BLOCKED", "BEHIND", "UNKNOWN", ""])
+async def test_auto_merge_github_still_arms_when_something_is_pending(
+    monkeypatch, merge_state: str
+) -> None:
+    """A PR with work left to wait for still ARMS auto-merge, unchanged.
+
+    The already-mergeable handshake must not swallow the ordinary case: a state
+    other than ``CLEAN``/``UNSTABLE`` dispatches ``enablePullRequestAutoMerge``
+    with no confirmation required.
+    """
+    node = _github_already_mergeable_node(merge_state)
+    run = AsyncMock(side_effect=[node, {}])
+    monkeypatch.setattr(source, "_run_json", run)
+
+    result = await source.enable_pull_request_auto_merge(
+        "https://github.com/acme/repo/pull/12"
+    )
+    assert result == "squash"
+
+    mutation_argv = run.await_args_list[1].args
+    assert any("enablePullRequestAutoMerge" in part for part in mutation_argv)
+
+
+@pytest.mark.asyncio
+async def test_github_pull_request_node_query_requests_merge_state_status() -> None:
+    """The node query must fetch ``mergeStateStatus`` or the handshake is blind.
+
+    Without this field the GitHub branch cannot tell "already mergeable" from
+    "still pending" and falls back to dispatching the arming mutation blind.
+    """
+    assert "mergeStateStatus" in source._GITHUB_PULL_REQUEST_NODE_QUERY
+
+
 @pytest.mark.asyncio
 async def test_auto_merge_gitlab_dispatches_merge_when_pipeline_succeeds(monkeypatch) -> None:
     run = AsyncMock(side_effect=[{"head_pipeline": {"status": "running"}}, {}])
@@ -5975,13 +6234,15 @@ def _pin_local_owner_gate(monkeypatch) -> None:
     and every ``/proc/<pid>/fd``) and fails closed with 403 whenever that table is
     changing or ambiguous. Under xdist, sibling workers churn that table, so the
     host is an input to the test. The tests below pin the token's subject and
-    claims, not provenance; the gate's own verdicts are pinned in
-    ``test_member_memory_auth.py`` and ``test_dashboard_handlers_core_coverage.py``.
+    claims, not provenance; the gate's own verdicts are pinned in ``test_member_memory_auth.py`` and
+    ``test_dashboard_handlers_core_coverage_security_endpoints.py``.
     Patched on its defining module, which the handler imports at call time.
     """
+    from kiro_crew.member_memory_auth import LocalOwnerProvenance
+
     monkeypatch.setattr(
-        "kiro_crew.member_memory_auth.local_owner_bootstrap_allowed",
-        lambda _request: True,
+        "kiro_crew.member_memory_auth.local_owner_bootstrap_provenance",
+        lambda _request: LocalOwnerProvenance(),
     )
 
 

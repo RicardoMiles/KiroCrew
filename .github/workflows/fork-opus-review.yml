@@ -368,7 +368,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.pr.outputs.base_sha }}
-          fetch-depth: 0
+          # Depth 1: the diff step fetches the head and the merge-base it
+          # needs, one commit each.
+          fetch-depth: 1
           persist-credentials: false
 
       - name: Extract base-ref AUTOSDE rules and review prompts
@@ -402,6 +404,7 @@ jobs:
       # artifact — so a faked Stage 1 diff cannot mislead the review. It is read
       # as a DATA file only — never applied to or overlaid on the tree; nothing runs it.
       - name: Fetch authentic diff (data only — never applied to the tree)
+        id: authentic
         if: steps.pr.outputs.obsolete != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -414,7 +417,7 @@ jobs:
           set -uo pipefail
           # COMPLETE diff via git, NOT the compare API: the compare endpoint
           # truncates very large diffs, which would let a big fork PR slip a defect
-          # past the cap and still pass. Fetch the PR head history as OBJECTS only
+          # past the cap and still pass. Fetch the PR head as OBJECTS only
           # (never checked out — the working tree stays the trusted base, so no
           # fork file/symlink is materialized) and diff locally, which has no cap.
           # GitHub's git smart-HTTP transport authenticates with BASIC auth
@@ -425,16 +428,38 @@ jobs:
           # logged and the raw token stays masked.
           auth_b64="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
           echo "::add-mask::$auth_b64"  # mask the derived header so it can never surface in logs
+          # Pin to the exact CI-reviewed head SHA: fetch that one commit at
+          # depth 1, by SHA, and fail closed if it is missing.
           git -c http.extraheader="AUTHORIZATION: basic $auth_b64" \
-            fetch --no-tags --quiet origin "refs/pull/$PR/head" \
-            || { echo "::error::could not fetch PR head history for #$PR"; exit 1; }
-          # Pin to the exact CI-reviewed head SHA; fail closed if it is missing
-          # (e.g. the fork rewrote history out from under the review).
+            fetch --no-tags --quiet --depth=1 origin "$HEAD_SHA" \
+            || { echo "::error::could not fetch PR head $HEAD_SHA for #$PR"; exit 1; }
           if ! git cat-file -e "${HEAD_SHA}^{commit}" 2>/dev/null; then
             echo "::error::head SHA $HEAD_SHA not present after fetch; failing closed."
             exit 1
           fi
-          git diff --no-color "$BASE_SHA...$HEAD_SHA" > "$PATCH"
+          # Both commits are shallow, so git cannot find the merge-base a
+          # three-dot range needs. GitHub's compare API names it -- only its
+          # SHA is read; the diff still comes from git, uncapped. That commit
+          # is fetched at depth 1 and the diff is the two-dot
+          # MERGE_BASE..HEAD_SHA: two trees, no history, and the same diff the
+          # three-dot range from BASE_SHA gave on a full clone.
+          compare_base() { gh api "repos/$REPO/compare/$1...$2?per_page=1" --jq '.merge_base_commit.sha'; }
+          merge_base=""
+          for attempt in 1 2 3; do
+            merge_base="$(compare_base "$BASE_SHA" "$HEAD_SHA")" && break
+            sleep "$attempt"
+          done
+          if ! [[ "$merge_base" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::could not read the merge-base of $BASE_SHA and $HEAD_SHA; failing closed."
+            exit 1
+          fi
+          if ! git cat-file -e "${merge_base}^{commit}" 2>/dev/null; then
+            git -c http.extraheader="AUTHORIZATION: basic $auth_b64" \
+              fetch --no-tags --quiet --depth=1 origin "$merge_base" \
+              || { echo "::error::could not fetch merge-base $merge_base for #$PR"; exit 1; }
+          fi
+          echo "merge_base=$merge_base" >> "$GITHUB_OUTPUT"
+          git diff --no-color "$merge_base..$HEAD_SHA" > "$PATCH"
           # git diff has no API size cap, so an oversized diff is a real signal —
           # fail CLOSED rather than review only a prefix.
           if [ "$(wc -c < "$PATCH" 2>/dev/null || echo 0)" -gt 1000000 ]; then
@@ -442,7 +467,7 @@ jobs:
             exit 1
           fi
           if [ ! -s "$PATCH" ]; then
-            echo "::error::empty diff for $BASE_SHA...$HEAD_SHA; failing closed."
+            echo "::error::empty diff for $merge_base..$HEAD_SHA; failing closed."
             exit 1
           fi
           # The patch is deliberately NOT applied to the working tree. The checkout
@@ -758,6 +783,33 @@ jobs:
             CRED_VALUE="$val" perl -i -pe 's/\Q$ENV{CRED_VALUE}\E/[REDACTED-CREDENTIAL]/g' claude-review-output.md
           done
 
+      # Turn-budget exhaustion is its own outcome (#13296). A stage stopped at
+      # --max-turns writes a `result` message with subtype `error_max_turns`
+      # and no verdict stamp, so it used to land as the same `review
+      # incomplete` as a hang, a bootstrap fault or a credential error. Read it
+      # from each stage's transcript and hand the steps below one fixed-enum
+      # value. It can only make the lane STRICTER: a spent stage is never a
+      # pass, even beside a stamp. Keep in sync with claude-review.yml.
+      - name: Detect turn-budget exhaustion
+        id: budget
+        if: always() && steps.pr.outputs.obsolete != 'true'
+        env:
+          DISCOVER_EXEC: ${{ steps.discover.outputs.execution_file }}
+          REVIEW_EXEC: ${{ steps.review.outputs.execution_file }}
+        run: |
+          spent=""
+          check_stage() {
+            [ -n "$2" ] && [ -f "$2" ] || return 0
+            hit="$(jq -rs '[ .[] | (if type=="array" then .[] else . end) | select(type=="object" and .type=="result" and .subtype=="error_max_turns") ] | length > 0' "$2" 2>/dev/null)" || hit=""
+            if [ "$hit" = "true" ]; then spent="${spent:+$spent,}$1"; fi
+          }
+          check_stage discovery "${DISCOVER_EXEC:-}"
+          check_stage validation "${REVIEW_EXEC:-}"
+          echo "spent=$spent" >> "$GITHUB_OUTPUT"
+          if [ -n "$spent" ]; then
+            echo "::notice::turn budget spent (error_max_turns) in stage(s): $spent"
+          fi
+
       - name: Post/update summary comment
         id: post
         if: always() && steps.pr.outputs.obsolete != 'true'
@@ -769,6 +821,7 @@ jobs:
           HUMAN_OVERRIDE: ${{ steps.human_override.outputs.active }}
           OVERRIDE_ACTOR: ${{ steps.human_override.outputs.actor }}
           OVERRIDE_SOURCE: ${{ steps.human_override.outputs.source }}
+          BUDGET_SPENT: ${{ steps.budget.outputs.spent }}
         run: |
           set -uo pipefail
           [ -z "${PR:-}" ] && { echo "no PR resolved; skipping comment"; exit 0; }
@@ -780,6 +833,10 @@ jobs:
             else
               kind="clear"; verdict="✅ no blocking findings"
             fi
+          fi
+          # A spent turn budget is its own outcome and never a pass (#13296).
+          if [ -n "${BUDGET_SPENT:-}" ] && [ "$kind" != "blocked" ]; then
+            kind="incomplete"; verdict="⚠️ turn budget spent, needs human review"
           fi
           {
             echo "$MARKER"
@@ -846,7 +903,7 @@ jobs:
             fi
           } > "${RUNNER_TEMP:-/tmp}/fork-opus-comment.md"
           # ONE publication primitive for every marker-comment write in this
-          # lane; test_ai_review_workflows.py pins it byte-identical across all
+          # lane; test_ai_review_workflows_comment_writes.py pins it byte-identical across all
           # of them, the way it already pins guarded_comment_upsert, so neither
           # the budget nor the honesty below can drift lane by lane.
           #
@@ -1286,7 +1343,7 @@ jobs:
             return 1
           }
           # Guarded upsert (#8292, #8344): the shared function below is defined
-          # byte-identically in every review lane; test_ai_review_workflows.py
+          # byte-identically in every review lane; test_ai_review_workflows_comment_writes.py
           # pins all copies to one canonical body so the invariant cannot
           # drift lane by lane.
           guarded_comment_upsert() {
@@ -1577,6 +1634,7 @@ jobs:
           HUMAN_OVERRIDE: ${{ steps.human_override.outputs.active }}
           OVERRIDE_ACTOR: ${{ steps.human_override.outputs.actor }}
           PUBLICATION: ${{ steps.post.outputs.publication }}
+          BUDGET_SPENT: ${{ steps.budget.outputs.spent }}
         run: |
           set -uo pipefail
           lane_text="$(printf 'Lane run: %s/%s/actions/runs/%s\n\n<!-- ai-review-fork-lane run=%s -->' \
@@ -1590,6 +1648,17 @@ jobs:
             fi
           fi
           summary="Fork AI review for $HEAD. See the PR comment for details."
+          # A stage stopped at --max-turns reached no whole review: its own
+          # title, never a pass (#13296). A blocking verdict keeps its title
+          # (it already fails). Only a human override, below, replaces this.
+          if [ -n "${BUDGET_SPENT:-}" ] && [ "$title" != "changes requested (blocking)" ]; then
+            case "$BUDGET_SPENT" in
+              discovery | validation | discovery,validation) stage="$BUDGET_SPENT" ;;
+              *) stage="unknown" ;;
+            esac
+            conclusion="failure"; title="turn budget spent, needs human review"
+            summary="The $stage stage stopped at --max-turns (error_max_turns) for $HEAD, so no verdict was reached. A re-run walks into the same cap; a human reviews this diff, or the PR is split."
+          fi
           # The output file proves a verdict was COMPUTED, never that it reached
           # the PR. A slot still holding another head's verdict, or an earlier
           # run's sample for this one, is what every stamp-freshness reader

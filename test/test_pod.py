@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from _clock_isolation import assert_clock_is_private
 from tmpdir_helpers import SHORT_TMP_PREFIX, short_tmp_base
 
 from conftest import host_abs
@@ -29,6 +30,7 @@ from kiro_crew.pod import cli as pod_cli
 from kiro_crew.pod import launchd
 from kiro_crew.pod import provision as prov
 from kiro_crew.pod import runtime as rt
+from kiro_crew.pod import runtime_lifecycle
 from kiro_crew.pod import unit as unit_mod
 from kiro_crew.pod.config import (
     DEFAULT_BASE_PORT,
@@ -39,6 +41,7 @@ from kiro_crew.pod.config import (
     PodConfig,
     _canonical_override,
 )
+from kiro_crew.testing.clock import ManualClock
 
 # The invoking user's REAL home, captured at import time — before the autouse
 # fixture below pins HOME to a tmp dir. Used only to assert that pod host state
@@ -3671,6 +3674,35 @@ class TestCleanupHomeVerifies:
         assert not home.exists()
 
 
+class _DrainClock(ManualClock):
+    """The drain's poll clock: ``on_sleep(seconds)`` runs after each poll sleep.
+
+    That is the unit's process tree shrinking between two reads of
+    ``cgroup.procs``. Installed on :mod:`kiro_crew.pod.runtime_lifecycle` alone,
+    the module whose ``drain_cgroup`` polls. Its ``time`` IS the stdlib module, so
+    patching ``rt.time.sleep`` ran the hook for every other thread's sleep in the
+    worker too.
+    """
+
+    def __init__(self, on_sleep=lambda _s: None) -> None:
+        super().__init__(monotonic_start=0.0)
+        self._on_sleep = on_sleep
+
+    def sleep(self, seconds: float) -> None:
+        super().sleep(seconds)
+        self._on_sleep(seconds)
+
+
+def _pin_clock(monkeypatch: pytest.MonkeyPatch, on_sleep=lambda _s: None) -> _DrainClock:
+    clock = _DrainClock(on_sleep)
+    clock.install(monkeypatch, runtime_lifecycle)
+    return clock
+
+
+def test_another_thread_keeps_the_real_sleep_and_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert_clock_is_private(_pin_clock(monkeypatch), runtime_lifecycle)
+
+
 class TestDrainCgroup:
     """The delete waits for the unit's process tree, because that is the set that
     recreates the HOME behind it."""
@@ -3684,9 +3716,10 @@ class TestDrainCgroup:
         procs = tmp_path / "cgroup.procs"
         procs.write_text("7\n8\n")
         remaining = ["8\n", ""]
-        monkeypatch.setattr(rt.time, "sleep", lambda _s: procs.write_text(remaining.pop(0)))
+        clock = _pin_clock(monkeypatch, lambda _s: procs.write_text(remaining.pop(0)))
         assert rt.drain_cgroup(procs) == []
         assert remaining == [], "it must poll until empty, not sample once"
+        assert len(clock.sleeps) == 2
 
     def test_reports_the_survivors_when_the_window_expires(self, tmp_path: Path) -> None:
         procs = tmp_path / "cgroup.procs"
@@ -3891,7 +3924,7 @@ class TestLinuxTeardownOrdering:
             order.append("deleted")
             return 0
 
-        monkeypatch.setattr(rt.time, "sleep", _last_process_exits)
+        _pin_clock(monkeypatch, _last_process_exits)
         monkeypatch.setattr(rt, "cleanup_home", _delete)
         assert rt.stop_pod(cfg, "demo").returncode == 0
         assert order == ["drained", "deleted"], "deleting first is the original race"
@@ -8026,7 +8059,7 @@ class TestBootTimeSettings:
     ) -> None:
         # Behavioural pin only: each mode in the enforcement tuple round-trips
         # through the env file into argv. This does NOT guard parser drift --
-        # a mode present in cli.py but absent from APPROVAL_MODES is never
+        # a mode present in cli_parser_admin.py but absent from APPROVAL_MODES is never
         # iterated here. test_cli_approval_choices_match_the_enforcement_tuple
         # covers that.
         for mode in rt.APPROVAL_MODES:
@@ -8039,11 +8072,14 @@ class TestBootTimeSettings:
         # encoding is explicit: cli.py contains non-ASCII (emoji in guard
         # messages), and read_text() defaults to the platform locale codec,
         # which is cp1252 on Windows CI and raises UnicodeDecodeError there.
-        src = (Path(rt.__file__).parent.parent / "cli.py").read_text(encoding="utf-8")
+        # The top-level parser is cli.py plus the cli_parser_* registrars it calls.
+        package = Path(rt.__file__).parent.parent
+        files = [package / "cli.py", *sorted(package.glob("cli_parser_*.py"))]
+        src = "\n".join(path.read_text(encoding="utf-8") for path in files)
         return ast.parse(src)
 
     def test_cli_approval_choices_match_the_enforcement_tuple(self) -> None:
-        # cli.py repeats the choices literal instead of importing pod.runtime
+        # cli_parser_admin.py repeats the choices literal instead of importing pod.runtime
         # (the top-level parser must not import pod modules at startup), so the
         # duplication is real. Read the literal argparse actually registers, so a
         # mode added on one side only fails HERE rather than being accepted by

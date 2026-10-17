@@ -232,7 +232,7 @@ export function pullRequestMergeBlocker(source: PullRequestSource): PullRequestM
 function stateTone(source: PullRequestSource): string {
   const state = source.state.toLowerCase()
   if (source.mergedAt || state === 'merged') return 'bg-aim/15 text-aim'
-  if (state === 'open' || state === 'opened') return 'bg-ok/15 text-ok'
+  if (state === 'open' || state === 'opened') return 'bg-ok/15 text-ok-text'
   return 'bg-bg-hover text-muted'
 }
 
@@ -397,7 +397,7 @@ const CI_META: Record<NonNullable<PullRequestStatus['ci']>, { icon: typeof Check
  * plus one health glyph while the pull request is live. Failed CI wins; a merge
  * conflict otherwise replaces pending/passed CI so an unmergeable branch never
  * reads as ready. Merged/closed suppress both CI and conflict because lifecycle
- * is the terminal signal there. `ChatSidebar.tsx::chipStatusGlyph` applies the
+ * is the terminal signal there. `SessionSourceChips.tsx::chipStatusGlyph` applies the
  * same precedence to the sidebar chip. */
 function SourceTabState({ status }: { status: PullRequestStatus | undefined }) {
   const lifecycle = status?.state
@@ -727,7 +727,7 @@ export function PullRequestActions({ source }: { source: PullRequestSource }) {
           title={isGitHub
             ? i18nT('components.pullRequestPanel.github_merges_this_pull_request_automatically_on')
             : i18nT('components.pullRequestPanel.gitlab_merges_this_merge_request_when_the_pipeli')}
-          className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-md border text-[11px] cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed ${confirmAutoMerge || immediateMergeWarning ? 'border-warn text-warn hover:bg-warn/10' : 'border-border bg-transparent text-muted hover:text-text hover:bg-bg-hover'}`}
+          className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-md border text-[11px] cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed ${confirmAutoMerge || immediateMergeWarning ? 'border-warn text-warn hover:text-warn-text hover:bg-warn/10' : 'border-border bg-transparent text-muted hover:text-text hover:bg-bg-hover'}`}
         >
           {autoMergeMutation.isPending ? <Loader className="lucide-inline animate-spin" /> : <GitMerge className="lucide-inline" />}
           {immediateMergeWarning ? i18nT('components.pullRequestPanel.merge_now') : confirmAutoMerge ? i18nT('components.pullRequestPanel.confirm_auto_merge') : i18nT('components.pullRequestPanel.enable_auto_merge')}

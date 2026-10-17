@@ -4,7 +4,9 @@ import { RefreshCw, Plug, AlertTriangle, Check, ChevronRight, Zap, X, Download, 
 import { motion, AnimatePresence } from 'framer-motion'
 import { Trans } from 'react-i18next'
 import { Link } from 'react-router-dom'
+import { configuredAcpBackend, mcpWholeServerDeny, type AcpBackendConfig } from '../../api/acpBackend'
 import { api } from '../../api/client'
+import type { AcpBackendProbe } from '../../api/client'
 import { Card, Btn, Badge, SearchInput, ContentSkeleton } from '../../components/ui'
 import InfoTip from '../../components/InfoTip'
 import ErrorNotice from '../../components/ErrorNotice'
@@ -29,6 +31,7 @@ import { useConnectionsUiEnabled } from '../../hooks/useConnectionsUi'
 import { i18nT } from '../../i18n/t'
 import { uiLocation } from '../../uiLocations/uiLocation'
 import { copyWithOutcome } from '../../utils/clipboard'
+import { SECRETS_GUIDE_ROUTING_URL } from '../../utils/docsLink'
 import { recordError, type ErrorReport } from '../../utils/errorReport'
 import { guideAnchor } from '../../uiLocations/targetRegistry'
 async function fetchServers(): Promise<McpServer[]> {
@@ -223,7 +226,7 @@ function ScopeBadge({
   const bg = disabled
     ? 'bg-bg-elevated text-muted'
     : active
-      ? 'bg-ok/20 text-ok border border-ok/40'
+      ? 'bg-ok/20 text-ok-text border border-ok/40'
       : 'bg-bg-elevated text-muted border border-border'
   const pendingRing = pendingChange
     ? 'ring-1 ring-[var(--warn)] ring-offset-1 ring-offset-bg border-dashed'
@@ -382,7 +385,13 @@ function mcpStatusVariant(status: string, auth: McpAuthState): 'ok' | 'err' | 'w
  * what the row becomes — waits here, because it is only useful once the sign-in is
  * done, and an always-visible cell in a dense table pays for every sentence.
  */
-function mcpStatusHint(status: string, serverName: string, auth: McpAuthState, probeFailing = false): string | undefined {
+function mcpStatusHint(
+  status: string,
+  serverName: string,
+  auth: McpAuthState,
+  probeFailing = false,
+  reasonOnRow = false,
+): string | undefined {
   // "Online" is the gateway's OWN probe result: it started the server in the
   // gateway process, under the gateway's client identity. It says nothing about
   // whether any particular agent session mounted it, and reading it as if it did
@@ -400,8 +409,14 @@ function mcpStatusHint(status: string, serverName: string, auth: McpAuthState, p
   // Failing badge in the same cell, whose tip says probing stopped and names
   // Reset count, so this badge stays silent there rather than repeat it or
   // send the reader to a refresh that will not work (#15516).
+  //
+  // An `outdated` row that carries an `error` is a probe refused before any
+  // spawn: the server's env holds a `secret://` reference, which resolves only
+  // when the MCP gateway starts the server. The row's text cell states that
+  // reason, and a refresh repeats the same refusal, so the badge stays silent
+  // there too rather than promise that re-probing helps.
   if (status === 'outdated') {
-    return probeFailing ? undefined : i18nT('pages.overview.mcpTab.outdated_help')
+    return probeFailing || reasonOnRow ? undefined : i18nT('pages.overview.mcpTab.outdated_help')
   }
   if (status === 'registry') return i18nT('pages.overview.mcpTab.registry_help', { provider: serverName })
   if (status !== 'needs_auth') return undefined
@@ -466,6 +481,31 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
     queryFn: async () => (await api.mcpGlobalScopes()).scopes || [],
     staleTime: Infinity,
   })
+
+  // What turning one tool off costs on the harness in use (#11969): the same
+  // sentences Settings → Agent Harness shows on that harness's card, read
+  // through the same helper so the two cannot disagree. It only DECLARES: the
+  // toggles below stay exactly as they are.
+  //
+  // Both queries share their keys with the pages that own them, so this adds no
+  // request when either is cached. `retry: false` on the probe because its two
+  // expected failures, 403 for a non-owner and 404 on an older gateway, are
+  // permanent answers; either leaves `data` undefined and nothing renders, as
+  // it does while a query is still in flight.
+  const { data: harnessCfg } = useQuery<AcpBackendConfig>({
+    queryKey: ['kirocrewConfig'],
+    queryFn: () => api.kirocrewConfig(),
+  })
+  const { data: harnessProbe } = useQuery<{ backends: AcpBackendProbe[] }>({
+    queryKey: ['acpBackends'],
+    queryFn: () => api.acpBackends(),
+    retry: false,
+  })
+  const denyReach = useMemo(() => {
+    if (!harnessCfg || !harnessProbe) return { rule: '', exception: '' }
+    const active = configuredAcpBackend(harnessCfg)
+    return mcpWholeServerDeny(harnessProbe.backends?.find(b => b.id === active))
+  }, [harnessCfg, harnessProbe])
 
   const pendingCount = useMemo(() => {
     return servers.reduce((count, s) => {
@@ -756,6 +796,11 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
             // server), and the line says so, because "set it to false" is the
             // wrong instruction for a value that already reads "false".
             const invalidValue = disabledByInvalidValue(s)
+            // An `outdated` row with an `error` was not probed at all, and the
+            // error says why. It is the row's one explanation, so it is shown in
+            // words in the text cell; `outdated` rows without an error (an aged
+            // result, or a quarantined server) carry none and show none.
+            const notProbedReason = s.status === 'outdated' && !!s.error
             // The line names the file as a chip that copies its path: the
             // re-enable switch is not in this table (a separate decision), so
             // the line says so and hands over the one thing it can -- the path.
@@ -879,7 +924,8 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
                        `title`: a native tooltip is unreachable by keyboard,
                        touch, and AT (#3626, #8359). `mcpStatusHint` returns a
                        string only for `ok` (the host-check caveat),
-                       `outdated` when not quarantined (why, and how to re-probe) and
+                       `outdated` when neither quarantined nor carrying a
+                       reason line (why, and how to re-probe) and
                        `needs_auth`; every other status returns undefined and
                        so gets no InfoTip — this stays a named exception rather
                        than a blanket hint on every badge. */
@@ -899,7 +945,7 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
                         {invalidValue ? i18nT('pages.overview.mcpTab.status_invalid_value') : mcpStatusLabel(s.status, mcpAuthState(s))}
                       </Badge>
                       {(() => {
-                        const hint = mcpStatusHint(s.status, s.name, mcpAuthState(s), s.probeFailing === true)
+                        const hint = mcpStatusHint(s.status, s.name, mcpAuthState(s), s.probeFailing === true, notProbedReason)
                         return hint ? <InfoTip text={hint} placement="top" /> : null
                       })()}
                     </span>
@@ -967,6 +1013,29 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
                       </div>
                     )
                   ))}
+                  {notProbedReason && (
+                    /* Warn tone, not the error red: no probe ran, so nothing
+                       failed, but the server stays off until the reason is
+                       dealt with. The text is the backend's own, which names
+                       only env keys, never a value. The link is the next step:
+                       the guide section on routing a server through the MCP
+                       gateway, the one place a `secret://` value resolves.
+                       `break-words`, not `break-all`: the line is prose, so it
+                       wraps between words and breaks inside one only when a
+                       single token is wider than the cell. */
+                    <div className="text-warn text-[12px] break-words" data-testid="mcp-not-probed-reason">
+                      <AlertTriangle className="lucide-inline" />{' '}
+                      {s.error}
+                      <a
+                        href={SECRETS_GUIDE_ROUTING_URL}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="block mt-0.5 text-accent hover:underline"
+                      >
+                        {i18nT('pages.overview.mcpTab.not_probed_routing_guide')}
+                      </a>
+                    </div>
+                  )}
                   {s.status === 'error' && s.error ? (
                     <span className="text-danger text-[12px]">
                       <AlertTriangle className="lucide-inline" /> {s.error}
@@ -1025,7 +1094,18 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
                     </div>
                   ) : s.tools?.length ? (<div>
                     <button className="flex items-center gap-1 text-[12px] text-accent hover:text-accent-hover cursor-pointer transition-colors mb-1" onClick={() => setExpandedTools(prev => { const next = new Set(prev); if (next.has(s.name)) next.delete(s.name); else next.add(s.name); return next })}>{s.tools.length} {i18nT('pages.overview.mcpTab.tools_2')}{!expandedTools.has(s.name) && (s.disabledTools?.length || 0) > 0 && <span className="text-muted ml-1">{i18nT('pages.overview.mcpTab.off_count', { count: s.disabledTools!.length })}</span>}<ChevronRight size={14} className={`transition-transform duration-200 ${expandedTools.has(s.name) ? 'rotate-90' : ''}`} /></button>
-                    <AnimatePresence>{expandedTools.has(s.name) && <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.2 }} className="overflow-hidden"><div className="space-y-0.5">{s.tools.map(t => {
+                    <AnimatePresence>{expandedTools.has(s.name) && <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} transition={{ duration: 0.2 }} className="overflow-hidden">
+                    {/* The cost of a tool-off, above the tools and before any click,
+                        at the card's weight: the rule strong, its exception muted
+                        right under it. Shown whenever the list is open on a harness
+                        whose reach can cost a whole server; nothing otherwise. */}
+                    {(denyReach.rule || denyReach.exception) && (
+                      <div className="mb-1 max-w-prose text-[12px] leading-relaxed" data-testid="mcp-deny-reach">
+                        {denyReach.rule && <p className="m-0 text-text-strong">{denyReach.rule}</p>}
+                        {denyReach.exception && <p className="m-0 text-muted">{denyReach.exception}</p>}
+                      </div>
+                    )}
+                    <div className="space-y-0.5">{s.tools.map(t => {
                       const currentlyDisabled = (s.disabledTools || []).includes(t)
                       const toolOverride = pendingTools[s.name]?.[t]
                       const effectivelyEnabled = toolOverride !== undefined ? toolOverride : !currentlyDisabled
@@ -1041,7 +1121,7 @@ export default function McpTab({ onManagedProviderClick }: McpTabProps = {}) {
                           : effectivelyEnabled ? i18nT('pages.overview.mcpTab.click_to_disable_pending_until_apply') : i18nT('pages.overview.mcpTab.click_to_enable_pending_until_apply')}
                       ><span className={`w-1.5 h-1.5 rounded-full shrink-0 ${effectivelyEnabled ? 'bg-ok' : 'bg-muted'}`} />{t}</button>
                     })}</div></motion.div>}</AnimatePresence>
-                  </div>) : disabledInConfig ? null : '—'}
+                  </div>) : disabledInConfig || notProbedReason ? null : '—'}
                 </td>
                 {/* Pinned like the header cell, on an OPAQUE `bg-card`. The row
                     states live on the <tr>, which the opaque base would hide, so

@@ -1,6 +1,7 @@
 /** The crew group's spaces: the peer's folder tree, read-only, built from rows. */
 import { describe, it, expect } from 'vitest'
-import { crewSpaceChain, crewSpaceId, crewSpaces } from '../pages/chat-sidebar/CrewGroups'
+import { crewAttention, crewDrawOrder, crewSpaceChain, crewSpaceId, crewSpaces } from '../pages/chat-sidebar/CrewGroups'
+import type { Slot } from '../pages/chat-sidebar/types'
 import { peerFoldersOf, type PeerFolder } from '../hooks/useInstanceSessions'
 
 const F = (id: string, order: number, parent_id?: string, name = id): PeerFolder =>
@@ -69,6 +70,54 @@ describe('crewSpaceChain', () => {
     expect(crewSpaceChain('c', [F('top', 0), F('mid', 0, 'top'), F('leaf', 0, 'mid')], 'leaf'))
       .toEqual([crewSpaceId('c', 'leaf'), crewSpaceId('c', 'mid'), crewSpaceId('c', 'top')])
     expect(crewSpaceChain('c', [F('top', 0)], undefined)).toEqual([])
+  })
+})
+
+describe('crewDrawOrder', () => {
+  it('lists a space\'s subspaces, then its own rows, with unfiled rows last', () => {
+    const folders = [F('work', 0), F('sub', 0, 'work'), F('other', 1)]
+    const rows = [row('loose'), row('in-work', 'work'), row('in-sub', 'sub'), row('in-other', 'other')]
+    expect(crewDrawOrder(folders, rows).map(r => r.key)).toEqual(['in-sub', 'in-work', 'in-other', 'loose'])
+  })
+
+  it('keeps the given order when the group draws no spaces', () => {
+    const rows = [row('b', 'work'), row('a')]
+    expect(crewDrawOrder(undefined, rows)).toBe(rows)
+    expect(crewDrawOrder([], rows)).toBe(rows)
+  })
+})
+
+describe('crewAttention', () => {
+  const slot = (key: string, over: Partial<Slot> = {}): Slot =>
+    ({ key, title: key, running: false, messages: 0, ...over }) as Slot
+  const ownFlag = (s: Slot) => s.running === true
+
+  it('counts a row once: an approval or a question that is also running is not working', () => {
+    const asks = crewAttention([
+      slot('approve', { pending_approval: true, running: true }),
+      slot('ask', { needs_input: true, running: true }),
+      slot('both', { pending_approval: true, needs_input: true }),
+      slot('run', { running: true }),
+      slot('idle'),
+    ], undefined, ownFlag)
+    expect(asks?.counts).toEqual({ approval: 2, question: 1, working: 1 })
+  })
+
+  it('targets the first row of the most urgent kind, in draw order', () => {
+    const rows = [slot('run', { running: true }), slot('ask', { needs_input: true }), slot('approve', { pending_approval: true })]
+    expect(crewAttention(rows, undefined, ownFlag)).toMatchObject({ kind: 'approval', target: { key: 'approve' } })
+    expect(crewAttention(rows.slice(0, 2), undefined, ownFlag)).toMatchObject({ kind: 'question', target: { key: 'ask' } })
+    expect(crewAttention(rows.slice(0, 1), undefined, ownFlag)).toMatchObject({ kind: 'working', target: { key: 'run' } })
+    // Filed in a space, an older approval draws above an unfiled newer one.
+    const filed = [slot('new', { pending_approval: true }), slot('old', { pending_approval: true, peer_folder_id: 'work' })]
+    expect(crewAttention(filed, [F('work', 0)], ownFlag)?.target.key).toBe('old')
+    expect(crewAttention(filed, undefined, ownFlag)?.target.key).toBe('new')
+  })
+
+  it('reads the running signal it is given, and nothing for a group that asks nothing', () => {
+    expect(crewAttention([slot('looping')], undefined, s => s.key === 'looping')?.counts.working).toBe(1)
+    expect(crewAttention([slot('idle'), slot('quiet')], undefined, ownFlag)).toBeNull()
+    expect(crewAttention([], undefined, ownFlag)).toBeNull()
   })
 })
 

@@ -9,6 +9,7 @@ Composed onto ``kiro_crew.hooks``; see :mod:`kiro_crew.hook_runtime`.
 from __future__ import annotations
 
 import fnmatch
+import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
         _TITLE_TRUNCATION_MARKER,
         _TOOL_TITLE_PREFIXES,
         CORE_MCP_SERVER,
+        DEEPSEEK_READ_ONLY_TOOLS,
         TOOL_AUTO_APPROVE,
         ToolHookResult,
         _bounded_pattern_search,
@@ -163,6 +165,17 @@ class ToolCall:
     #: the read-only proof): another harness that stamps the same bare id is
     #: judged under that id alone, exactly as on main.
     kas_builtin_ids: bool = False
+    #: ``AcpEvent.harness_builtin_tool``: the kiro-cli read built-in a claude call
+    #: is for, from the name claude-agent-acp stamped on the tool_call frame. A
+    #: deny target, so a rule on ``web_fetch`` binds claude's WebFetch, and the
+    #: claude half of the read-only built-in proof. Never a grant.
+    harness_builtin_tool: str = ""
+    #: ``AcpEvent.deepseek_tool_name``: the DeepSeek Harness tool a call is for, as
+    #: its tool_call frame stated it. Read by the gate on a ``classifier_only``
+    #: (READ_ONLY) turn only: a deny target and a governance identity under both
+    #: its own name and its kiro-cli policy name, and the deepseek half of the
+    #: read-only built-in proof.
+    deepseek_tool_name: str = ""
     #: The ``spawn_run`` target the governance spawn policy judges.
     spawn_target: str = ""
     #: The agent that ACTUALLY ran (``read_effective_agent``), never the slot's
@@ -210,6 +223,8 @@ class ToolCall:
             "identity_trusted": bool(getattr(event, "mcp_identity_trusted", False)),
             "identity_unreadable": bool(getattr(event, "mcp_identity_unreadable", False)),
             "kas_builtin_ids": bool(getattr(event, "kas_builtin_ids", False)),
+            "harness_builtin_tool": getattr(event, "harness_builtin_tool", "") or "",
+            "deepseek_tool_name": getattr(event, "deepseek_tool_name", "") or "",
             "spawn_target": getattr(event, "spawn_target", "") or "",
         }
         values.update(overrides)
@@ -233,6 +248,8 @@ class ToolCall:
             "mcp_identity_trusted": self.identity_trusted,
             "mcp_identity_unreadable": self.identity_unreadable,
             "kas_builtin_ids": self.kas_builtin_ids,
+            "harness_builtin_tool": self.harness_builtin_tool,
+            "deepseek_tool_name": self.deepseek_tool_name,
             "spawn_target": self.spawn_target,
         }
 
@@ -332,6 +349,46 @@ def _is_host_read_only_builtin(
     if not kas_builtin_ids:
         return False
     return any(alias in _HOST_READ_ONLY_BUILTIN_TOOLS for alias in policy_aliases(mcp_tool_name))
+
+
+def _is_harness_read_only_builtin(harness_builtin_tool: str, mcp_server_name: str) -> bool:
+    """True when a claude call's adapter-stamped name maps to a read-only BUILT-IN.
+
+    ``harness_builtin_tool`` is filled only from the ``_meta.claudeCode.toolName``
+    claude-agent-acp stamped on the call's own tool_call frame
+    (``AcpEvent.harness_builtin_tool``), never from the permission payload or the
+    title. That name is the tool claude-agent-acp runs, so a write tool cannot
+    arrive under a read tool's name. A call with an MCP server behind it fails closed.
+    """
+    if mcp_server_name:
+        return False
+    return harness_builtin_tool in _HOST_READ_ONLY_BUILTIN_TOOLS
+
+
+def _is_deepseek_read_only_builtin(
+    deepseek_tool_name: str, mcp_server_name: str, raw_params: object
+) -> bool:
+    """True when a DeepSeek Harness call is one of its read built-ins, with its target named.
+
+    ``deepseek_tool_name`` is filled only from the name the call's own tool_call
+    frame stated (``AcpEvent.deepseek_tool_name``), never from the permission
+    payload. dsh dispatches the call to the tool registered under that name and
+    prefixes every MCP tool ``mcp__<server>__``, so a bare ``read`` is its own file
+    read. The call must also name what it reads (``DEEPSEEK_READ_ONLY_TOOLS``) as an
+    ABSOLUTE path, ``~`` allowed: dsh resolves a missing ``path`` (``grep``, ``glob``)
+    or a relative one against the session's work dir, while the sensitive-path and
+    ``filesystem.read`` checks resolve a relative path against the gateway's own, so
+    a ``../`` spelling of a guarded file would pass them. A call with an MCP server
+    behind it fails closed.
+    """
+    entry = DEEPSEEK_READ_ONLY_TOOLS.get(deepseek_tool_name)
+    if mcp_server_name or entry is None:
+        return False
+    policy_name, target_param, _owner = entry
+    target = raw_params.get(target_param) if isinstance(raw_params, dict) else None
+    if not isinstance(target, str) or not os.path.isabs(os.path.expanduser(target)):
+        return False
+    return policy_name in _HOST_READ_ONLY_BUILTIN_TOOLS
 
 
 def _app_owns_mcp_server(mcp_server_name: str, app: str) -> bool:

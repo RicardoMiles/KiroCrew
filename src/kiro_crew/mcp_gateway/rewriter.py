@@ -1004,8 +1004,18 @@ def _build_stub_entry(
         if k not in ("command", "args", "env", "poolable", "autoApprove",
                      _WRAPPER_MARKER, _WRAPPER_MARKER_LEGACY)
     }
+    # ``-P`` (``PYTHONSAFEPATH``) keeps the launch cwd off ``sys.path``:
+    # kiro-cli starts the stub in the agent's SESSION cwd, a project checkout
+    # Kiro Crew does not control, and a stdlib-named file there (``json.py``,
+    # ``socket.py``) would otherwise be imported in place of the standard
+    # library. The rewrite fingerprint's ``python_isolation_flags`` records the
+    # same option prefix, so an overlay written without it is regenerated on
+    # upgrade instead of served from cache.
     stub_argv = platform_compat.isolated_python_argv(
-        "-m", _STUB_MODULE, f"{STUB_FLAGS_FLAG}={encode_target_args(stub_args)}"
+        "-P",
+        "-m",
+        _STUB_MODULE,
+        f"{STUB_FLAGS_FLAG}={encode_target_args(stub_args)}",
     )
     wrapped.update({
         _WRAPPER_MARKER: True,
@@ -1014,7 +1024,8 @@ def _build_stub_entry(
         # ``Program Files`` install it carries the space that makes cmd.exe
         # quote-stripping reachable (see the helper's docstring).
         "command": _cmd_safe_command(stub_argv[0]),
-        # The helper's optional ``-s`` precedes ``-m kiro_crew.mcp_gateway.stub``;
+        # The helper's optional ``-s`` and ``-P`` precede
+        # ``-m kiro_crew.mcp_gateway.stub``;
         # the stub's own flags follow as ONE encoded envelope.
         # Every value above is raw operator or
         # filesystem text -- the executable path, the work dir, the socket, the
@@ -1847,8 +1858,10 @@ def _rewrite_inputs_fingerprint(
       ``pooling_enabled`` — decide stub flags and which entries are shareable.
     * ``python`` records ``sys.executable``, which is baked into every overlay
       ``command``. ``python_isolation_flags`` records the effective option prefix
-      derived by :func:`platform_compat.isolated_python_argv`, so either an
-      interpreter move or a user-site policy change regenerates the overlays.
+      the stub argv carries (``-P`` plus the optional ``-s`` derived by
+      :func:`platform_compat.isolated_python_argv`), so an interpreter move, a
+      user-site policy change, or a change to the stub's own interpreter
+      options regenerates the overlays.
     * ``python_cmd_safe`` — the cmd.exe-safe spelling of ``sys.executable``
       actually written as the overlay ``command`` on Windows. A volume's 8.3
       name generation being toggled (or the alias stripped with ``fsutil
@@ -1888,7 +1901,8 @@ def _rewrite_inputs_fingerprint(
         "schema": _FINGERPRINT_SCHEMA,
         "package": __version__,
         "python": sys.executable,
-        "python_isolation_flags": platform_compat.isolated_python_argv()[1:],
+        # The stub argv's option prefix, ``-P`` included (see _build_stub_entry).
+        "python_isolation_flags": platform_compat.isolated_python_argv("-P")[1:],
         "python_cmd_safe": _cmd_safe_command(sys.executable),
         "path_env": os.environ.get("PATH", ""),
         "pathext": os.environ.get("PATHEXT", ""),

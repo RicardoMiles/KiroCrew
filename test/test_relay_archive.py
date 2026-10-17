@@ -2,8 +2,8 @@
 
 The turn relay that ran a local slot on a peer crew is gone. A slot whose
 metadata line still says ``executor == "remote"`` comes back as an archive:
-it reads like it did, and the send, turn-restarting, chokepoint and peer-side
-paths all refuse to run it. The MCP session tools, the OpenAI-compatible
+it reads like it did, and the send, turn-restarting, chokepoint, fork and
+peer-side paths all refuse to run it. The MCP session tools, the OpenAI-compatible
 endpoint, the header picks and the checklist pill pin the same 409 in their own
 test files (``test_session_control*``, ``test_openai_compat``,
 ``test_chat_agent_kind``, ``test_todo_pill_resync``).
@@ -43,6 +43,7 @@ def _archive(key: str = "chat-1", *, complete: bool = True) -> _ChatSlot:
 def _app(state, *, app_name: str = "") -> web.Application:
     """The send and turn-restarting handlers behind one owner-authenticated server."""
     from kiro_crew.dashboard.chat import api_chat
+    from kiro_crew.dashboard.chat_fork import api_chat_slot_fork
     from kiro_crew.dashboard.chat_handlers import api_chat_slot_continue
     from kiro_crew.dashboard.chat_regenerate import (
         api_chat_slot_edit_resend,
@@ -63,6 +64,7 @@ def _app(state, *, app_name: str = "") -> web.Application:
     app.router.add_post("/api/chat/slots/{slot}/edit-resend", api_chat_slot_edit_resend)
     app.router.add_post("/api/chat/slots/{slot}/rewind", api_chat_slot_rewind)
     app.router.add_post("/api/chat/slots/{slot}/continue", api_chat_slot_continue)
+    app.router.add_post("/api/chat/slots/{slot}/fork", api_chat_slot_fork)
     return app
 
 
@@ -218,3 +220,51 @@ def test_peer_text_is_redacted_and_clean_text_passes_unchanged():
     secret = "key AKIAIOSFODNN7EXAMPLE here"
     assert "AKIAIOSFODNN7EXAMPLE" not in redact_peer_text(secret)
     assert redact_peer_text("plain words") == "plain words"
+
+
+@pytest.mark.asyncio
+async def test_forking_an_archive_is_refused_and_mints_no_local_child(tmp_path):
+    """Forking a relay archive must not launder it into a runnable local session.
+
+    ``fork_slot`` builds the child with ``get_or_create_slot``, which does not
+    carry ``executor`` / ``instance_id`` / ``remote_slot``: without a guard a
+    copy of a peer-bound session would be born LOCAL and runnable, then run the
+    peer crew's agent on this machine and fail with ``agent "<default>" not
+    found``. The fork route refuses it with the same 409 every other turn path
+    uses.
+    """
+    state = _make_state(tmp_path)
+    slot = _with_a_turn(state, _archive())
+    slot.agent = "default"  # the peer crew's agent, not configured here
+    before = dict(state._slots)
+
+    async with TestClient(TestServer(_app(state))) as client:
+        resp = await client.post("/api/chat/slots/chat-1/fork", json={})
+        assert resp.status == 409
+        assert (await resp.json())["code"] == RELAY_ARCHIVE_CODE
+
+    # No child slot was created: the archive was refused before anything was minted.
+    assert state._slots == before
+
+
+@pytest.mark.parametrize("complete", [True, False], ids=["complete", "half-bound"])
+@pytest.mark.asyncio
+async def test_resolve_fork_source_refuses_an_archive(tmp_path, complete):
+    """The shared choke point both fork routes pass through refuses an archive.
+
+    ``resolve_fork_source`` is where the human route (``api_chat_slot_fork``) and
+    the agent route (``session_control.fork_session``) both freeze the source, so
+    one guard here covers both -- and keys on ``executor`` alone, so a half-written
+    binding is refused too.
+    """
+    from kiro_crew.dashboard.chat_fork import resolve_fork_source
+
+    state = _make_state(tmp_path)
+    slot = _with_a_turn(state, _archive(complete=complete))
+
+    refusal = await resolve_fork_source(slot, audit_caller="dashboard")
+    assert isinstance(refusal, web.Response)
+    assert refusal.status == 409
+    import json as _json
+
+    assert _json.loads(refusal.body)["code"] == RELAY_ARCHIVE_CODE

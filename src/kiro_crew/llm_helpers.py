@@ -79,6 +79,7 @@ from kiro_crew.security import (
     redact_exfiltration_urls,
     sensitive_path_refusal,
 )
+from kiro_crew.security.readonly_bash import command_invokes_git, is_read_only_bash
 from kiro_crew.sel import sel as _sel
 from kiro_crew.start_priority import StartPriority
 from kiro_crew.tool_gate_busy import hook_gate_busy
@@ -2457,11 +2458,12 @@ async def background_turn(
     memory_store: str = "",
     crew_log_kind: str = "",
     crew_log_session_key: str = "",
+    session_key: str | None = None,
 ) -> "AsyncIterator[Any]":
     """Take the shared background session for ONE turn, then release and account.
 
     Every background caller needs the same three steps around its prompt: acquire
-    the shared session (which takes its per-session semaphore), release that
+    its persistent session (which takes its per-session semaphore), release that
     semaphore in a ``finally`` or the next caller deadlocks on it, and recycle the
     session afterwards. Callers that hand-rolled those steps had no reason to also
     record what the turn cost, so background spend reached the provider's bill
@@ -2488,7 +2490,7 @@ async def background_turn(
     """
     from kiro_crew.session import BACKGROUND_AGENT, BACKGROUND_KEY  # circular import
 
-    key = BACKGROUND_KEY
+    key = session_key or BACKGROUND_KEY
     # Pinned before the first suspension point for the same reason the other
     # background helper does it: the owning slot can be reset or recycled while
     # this turn runs, and its successor is a different ledger unit. Everything the
@@ -2594,8 +2596,12 @@ async def background_turn(
             try:
                 if memory_store:
                     await _cleanup_memory_consolidation_session(sessions, key, memory_store, log)
-                else:
+                elif key == BACKGROUND_KEY:
                     await sessions.recycle_background()
+                else:
+                    await sessions.recycle_background(
+                        session_key=key, agent=agent or BACKGROUND_AGENT
+                    )
             except Exception:
                 logger.debug("background recycle failed task=%s", task, exc_info=True)
 
@@ -3512,6 +3518,21 @@ async def _resolve_permission(
         await provider.reject_tool(event.request_id)
         return False
 
+    if policy == ToolApprovalPolicy.READ_ONLY and event.deepseek_read_only_issue:
+        # A DeepSeek Harness session whose launch did not prove stock dsh owns its
+        # read tools: any plugin it composes may register a tool under a read name,
+        # so no call is provable read-only and the turn is REJECT_ALL.
+        _log("rejected", metadata={"reason": "read_only_policy_unproven_composition"})
+        await _steer_host_deny(
+            provider,
+            event,
+            "this surface is read-only and the harness composes a plugin Kiro Crew "
+            "cannot vouch for, so every tool call is refused",
+            cause=DENY_CAUSE_SURFACE_POLICY,
+        )
+        await provider.reject_tool(event.request_id)
+        return False
+
     if policy == ToolApprovalPolicy.READ_ONLY and hooks is None:
         # Fail closed: READ_ONLY's classifier IS the hook gate. Without one
         # there is no way to prove a call read-only, so the policy degrades to
@@ -3674,6 +3695,26 @@ async def _resolve_permission(
         )
         await provider.reject_tool(event.request_id)
         return False
+
+    # A git read the gate's read-only tier declined (git reads `.git/config`,
+    # whose `core.fsmonitor` / `core.hooksPath` name a program no text
+    # classifier sees) falls through to the surface's approver. With no
+    # approver on a hook-based surface (a Meetings dispatch), the default
+    # below would run it unchecked -- not even the name-grant check the
+    # read-only approve ran -- so it is refused instead.
+    if policy == ToolApprovalPolicy.HOOK_BASED and hooks and on_tool_approval is None:
+        _git_command = name_grant.shell_command_for_event(event)
+        if _git_command and command_invokes_git(_git_command) and is_read_only_bash(_git_command):
+            _log("rejected", metadata={"reason": "git_read_headless_reject"})
+            await _steer_host_deny(
+                provider,
+                event,
+                "a git command is never auto-approved as a read (git runs programs "
+                "its repository config names) and this surface has no approver",
+                cause=DENY_CAUSE_SURFACE_POLICY,
+            )
+            await provider.reject_tool(event.request_id)
+            return False
 
     # Interactive approval if callback provided
     if on_tool_approval:

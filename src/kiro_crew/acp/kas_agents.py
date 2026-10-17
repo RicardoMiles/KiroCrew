@@ -63,7 +63,6 @@ the field absent, which is the all-``ask`` case above.
 
 from __future__ import annotations
 
-import copy
 import logging
 import os
 import re
@@ -75,6 +74,7 @@ from kiro_crew.acp.kas_permissions import (
     allowed_tools_to_permissions,
     auto_approved_capabilities,
     merge_user_permissions,
+    tools_settings_to_permissions,
     withhold_hook_gated_auto_approval,
 )
 from kiro_crew.agent_discovery import (
@@ -106,6 +106,7 @@ from kiro_crew.platform.tool_names import (
 )
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
+from kiro_crew.user_json import copy_json_document
 
 logger = logging.getLogger(__name__)
 
@@ -206,16 +207,50 @@ UNSUPPORTED_SPEC_KEYS = frozenset(
 
 #: The keys in :data:`UNSUPPORTED_SPEC_KEYS` that nothing carries to a KAS session,
 #: so an agent that sets one runs without it. The user is told once per session.
-SPEC_KEYS_WITHOUT_CARRIER = UNSUPPORTED_SPEC_KEYS - {"hooks"}
+#: ``toolsSettings`` is not here: it is translated into ``permissions``
+#: (:func:`kiro_crew.acp.kas_permissions.tools_settings_to_permissions`), and only
+#: the entries that translation cannot carry are reported.
+SPEC_KEYS_WITHOUT_CARRIER = UNSUPPORTED_SPEC_KEYS - {"hooks", "toolsSettings"}
 
 
-def spec_keys_without_carrier(spec: dict[str, Any]) -> list[str]:
-    """The keys of :data:`SPEC_KEYS_WITHOUT_CARRIER` that *spec* sets, sorted."""
-    return sorted(k for k in SPEC_KEYS_WITHOUT_CARRIER if spec.get(k))
+def spec_keys_without_carrier(
+    spec: dict[str, Any], *, translates_tools_settings: bool = False
+) -> list[str]:
+    """What *spec* sets that the session runs without, sorted.
+
+    Whole keys from :data:`SPEC_KEYS_WITHOUT_CARRIER`. ``toolsSettings`` is named
+    whole too, unless *translates_tools_settings* says this session receives its
+    ``permissions`` translation (KAS only); then each ``toolsSettings.<tool>.<key>``
+    the translation cannot carry is named instead.
+    """
+    lost = [k for k in SPEC_KEYS_WITHOUT_CARRIER if spec.get(k)]
+    tools_settings = spec.get("toolsSettings")
+    if not translates_tools_settings:
+        if tools_settings:
+            lost.append("toolsSettings")
+        return sorted(lost)
+    _, not_carried = tools_settings_to_permissions(tools_settings)
+    lost.extend(f"toolsSettings.{path}" for path in not_carried)
+    return sorted(lost)
 
 
 class KasAgentTranslationError(ValueError):
     """A spec cannot be projected onto KAS's schema at all."""
+
+
+class KasAgentSpecAbsent(KasAgentTranslationError):
+    """No spec declares the agent and no file carries its name: there is nothing to read.
+
+    Distinct from a spec that exists and cannot be read, because the remedy is
+    different: something has to put the definition back (typically by enabling the
+    app that registers it), and the caller can say so instead of quoting a failed
+    file open. A subclass, so every ``except KasAgentTranslationError`` keeps
+    refusing the session exactly as before.
+    """
+
+    def __init__(self, agent_id: str, agents_dir: Path) -> None:
+        super().__init__(f"agent {agent_id!r} has no spec in {agents_dir}")
+        self.agent_id = agent_id
 
 
 #: System prompt fed to a prompt-less agent when projecting onto KAS. KAS
@@ -920,6 +955,21 @@ def to_client_custom_agent(
         allowlist_present=isinstance(allowed_tools_input, list),
         agent_id=agent_id,
     )
+    # `toolsSettings` has no wire slot, but KAS's `permissions` is its
+    # replacement. The translated block goes through the same merge as an
+    # authored one: its denies travel, its allows meet the ceiling.
+    translated, _ = tools_settings_to_permissions(spec.get("toolsSettings"))
+    permissions = merge_user_permissions(
+        permissions,
+        translated,
+        ceiling_permits=may_skip_gate_now,
+        audit_decision=lambda refs, outcome, reason: _audit_permission_decision(
+            refs, outcome, reason, agent_id
+        ),
+        allowlist_present=isinstance(allowed_tools_input, list),
+        agent_id=agent_id,
+        source="translated `toolsSettings`",
+    )
     permissions = withhold_hook_gated_auto_approval(
         permissions,
         pre_tool_hook_matchers,
@@ -1044,10 +1094,11 @@ def load_agent_spec(agents_dir: Path, agent_id: str) -> dict[str, Any]:
     convention use, and it is what keeps a misnamed ``<agent_id>.json`` that
     declares some other agent from being projected under this id, with that
     other agent's tools and prompt, while the spec that does declare the id
-    sits beside it unread. Two specs declaring *agent_id* are refused, as
-    :func:`kiro_crew.agent.agent_spec_path` refuses them: which is live is
-    undefined, and picking either would project an agent the operator did not
-    name.
+    sits beside it unread. Two DIFFERING specs declaring *agent_id* are
+    refused, as :func:`kiro_crew.agent.agent_spec_path` refuses them: which is
+    live is undefined, and picking either would project an agent the operator
+    did not name. Two identical ones are one spec, and the scan projects it:
+    whichever the backend runs, the projection is the same.
 
     The scan's parsed spec is what the projection uses: it was read under the hardened
     reader's guards, labelled ``kas_agent_projection`` so a denial is
@@ -1068,9 +1119,11 @@ def load_agent_spec(agents_dir: Path, agent_id: str) -> dict[str, Any]:
     spec is never memoized (:func:`kiro_crew.agent_discovery.agents_dir_revision`,
     which also refuses a spec entry whose kind cannot be read and a young
     entry it cannot hash). The answer handed
-    back is a deep copy, so it is still a parse the caller owns and a caller's
-    mutation cannot reach a later session. The fallback read below is one file
-    and is not memoized.
+    back is a deep copy (:func:`kiro_crew.user_json.copy_json_document`, which
+    walks an explicit stack so a deeply nested spec cannot raise
+    ``RecursionError`` out of session start), so it is still a parse the
+    caller owns and a caller's mutation cannot reach a later session. The
+    fallback read below is one file and is not memoized.
 
     The scan and the fallback read raise :class:`KasAgentTranslationError` on
     an ``OSError`` for the same reason: every caller of this module handles the
@@ -1090,7 +1143,11 @@ def load_agent_spec(agents_dir: Path, agent_id: str) -> dict[str, Any]:
     except OSError as exc:
         raise KasAgentTranslationError(f"agent spec {path} is unreadable: {exc}") from exc
     if declared is not None:
-        return copy.deepcopy(declared)
+        # An iterative copy, not ``copy.deepcopy``: the reader admits a spec
+        # nested hundreds of levels deep, and a recursive copy of it would
+        # raise ``RecursionError`` out of session start instead of projecting
+        # or refusing it.
+        return copy_json_document(declared)
     # ``<id>.json`` first: beside an ``<id>.md`` twin the JSON wins, the same
     # rule the directory scan applies (see ``agent_spec_format``).
     present = [p for p in candidates if p.is_file()]

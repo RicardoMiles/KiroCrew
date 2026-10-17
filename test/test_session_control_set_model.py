@@ -203,18 +203,18 @@ def test_a_turn_during_a_picker_switch_keeps_the_pick_pending(tmp_path):
     assert target.model == out["model"]
 
 
-def test_the_model_check_uses_the_targets_provider_seam(tmp_path, monkeypatch):
-    """A Claude-backend target takes canonical keys as wire ids, so the check
-    must not reject them under a global ACP provider."""
+def test_the_model_check_uses_the_targets_backend(tmp_path, monkeypatch):
+    """A Claude-backend target takes canonical keys as wire ids, so the check is
+    judged on the TARGET's backend, not the global ACP provider."""
     from types import SimpleNamespace
 
     from kiro_crew.dashboard import chat_handlers
 
     seen: list[str | None] = []
 
-    def _reason(_model, provider=None):
-        seen.append(provider)
-        return None if provider == "claude-seam" else "rejected"
+    def _reason(_model, backend=None):
+        seen.append(backend)
+        return None if backend == "claude-backend" else "rejected"
 
     monkeypatch.setattr(chat_handlers, "_model_rejected_reason", _reason)
     monkeypatch.setattr(sc, "is_claude_code", lambda p: p == "claude-seam")
@@ -230,7 +230,7 @@ def test_the_model_check_uses_the_targets_provider_seam(tmp_path, monkeypatch):
 
     out = _set_model(state, caller, "chat-2", "fable-5-1m")
 
-    assert seen == ["claude-seam"]
+    assert seen == ["claude-backend"]
     assert out["model"] == "fable-5-1m"
 
 
@@ -380,7 +380,14 @@ def test_the_turn_arms_the_reset_for_a_live_or_spawning_session_only():
     whose behaviour is pinned below."""
     import kiro_crew.dashboard.chat_runner as runner
 
-    source = Path(runner.__file__).read_text(encoding="utf-8")
+    source = "\n".join(
+        turn_file.read_text(encoding="utf-8")
+        for turn_file in [
+            *sorted(Path(runner.__file__).with_name("chat_turn").glob("*.py")),
+            Path(runner.__file__),
+        ]
+        if turn_file.name != "__init__.py"
+    )
     body = source[source.index("if apply_pending_model_pick(state, slot):") :]
     body = body[: body.index("await _consume_pending_reset(state, slot)")]
     assert "arm_model_switch_reset(state, slot)" in body
@@ -429,7 +436,14 @@ def test_the_turn_persists_a_committed_pick_before_it_acquires_a_session():
     refused save leaves the slot dirty for the periodic flush."""
     import kiro_crew.dashboard.chat_runner as runner
 
-    source = Path(runner.__file__).read_text(encoding="utf-8")
+    source = "\n".join(
+        turn_file.read_text(encoding="utf-8")
+        for turn_file in [
+            *sorted(Path(runner.__file__).with_name("chat_turn").glob("*.py")),
+            Path(runner.__file__),
+        ]
+        if turn_file.name != "__init__.py"
+    )
     body = source[source.index("if apply_pending_model_pick(state, slot):") :]
     body = body[: body.index("await _consume_pending_reset(state, slot)")]
     assert "await save_slot_off_loop(" in body
@@ -447,7 +461,14 @@ def test_the_turn_applies_the_pick_before_it_acquires_a_session():
     reset is consumed and before get_or_create reads ``slot.model``."""
     import kiro_crew.dashboard.chat_runner as runner
 
-    source = Path(runner.__file__).read_text(encoding="utf-8")
+    source = "\n".join(
+        turn_file.read_text(encoding="utf-8")
+        for turn_file in [
+            *sorted(Path(runner.__file__).with_name("chat_turn").glob("*.py")),
+            Path(runner.__file__),
+        ]
+        if turn_file.name != "__init__.py"
+    )
     body = source[source.index("async def _run_chat(") :]
     apply_at = body.index("apply_pending_model_pick(state, slot)")
     assert apply_at < body.index("await _consume_pending_reset(state, slot)")

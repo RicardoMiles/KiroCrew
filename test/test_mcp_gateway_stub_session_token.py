@@ -37,7 +37,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -74,6 +73,7 @@ from kiro_crew.mcp_gateway.session_servers import (
     STUB_SESSION_TOKEN_ENV,
     attach_stub_session_token,
 )
+from kiro_crew.testing.wait import LoopHop, await_until, finished, wait_until
 
 pytestmark = pytest.mark.xdist_group("mcp_gateway")
 
@@ -420,7 +420,7 @@ async def _live_conn(
     reader.feed(_register_with_token(session_key, token, stub_uuid=stub_uuid))
     reader.feed(_CALL)
     task = asyncio.create_task(_handle(reader, _RecordingWriter()))
-    await asyncio.wait_for(backend.forwarded.wait(), timeout=5.0)
+    await await_until(backend.forwarded)
     return backend, reader, task
 
 
@@ -444,7 +444,7 @@ async def _next_caller(backend: Any, reader: Any) -> Any:
     """The identity the connection forwards on its NEXT call."""
     backend.forwarded.clear()
     reader.feed(_CALL)
-    await asyncio.wait_for(backend.forwarded.wait(), timeout=5.0)
+    await await_until(backend.forwarded)
     return backend.callers[-1]
 
 
@@ -571,6 +571,55 @@ async def test_a_tokenless_stub_is_not_handed_to_a_co_tenant(
 
     await _close(a_reader, a_task)
     await _close(b_reader, b_task)
+    await _close(plain_reader, plain_task)
+
+
+@pytest.mark.asyncio
+async def test_a_cleared_stub_regains_identity_after_co_tenant_disconnects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cleared tokenless stub is re-attributed once the co-tenant leaves.
+
+    Two recovery paths exist for a cleared stub. This test pins the second one:
+    once the co-tenant's token-carrying connections have disconnected,
+    ``_pid_live_tenants`` drops below two, ``shared_pid`` becomes False, and a
+    tokened claim from the remaining session can retarget the tokenless stub.
+    The first path (a tokenless claim) is already covered by
+    ``test_claim_across_token_topologies``; this test covers the second so the
+    comment's two named routes are each backed by a test.
+
+    The test also pins item 2: ``identity_refused`` is reset when the connection
+    is retargeted, so the recaller is not permanently blocked after recovery.
+    """
+    a_backend, a_reader, a_task = await _live_conn(monkeypatch, "", TOKEN_A, "stub-a")
+    b_backend, b_reader, b_task = await _live_conn(monkeypatch, "", TOKEN_B, "stub-b")
+    plain_backend, plain_reader, plain_task = await _live_conn(monkeypatch, "", "", "stub-plain")
+
+    # One session so far — tokenless stub rides along as usual.
+    await gw._apply_claim(_claim_with_token(_PID, PARENT_KEY, TOKEN_A))
+    assert (await _next_caller(plain_backend, plain_reader)).session_key == PARENT_KEY
+
+    # Co-tenant joins: tokenless stub is cleared.
+    second = await gw._apply_claim(_claim_with_token(_PID, SUB_KEY, TOKEN_B))
+    assert second["skipped"] == 1
+    assert await _next_caller(plain_backend, plain_reader) is None
+
+    # Confirm identity_refused was set so we can prove it is cleared after recovery.
+    plain_conn = next(c for c in gw._CONN_INDEX[_PID] if c.stub_uuid == "stub-plain")
+    assert plain_conn.identity_refused, "should be refused while co-tenant is live"
+
+    # Co-tenant disconnects: _pid_live_tenants now sees only stub-a's session.
+    await _close(b_reader, b_task)
+
+    # First session re-claims: shared_pid is now False, tokenless stub is retargeted.
+    third = await gw._apply_claim(_claim_with_token(_PID, PARENT_KEY, TOKEN_A))
+    assert third["updated"] >= 1, "stub-plain should be retargeted"
+    assert (await _next_caller(plain_backend, plain_reader)).session_key == PARENT_KEY
+
+    # identity_refused is cleared by the retarget (item 2).
+    assert not plain_conn.identity_refused, "retarget should clear the refused flag"
+
+    await _close(a_reader, a_task)
     await _close(plain_reader, plain_task)
 
 
@@ -800,7 +849,7 @@ async def test_register_prefers_the_binding_over_the_proc_walk(
     reader.feed(_register_with_token("", TOKEN_B, stub_uuid="stub-sub"))
     reader.feed(_CALL)
     task = asyncio.create_task(_handle(reader, _RecordingWriter()))
-    await asyncio.wait_for(backend.forwarded.wait(), timeout=5.0)
+    await await_until(backend.forwarded)
 
     assert backend.callers[0] is not None
     assert backend.callers[0].session_key == SUB_KEY
@@ -928,7 +977,7 @@ async def test_recaller_cannot_name_a_token_carrying_connection(
     reader.feed(_register_with_token("", TOKEN_B, stub_uuid="stub-sub"))
     reader.feed(_CALL)
     task = asyncio.create_task(_handle(reader, _RecordingWriter()))
-    await asyncio.wait_for(backend.forwarded.wait(), timeout=5.0)
+    await await_until(backend.forwarded)
     assert backend.callers[0] is None
 
     reader.feed({"type": "recaller", "session_key": PARENT_KEY, "session_type": "dashboard"})
@@ -1026,7 +1075,7 @@ async def _live_conn_on(
     reader.feed(_register_with_token("", token, stub_uuid=stub_uuid, ancestor_pids=ancestor_pids))
     reader.feed(_CALL)
     task = asyncio.create_task(_handle(reader, _RecordingWriter()))
-    await asyncio.wait_for(backend.forwarded.wait(), timeout=5.0)
+    await await_until(backend.forwarded)
     return backend, reader, task
 
 
@@ -1448,7 +1497,7 @@ async def test_the_token_never_reaches_the_prewarm_file(
     reader.feed(_register_with_token(PARENT_KEY, TOKEN_A, stub_uuid="stub-parent"))
     reader.feed(_CALL)
     task = asyncio.create_task(
-        asyncio.wait_for(
+        finished(
             gw._handle_connection(
                 reader,
                 _RecordingWriter(),
@@ -1457,10 +1506,10 @@ async def test_the_token_never_reaches_the_prewarm_file(
                 socket_path=Path("/tmp/cp.sock"),
                 hot_keys=hot,
             ),
-            timeout=5.0,
+            "hot_keys connection",
         )
     )
-    await asyncio.wait_for(backend.forwarded.wait(), timeout=5.0)
+    await await_until(backend.forwarded)
     await _close(reader, task)
 
     payloads = hot.top_register_payloads(10)
@@ -1655,7 +1704,9 @@ _SHARED_RUNTIME_SESSION_SITES = [
 def test_sessions_on_a_shared_runtime_name_their_own_owner(path: str, expected: str) -> None:
     body = (Path(__file__).resolve().parents[1] / path).read_text(encoding="utf-8")
     start = body.index("await runtime.create_session(")
-    call = body[start : body.index("\n        )", start)]
+    line = body[body.rindex("\n", 0, start) + 1 : start]
+    indent = line[: len(line) - len(line.lstrip())]
+    call = body[start : body.index("\n" + indent + ")", start)]
     assert expected in call, f"{path} opens a shared-runtime session without naming its owner"
 
 
@@ -1826,7 +1877,7 @@ async def test_a_cold_started_session_can_re_bind_after_a_respawn(
 #: shared-runtime session sites: one deleted keyword argument and the provider's
 #: re-claim carries no key, which gatewayd discards.
 _PROVIDER_OWNER_SITES = [
-    ("src/kiro_crew/providers/acp.py", "session_key=self._owning_session_key()"),
+    ("src/kiro_crew/providers/acp_runtime_start.py", "session_key=self._owning_session_key()"),
     ("src/kiro_crew/subagent_manager/run.py", "session_key=session_key"),
 ]
 
@@ -2050,9 +2101,14 @@ def test_real_kiro_cli_delivers_the_token_and_still_overrides_the_spec() -> None
                 if stream is not None:
                     with contextlib.suppress(OSError):
                         stream.close()
-        deadline = time.time() + 5
-        while time.time() < deadline and not (root / "marks" / "INJECTED").exists():
-            time.sleep(0.2)
+                wait_until(
+                    lambda: (root / "marks" / "INJECTED").exists(),
+                    describe=lambda: (
+                        f"driver exit: {proc.returncode}\n"
+                        + f"driver stdout: {(stdout or '')[-2000:]}\n"
+                        + f"driver stderr: {(stderr or '')[-2000:]}"
+                    ),
+                )
         assert (root / "marks" / "INJECTED").exists(), (
             "the injected server never launched with env on its element\n"
             f"driver exit: {proc.returncode}\n"
@@ -2091,7 +2147,7 @@ async def _live_conn_for_server(
     reader.feed(frame)
     reader.feed(_CALL)
     task = asyncio.create_task(_handle(reader, _RecordingWriter()))
-    await asyncio.wait_for(backend.forwarded.wait(), timeout=5.0)
+    await await_until(backend.forwarded)
     return backend, reader, task
 
 
@@ -2203,7 +2259,7 @@ async def test_a_respawned_replacement_is_judged_on_its_own(
     reader.feed(_CALL)
     reader.feed(dict(_CALL, id=2))
     task = asyncio.create_task(_handle(reader, _RecordingWriter()))
-    await asyncio.wait_for(replacement.forwarded.wait(), timeout=5.0)
+    await await_until(replacement.forwarded)
 
     # The dead control plane was entitled to the token ...
     assert dying.callers[0] is not None and dying.callers[0].session_token == TOKEN_A
@@ -3028,12 +3084,13 @@ def _claim_during_register(
     ordering deterministic rather than hoping to catch it.
     """
     loop = asyncio.get_running_loop()
+    hop = LoopHop(loop)
     acks: list[dict[str, Any]] = []
     real = gw._get_process_start_id
 
     def snapshot(pid: int) -> Any:
         if not acks:
-            acks.append(asyncio.run_coroutine_threadsafe(gw._apply_claim(frame), loop).result(5))
+            acks.append(hop.run(gw._apply_claim(frame), "apply claim"))
         return real(pid)
 
     monkeypatch.setattr(gw, "_get_process_start_id", snapshot)
@@ -3056,7 +3113,7 @@ async def _register_racing_a_claim(
     reader.feed(_register_with_token("", TOKEN_B, stub_uuid="stub-raced", ancestor_pids=stub_pids))
     reader.feed(_CALL)
     task = asyncio.create_task(_handle(reader, _RecordingWriter()))
-    await asyncio.wait_for(backend.forwarded.wait(), timeout=5.0)
+    await await_until(backend.forwarded)
     # The claim really did miss — without that, the test proves nothing.
     assert acks == [{"type": "claim-noop", "updated": 0, "connections": 0}]
     return backend, acks, reader, task
@@ -3191,7 +3248,7 @@ async def test_a_token_carrying_stub_asks_its_binding_exactly_once(
     reader.feed(_register_with_token("", TOKEN_B, stub_uuid="stub-once"))
     reader.feed(_CALL)
     task = asyncio.create_task(_handle(reader, _RecordingWriter()))
-    await asyncio.wait_for(backend.forwarded.wait(), timeout=5.0)
+    await await_until(backend.forwarded)
     assert acks == [{"type": "claim-noop", "updated": 0, "connections": 0}]
     assert len(asks) == 1
     assert backend.callers[0] is not None
@@ -3214,7 +3271,7 @@ async def test_an_unclaimed_token_still_logs_and_audits_its_refusal(
     reader.feed(_register_with_token("", TOKEN_B, stub_uuid="stub-unclaimed"))
     reader.feed(_CALL)
     task = asyncio.create_task(_handle(reader, _RecordingWriter()))
-    await asyncio.wait_for(backend.forwarded.wait(), timeout=5.0)
+    await await_until(backend.forwarded)
     assert len(asks) == 1
     assert backend.callers[0] is None
     assert any("unclaimed session token" in r.getMessage() for r in caplog.records)

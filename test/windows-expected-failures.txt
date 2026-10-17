@@ -24,7 +24,7 @@
 # test_config_loader.py::TestAgentWorkspaceBindingsProperties::test_workspace_path_resolution.
 test/metrics/test_local_exporter.py::test_export_locks_only_the_prune_phase
 test/test_acp_offload.py::TestOffloadRunsOnSubprocessPool::test_kill_process_runs_scan_and_sweep_off_loop
-test/test_acp_runtime.py::test_periodic_sweep_skips_protected_runtime_pid
+test/test_acp_runtime_client_parity.py::test_periodic_sweep_skips_protected_runtime_pid
 test/test_agent.py::TestResolveKirocrewBin::test_accepts_any_readable_bin_from_walk
 test/test_agent.py::TestResolveKirocrewBin::test_accepts_apollo_binary_with_envroot
 test/test_agent.py::TestResolveKirocrewBin::test_accepts_wrapper_bin_from_walk
@@ -124,13 +124,13 @@ test/test_sandbox_launcher_sweep.py::TestNamespaceArgvPlacement::test_launcher_i
 test/test_sandbox_launcher_sweep.py::TestNamespaceArgvPlacement::test_launcher_is_executable
 test/test_sandbox_launcher_sweep.py::TestRunDirMode::test_run_dir_mode_0o700
 test/test_sandbox_launcher_sweep.py::TestRunDirMode::test_run_dir_mode_enforced_on_existing
-test/test_service.py::TestKirocrewBinOverride::test_service_bin_override_wins_over_which
 test/test_service.py::TestLinuxUnitRendering::test_install_writes_unit_via_sudo_install_and_invokes_systemctl
-test/test_service.py::TestServiceEnvironment::test_plist_includes_locale_and_kiro_bin
-test/test_service.py::TestServiceEnvironment::test_propagates_kiro_bin_pin_only_when_set
-test/test_service.py::TestServiceEnvironment::test_unit_escapes_percent_specifiers
-test/test_service.py::TestServiceEnvironment::test_unit_includes_locale_and_kiro_bin
-test/test_service.py::TestServiceEnvironment::test_unit_quotes_spaced_program_and_env
+test/test_service_environment.py::TestKirocrewBinOverride::test_service_bin_override_wins_over_which
+test/test_service_environment.py::TestServiceEnvironment::test_plist_includes_locale_and_kiro_bin
+test/test_service_environment.py::TestServiceEnvironment::test_propagates_kiro_bin_pin_only_when_set
+test/test_service_environment.py::TestServiceEnvironment::test_unit_escapes_percent_specifiers
+test/test_service_environment.py::TestServiceEnvironment::test_unit_includes_locale_and_kiro_bin
+test/test_service_environment.py::TestServiceEnvironment::test_unit_quotes_spaced_program_and_env
 test/test_session.py::TestResetWithPid::test_reset_with_pid_survives_shutdown_force_kills
 test/test_session_pid_sig.py::TestNoNofollowPlatform::test_lstat_open_swap_refused
 test/test_session_pid_sig.py::TestNoNofollowPlatform::test_regular_file_still_reads
@@ -162,5 +162,5 @@ test/test_write_secret_file.py::TestWriteSecretFile::test_happy_path
 # first time. `PermissionError [Errno 13]` from `pathlib` writing the linked worktree's
 # `.git` pointer file: Windows refuses the write where POSIX allows it. The security
 # property it guards (a repointed gitdir must be refused) is POSIX-shaped.
-src/kiro_crew/apps/builtins/auto_improvement/tests/test_dogfood_learnings.py::TestRepoControlledGitHooksDoNotExecuteHostSide::test_a_repointed_worktree_gitdir_is_refused
+src/kiro_crew/apps/builtins/auto_improvement/tests/test_dogfood_learnings_clone.py::TestRepoControlledGitHooksDoNotExecuteHostSide::test_a_repointed_worktree_gitdir_is_refused
 test/test_open_slots_persistence.py::test_persist_open_slots_handles_write_failure_gracefully

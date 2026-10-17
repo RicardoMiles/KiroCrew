@@ -22,10 +22,10 @@ migration is required from the first release.
 **The ledger** -- work items, progress lines and the repository-shared skip index
 -- is not a file of its own. It is a **projection of the crew log**: every
 `issue_radar_crew_record` call appends exactly ONE `radar/recorded` entry to the
-crew log of the session the crew runs on (`crew_log/entry_types.py` declares the
-shape; `docs/reference/crew-log/session-types.md` documents it), and every read is
-the `radar` fold of those entries (`crew_log/projection.py`, registered in the fold
-registry as a SLOT-keyed fold). The store module (`crew_store.py`) keeps the same
+crew log of the session the crew runs on (`crew_log/entry_types_ledgers.py` declares
+the shape; `docs/reference/crew-log/session-types.md` documents it), and every read is
+the `radar` fold of those entries (`crew_log/projection_radar.py`, registered in the
+fold registry as a SLOT-keyed fold). The store module (`crew_store.py`) keeps the same
 function names its callers had; what they do is fold.
 
 ```
@@ -126,6 +126,10 @@ pass for a clear. The route turns each name into an explicit null in the patch; 
 typed entry field cannot hold a null, so the writer carries the cleared names in the
 entry's own `clear` list and the fold empties each one before applying the fields
 the same update sets -- a call that clears and sets one field keeps the set value.
+`clear` is also how a crew records that it holds no labels after removing its
+last one: the tool forwards `labels_applied: []` when it arrives, but a client that
+drops empty lists delivers it as an omitted field, so the record tool's description
+points at `clear: ["labels_applied"]`.
 
 **A refusal is not a commit.** The write drains the writer and reads its entry back
 from the log. A writer that drained WITHOUT the entry showing in the log did not

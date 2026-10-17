@@ -36,6 +36,13 @@ this spec states the target and that one states the present.
 | Driver | `implemented` | in-session timer of `AutoNudgeService` (`autonudge_service/firing.py`; probe gate `gate.py`, judge `judge_tick.py`), which reads the subject each tick and screens it with the wake judge |
 | Delivery | `implemented` | session directive keyed by the call's input digest, shared by both arming paths |
 
+The dashboard's `autonudge_state` lifecycle frame carries the loop's public
+`created_ts` runtime-budget clock alongside cadence, counters, deadline and stop
+state. The dashboard caches that frame over its REST seed, so omitting this clock
+would erase a known Runtime started/Runtime value after any update. Structured
+subject fields remain withheld from the broad frame and come only from the
+owner-gated monitor read.
+
 ## Three prerequisites
 
 Nothing in the seven layers is reachable until these three exist. Each is a
@@ -127,7 +134,7 @@ Giving the kind its own objective (a registry row plus a per-kind stamp) is the
 next step and is not part of the change that made it reachable.
 
 A conductor does not have to remember that arm. When `work_ledger_record`
-`action=bind` commits and the conductor's slot holds no loop at all,
+`action=bind` commits and the conductor's slot holds no ACTIVE loop,
 `conductor_patrol.ensure_patrol` arms a default patrol on it: `watch:
 "work-ledger"`, gated, every 600 seconds, 300 cycles and 86400 seconds, which
 pass the goal-conductor skill's `patrol_budget.py check`. It goes through the
@@ -135,16 +142,28 @@ same chokepoint as an agent's own `monitor_start`
 (`autonudge_authz.authorize_and_add_nudge`), create-only, as an OUTSIDE arm with
 no `initiator_slot_key`: the bind route knows the calling session but not the
 turn, so it cannot tell the session's own turn from a cron injection or a
-sub-agent sharing the slot. A crew/member conductor therefore refuses it. Any
-existing record -- active, approval-held, or stopped by a person -- is left
-alone, so a bind never stacks a second loop or revives a person's stop. The one
-re-arm is the gateway's own default patrol stopped by the system (its budget or
-cap ran out, the `_stopped_row_is_replaceable` allowlist): a new bind is new work,
-so it is replaced by a fresh default. A refusal is logged at WARNING and the bind
-still succeeds; the bind reply carries `patrol: armed | existing | refused |
-unsupported`, plus a `patrol_note` telling the conductor to arm its own
+sub-agent sharing the slot. A crew/member conductor therefore refuses it. An
+active record is left alone, so a bind never stacks a second loop. An inactive
+record the SYSTEM stopped -- its subject went terminal (every item closed), its
+budget or cap ran out, the `_stopped_row_is_replaceable` allowlist -- counts as
+no loop, whoever armed it, and is replaced by a fresh default: a new bind is new
+work. An inactive record a PERSON stopped is kept and the arm is refused with
+reason `user-stopped`. A refusal is logged at WARNING and the bind still
+succeeds; the bind reply carries `patrol: armed | existing | refused |
+unsupported` and `patrol_reason` (`no-loop`, `replaced-system-stopped`,
+`active-work-ledger`, `active-other-watch`, `user-stopped`,
+`outside-arm-refused`, `session-cannot-host-loop`, `arm-failed`,
+`autonudge-disabled`, `no-ledger`), plus a `patrol_note` telling the conductor to arm its own
 `monitor_start` in the same turn whenever no `work-ledger` watch is active after
-the bind. The armed loop carries `default_patrol: true`, and that tag is the one
+the bind. The MCP tool renders all three on every bind reply. A `session_create`
+(`POST /api/session-control/create`, not a dry run) is a dispatch too and runs
+the same `ensure_patrol` on its caller, with the same fields on its reply. A
+caller that holds no work ledger gets nothing armed (`no-ledger`): the watch
+would read nothing and fire on its timer, so the reply says what fits instead. A
+crew/member caller is still refused: neither route can tell the member's own
+turn from a cron, app or sub-agent turn on the same session key, and the only
+path that can (`session_directive_apply`, through `DIRECTIVE_TOOLS` and
+`mcp_core.derive_directive`) is reached by a member's own `monitor_start`. The armed loop carries `default_patrol: true`, and that tag is the one
 exception to create-only: ANY create-only arm of a loop that is not itself a
 default patrol -- the conductor's own `monitor_start` or `monitor_watch`, and
 equally a person's dashboard create or a channel arm -- displaces an ACTIVE
@@ -314,7 +333,7 @@ person-wait hold hands back the span it held, measured on the monotonic clock
 from the hold's start, while `created_ts` moves by the wall-clock span, which
 is what a restart reads. A step before or during a hold therefore changes the
 budget only across a restart.
-`test_autonudge.py::test_a_released_hold_hands_back_the_time_it_really_held`
+`test_autonudge_budget.py::test_a_released_hold_hands_back_the_time_it_really_held`
 pins the hold cases. The
 budget is awake time while the gateway runs, the clock the loop's own
 `asyncio` waits use: `time.monotonic()` stops while the host is suspended on
@@ -322,7 +341,7 @@ Linux and macOS, so a suspend there spends none of the budget, and it keeps
 counting on Windows, where a suspend is spent. Time before a restart is read
 back from the stored `created_ts` on the wall clock, so a suspend or a step that
 came before a restart counts in full.
-`test_autonudge.py::test_a_suspend_spends_no_runtime_budget_until_a_restart`
+`test_autonudge_budget.py::test_a_suspend_spends_no_runtime_budget_until_a_restart`
 pins both readings.
 
 A work-ledger watch also HOLDS while every open item waits on a person: each is

@@ -56,7 +56,7 @@ in the **same commit** when you change what it documents.
 | `mcp_gateway/` — `gatewayd.py`, `daemon/`, the daemon's lifecycle and facade | [mcp-gateway-daemon-lifecycle](docs/system-specs/modules/mcp-gateway-daemon-lifecycle.md) + [mcp](docs/architecture/mcp.md) |
 | apps, App Kit, manifests, app agents | [app-kit-platform](docs/system-specs/modules/app-kit-platform.md) + [app-kit/](docs/app-kit/README.md) |
 | artifacts, companion chat | [artifacts](docs/system-specs/modules/artifacts.md) |
-| `stt/`, `transcribe.py`, `voice_reply.py`, the mic, dictation, TTS | [stt-streaming](docs/system-specs/modules/stt-streaming.md) + [voice-streaming](docs/system-specs/modules/voice-streaming.md) |
+| `stt/`, `transcribe.py` and its `transcribe_*.py` owners, `voice_reply.py`, the mic, dictation, TTS | [stt-streaming](docs/system-specs/modules/stt-streaming.md) + [voice-streaming](docs/system-specs/modules/voice-streaming.md) |
 | cron, learn, dashboard handlers | [learn-cron-dashboard](docs/system-specs/modules/learn-cron-dashboard.md) |
 | Slack, Discord, any channel, messaging, approvals | [messaging](docs/system-specs/modules/messaging.md) + [slack-gateway](docs/system-specs/modules/slack-gateway.md) |
 | subagents, spawn, orphan recovery | [subagent](docs/system-specs/modules/subagent.md) |
@@ -150,7 +150,7 @@ Detail and rationale: [security](docs/system-specs/modules/security.md),
   command line and the OS sandbox does not hold the path (#7441 went four rounds
   of `command`/`exec -a`/`nice`/`env -i`/`timeout`/`busybox` before restructuring).
 - **The sandbox's SCOPE is the operator's to widen, never yours.** What
-  `sandbox.py` seals, masks or no-follow pins decides which of the operator's own
+  `sandbox.py` and its `sandbox_*` owners seal, mask or no-follow pin decides which of the operator's own
   files their agent can still reach, so a widening they did not ask for surfaces
   days later as work that stopped, with no record that anyone chose to lose it.
   Never add a seal, mask or refusal a task did not ask for, never tighten a fence
@@ -179,9 +179,8 @@ Detail and rationale: [security](docs/system-specs/modules/security.md),
 fallback fails at runtime for anyone not entitled to it, silently until the first
 prompt. The default is `"auto"`; resolve a substitute choice through
 `acp.client.resolve_usable_model`; pin a cheaper model for the worker roles only
-via `agent.role_models.<role>` (and, once rfc-worker-model-inheritance's
-implementation #19368 lands, for one crewmate's dispatched sessions via that
-crewmate's `worker_model`). `code-review.yml` fails on a newly added hardcoded
+via `agent.role_models.<role>` (and, for one crewmate's dispatched sessions, via
+that crewmate's `worker_model`). `code-review.yml` fails on a newly added hardcoded
 literal. Rules and the one exception:
 [model-selection](docs/system-specs/common/model-selection.md).
 
@@ -297,6 +296,13 @@ human passes `--full`. See
 - A multi-test `--override-ini` MUST keep `-n auto --dist loadgroup
   --max-worker-restart=2`; a bare override silently drops `--dist loadgroup` and
   scatters `@pytest.mark.xdist_group` tests into flaky races.
+
+**No hand-written file over 2,000 lines; put new code in a new module.** When a
+file nears the cap, move whole definitions into a sibling module and keep the
+original path as the import path callers use. `scripts/check_file_line_cap.py`
+enforces it in CI's lint jobs; run it before you push. The files already over are
+listed in `.github/file-line-cap-baseline.txt`, which only shrinks, so never add a
+row. Details: [code-style](docs/system-specs/common/code-style.md).
 
 Gates, the seven flake classes, the conftest isolation floor and the traps that are
 invisible when reading a test: [code-style](docs/system-specs/common/code-style.md) +

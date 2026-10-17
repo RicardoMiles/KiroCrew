@@ -153,7 +153,7 @@ def _record(row: Any) -> dict:
 
 
 def _rows(store: Any, query: dict, identities: list[tuple[str, str]] | None = None):
-    from kiro_crew.memory_record_metadata import get_record_metadata, record_id_for
+    from kiro_crew.memory_record_metadata import get_record_metadata, record_identity_or_none
 
     # A UNION over the compatibility relations preserves both physical schemas.
     # No vector column is read; row width and Python memory remain bounded.
@@ -188,7 +188,8 @@ def _rows(store: Any, query: dict, identities: list[tuple[str, str]] | None = No
                 continue
             if query["kind"] != "all" and row["kind"] != query["kind"]:
                 continue
-            meta = get_record_metadata(store.db, record_id_for(row["kind"], row["id"]))
+            record_id = record_identity_or_none(row["kind"], row["id"])
+            meta = get_record_metadata(store.db, record_id) if record_id is not None else {}
             text = row["text"]
             if row["value_json"] is not None:
                 try:
@@ -497,6 +498,8 @@ def _after(store: Any, before: dict, operation: dict) -> dict | None:
 
 
 def _collect(store: Any, selection: dict, operation: dict) -> tuple[str, int, list]:
+    from kiro_crew.memory_record_metadata import record_identity_or_none
+
     if operation["type"] == "restore" and len(selection.get("items", [])) != 1:
         raise MemoryEditError("Restoring a version requires exactly one memory.")
     explicit = {(item["kind"], item["id"]): item["revision"] for item in selection.get("items", [])}
@@ -506,6 +509,12 @@ def _collect(store: Any, selection: dict, operation: dict) -> tuple[str, int, li
     matched, size, changes = 0, 0, []
     for before in _rows(store, query, list(explicit) if explicit else None):
         identity = before["kind"], before["id"]
+        if record_identity_or_none(before["kind"], before["id"]) is None:
+            # A legacy row whose identity is NULL or empty stays visible in the
+            # read-only list but cannot be edited: _write looks it up by that
+            # identity, and WHERE id = NULL matches nothing. Skipping it here
+            # keeps the batch applicable instead of failing the whole apply.
+            continue
         if (explicit and identity not in explicit) or identity in excluded:
             continue
         if explicit and explicit[identity] != before["revision"]:

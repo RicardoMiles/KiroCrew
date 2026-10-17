@@ -168,6 +168,22 @@ class TestStagingRecordsNothing:
         with patch.object(instance, "_now_ms", return_value=instance._now_ms() + stale):
             assert instance.staged_preview(SLUG) is None
 
+    def test_a_forged_non_numeric_staged_ms_reads_as_nothing_staged(self) -> None:
+        """A fifth bad envelope: a hand-forged ``staged_ms`` that is not a number.
+
+        A gateway writer always stamps an int, so this is only reachable from a file an
+        agent forged on disk. It must read as nothing staged -- the same answer the four
+        documented bad cases give -- rather than letting the ``int()`` escape as an
+        uncaught HTTP 500 through preview and apply.
+        """
+        instance.stage_preview(SLUG, template_id="fixture-board")
+        raw = json.loads(instance._preview_path(SLUG).read_text(encoding="utf-8"))
+        raw["staged_ms"] = "not-a-number"
+        instance._preview_path(SLUG).write_text(
+            json.dumps(raw, ensure_ascii=False), encoding="utf-8"
+        )
+        assert instance.staged_preview(SLUG) is None
+
     def test_the_preview_wire_carries_the_link_and_never_the_page(self) -> None:
         """The html is the large half and the agent that staged it already holds it."""
         wire = instance.stage_preview(SLUG, template_id="fixture-board").wire("Fleet")
@@ -254,7 +270,7 @@ class TestAnAgentWrittenPageCannotBeStaged:
         with pytest.raises(instance.InstanceRefused) as refused:
             instance.stage_preview(SLUG, **kwargs)
         assert str(refused.value) == instance.AUTHORED_PAGE_REFUSAL
-        assert "come later" in str(refused.value)
+        assert "dashboard_save" in str(refused.value)
         assert instance.staged_preview(SLUG) is None, "a refused page was staged anyway"
 
     def test_the_refusal_says_what_to_call_instead(self) -> None:
@@ -415,10 +431,11 @@ class TestTheToolSurface:
             "dashboard_rollback",
         }
 
-    def test_apply_advertises_no_arguments(self) -> None:
-        """The emptiness IS the safety property: apply cannot be pointed elsewhere."""
+    def test_apply_advertises_only_an_optional_template_id(self) -> None:
+        """A template applies without a preview: the preview is a look, not a gate."""
         apply_tool = next(t for t in _list_tools() if t["name"] == "dashboard_apply")
-        assert apply_tool["inputSchema"].get("properties") == {}
+        assert set(apply_tool["inputSchema"]["properties"]) == {"template_id"}
+        assert not apply_tool["inputSchema"].get("required")
 
 
 class TestDashboardTemplatesTool:
@@ -525,10 +542,8 @@ class TestDashboardPreviewTool:
         # A markdown link, because the chat links a root-relative href only in that
         # form; the bare path would show as plain text the person cannot click.
         assert "[Open the dashboard preview](/members?member=fleet&dashboard=preview)" in out
-        # The instruction to ASK is unconditional: this tool's whole value is that it
-        # changes nothing, and an agent that previews and applies in one breath has
-        # spent the staging step without letting anybody look.
-        assert "ASK the person" in out
+        # The way to keep it, and the person's own buttons, are both named.
+        assert "dashboard_apply with template_id `fixture-board` puts it live" in out
 
     @pytest.mark.parametrize(
         "args",
@@ -556,7 +571,7 @@ class TestDashboardPreviewTool:
         with patch("kiro_crew.mcp_panel._post") as mock_post:
             out = _call_tool_inner("dashboard_preview", args)
         assert out == f"Error: {instance.AUTHORED_PAGE_REFUSAL}"
-        assert "come later" in out
+        assert "dashboard_save" in out
         mock_post.assert_not_called()
 
     def test_previewing_nothing_is_refused_locally(self, _verified_caller: Any) -> None:
@@ -573,7 +588,8 @@ class TestDashboardPreviewTool:
         """
         tool = next(t for t in _list_tools() if t["name"] == "dashboard_preview")
         assert set(tool["inputSchema"]["properties"]) == {"template_id"}
-        assert "CANNOT preview a page you wrote" in tool["description"]
+        assert "OPTIONAL" in tool["description"]
+        assert "dashboard_save" in tool["description"]
 
     def test_a_refusal_from_the_gateway_comes_back_whole(self, _verified_caller: Any) -> None:
         """A parity refusal names every unpaired field in both directions.

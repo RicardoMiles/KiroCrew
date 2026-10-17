@@ -74,11 +74,21 @@ MAX_FLAKY_SPECS = 0
 # A bound on the WHOLE Playwright run, taken from the CI job's budget so the run's
 # report survives. It is not a lost-run ceiling (that bounds one wait inside a test
 # at 10x its measured worst case), and it can stop a slow run that would have
-# passed. ci.yml's 25-minute `e2e` job reaches this step about 5 minutes in, and
-# the suite took 12.8 min there (run 37340204150; 9-10 min locally). 17 min of
-# Playwright plus _STOP_GRACE_SECS leaves about 2 min to read the report and write
-# the job summary. It sits below the 1800 s pytest timeout of setup.py test_e2e.
-PLAYWRIGHT_RUN_CEILING_SECS = 1020
+# passed -- so it must be sized against the real suite length, not left behind it.
+#
+# ci.yml's 25-minute (1500 s) `e2e` job reaches this step about 4 minutes in, and
+# the Playwright run itself starts ~75 s into the step, so ~1180 s of the job
+# budget is left for the run. The suite was 12.8 min when the old 1020 s bound was
+# set (run 37340204150), but it is now ~17 min on the hosted runner: two runs with
+# every spec green were still failed here for crossing 1020 s (322 passed/16.9 min,
+# duration 1016 s; 318 passed/17.0 min, duration 1017 s), and the job itself had
+# ~225 s of its 1500 s budget still unused when the bound fired. 1200 s (20 min)
+# clears the measured ~1017 s worst case with ~3 min of margin while 1200 s plus
+# _STOP_GRACE_SECS still leaves about 2 min to read the report and write the job
+# summary before the 25-minute job timeout. It sits below the 1800 s pytest
+# timeout of setup.py test_e2e. RAISE this (not the specs) if the suite grows again
+# and the job budget allows; split or speed up the suite before it nears the budget.
+PLAYWRIGHT_RUN_CEILING_SECS = 1200
 
 # A stopped run first gets SIGINT, so Playwright can run its reporters and close
 # its browsers, and is killed with its whole process group after this long.

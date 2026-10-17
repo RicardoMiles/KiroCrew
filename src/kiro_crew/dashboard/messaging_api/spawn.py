@@ -29,7 +29,7 @@ if TYPE_CHECKING:
         effort_drop_reason,
         effort_pending_note,
         internal_memory_scope,
-        parent_spawn_allowlists,
+        parent_template_allowlists,
         parent_work_supported,
         spawn_parent_claim,
         validate_tool_args,
@@ -317,7 +317,9 @@ async def api_spawn(request: web.Request) -> web.Response:
         parent_spawn_policy = (
             (
                 parent_execution.template_id,
-                await asyncio.to_thread(parent_spawn_allowlists, parent_execution.template_id),
+                await asyncio.to_thread(
+                    parent_template_allowlists, parent_session, parent_execution.template_id
+                ),
             )
             if parent_execution is not None
             else ("", ())
@@ -355,7 +357,7 @@ async def api_spawn(request: web.Request) -> web.Response:
         return web.json_response({"error": "batch_id must be alphanumeric"}, status=400)
     try:
         batch_total = max(0, min(int(body.get("batch_total", 0) or 0), 1000))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         batch_total = 0
     # The async moment preceding the synchronous spawn(): warm here so the
     # on-loop, cache-only agent validation inside spawn() is a hit.
@@ -564,7 +566,7 @@ async def api_spawn_continue(request: web.Request) -> web.Response:
     model = str(body.get("model", "") or "")
     try:
         max_turns = max(0, min(int(body.get("max_turns", 0) or 0), 1000))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         max_turns = 0
     # The run's own cwd, resolved OFF the event loop: a continuation has to run
     # where the run ran (a project-local agent does not resolve against the pool

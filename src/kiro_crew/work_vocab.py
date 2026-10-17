@@ -140,6 +140,8 @@ class WorkBoardItem(TypedDict):
     closed_at: str | None
     #: When the conductor last wrote ``decide`` on the item, or unset.
     decided_at: str | None
+    #: When the item's current run of ``pending`` verdicts began, or unset.
+    pending_since: str | None
     events: list[WorkBoardEvent]
 
 

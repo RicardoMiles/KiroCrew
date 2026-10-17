@@ -66,7 +66,7 @@ sequenceDiagram
     participant Owner as Slack Owner
     participant Handler as commands.py (_bang_dashboard)
     participant Allowlist as allowlist.py (send_dashboard_link)
-    participant TokenGen as token_auth.py
+    participant TokenGen as token_auth_tokens.py
     participant Browser as Browser
     participant MW as Token Auth Middleware
     participant App as Dashboard App
@@ -151,6 +151,18 @@ gates (`_workflow_ready`, `_crewmate_prune_gate`, each a 503).
 ### 1. `token_auth.py` — Token Generator, Validator & Middleware
 
 Location: `src/kiro_crew/dashboard/token_auth.py`
+
+`token_auth.py` keeps the middleware and is the import path for every name below: a
+mirror facade (`kiro_crew._facade_mirror`) that serves what its owners bind and sends a
+patch of `token_auth.<name>` to every owner holding it. Owners never import it. New work
+goes to the owner of its responsibility:
+
+| Owner | Responsibility |
+|---|---|
+| `token_auth_paths.py` | Requests that skip token auth (static assets, self-authenticating webhooks, CSRF exemptions, the SPA shell and app-window paths), and the refusal and auth-log helpers |
+| `token_auth_tokens.py` | Minting, validating, pinning and revoking session tokens; app secrets; the per-process token state |
+| `token_auth_app_scope.py` | What an app token may reach: its namespace and its manifest `permissions.api` prefixes |
+| `token_auth_callers.py` | Unix-socket peer verification, and attributing a request to its app, cron job, sub-agent or member |
 
 #### Token Format
 
@@ -332,7 +344,21 @@ Request flow:
    refusal is a `403` with a machine-readable `code` matching its SEL
    `token.local` record's `resources`: `loopback_only` (`non-loopback`),
    `invalid_secret` (`invalid-secret`) and `member_owner_token_refused`
-   (`unverified-owner-process`).
+   (`unverified-owner-process`). The owner-process check answers with
+   provenance, not a bare verdict (`member_memory_auth.local_owner_bootstrap_provenance`
+   returns a `LocalOwnerProvenance`): when the caller is owned by an app backend
+   this gateway spawned, the backend registry's name for that app
+   (`apps.backend.spawned_backend_owner`) is consulted before the host-process
+   leg, so an unsandboxed backend that would also pass as a host process is still
+   attributed to its app. The success record's `resources` is `token-issued` for
+   a host process and `token-issued app=<name>` for an app backend; the response
+   body is unchanged. The name is the registry key, which `apps.manifest.app_name_error`
+   holds to kebab-case, so it can carry neither a space nor `=` and cannot forge a
+   second field in the row. It is NOT a token claim: an `app`-scoped token is
+   refused by `is_owner_dashboard_request`, so a claim would withdraw the
+   capability the admission grants. Consulting the registry first changes what is
+   recorded, never what is admitted; a registry that raises names no app and
+   leaves the host-process leg to decide as before.
 3. Extract token from `?token=` query param or `mc_token_{port}` cookie
 4. Validate signature + expiry (link window for query param, session_exp for cookie)
 5. Check IP binding
@@ -421,7 +447,7 @@ If `index()` cannot read the static bundle, its `FileNotFoundError` fallback
 body (`_DASHBOARD_HTML_NOT_FOUND` in `handlers/core.py`) is likewise static and
 secret-free, honoring the same unauthenticated cold-start contract.
 
-**One predicate, no drift:** `_is_spa_shell_request` in `token_auth.py` is the
+**One predicate, no drift:** `_is_spa_shell_request` in `token_auth_paths.py` is the
 single source of truth for "paths that are never the SPA shell". It combines
 three exclusions:
 
@@ -779,7 +805,7 @@ byte-identical to the pre-token scheme. The senders are `mcp_core`'s own
 
 ### 6. `gateway.py` Integration
 
-`_init_dashboard()` resolves config and passes to `start_dashboard()` (abbreviated):
+`_init_dashboard()` (in `slack/gateway_runtime/service_boot.py`) resolves config and passes to `start_dashboard()` (abbreviated):
 
 ```python
 configured_host, dashboard_port = parse_dashboard_url(self._cfg.dashboard.url)

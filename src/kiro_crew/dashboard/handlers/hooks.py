@@ -21,6 +21,7 @@ from kiro_crew.agent import (
     _shipped_defaults,
     agents_spec_lock,
     kiro_agents_dir_path,
+    unsent_kiro_hook_rows,
 )
 from kiro_crew.agent_capabilities import CapabilityError
 from kiro_crew.agent_discovery import _read_agent_spec, list_agents
@@ -119,6 +120,10 @@ async def api_hooks(request: web.Request) -> web.Response:
     return web.json_response({"hooks": [h.to_dict() for h in store.list_all()]})
 
 
+#: The ``unsent`` row fields the author wrote, which may hold a credential.
+_UNSENT_AUTHORED = frozenset({"name", "matcher", "command"})
+
+
 @_store_failure_guard
 async def api_kiro_hooks(request: web.Request) -> web.Response:
     """GET /api/kiro-hooks — read-only view of kiro-cli agent hooks from kirocrew.json."""
@@ -181,7 +186,9 @@ async def api_kiro_hooks(request: web.Request) -> web.Response:
                 )
         if tagged:
             result[event] = tagged
-    return web.json_response({"hooks": result})
+    unsent = await asyncio.to_thread(unsent_kiro_hook_rows)  # off-loop: reads config.json
+    unsent = [{k: redact(v) if k in _UNSENT_AUTHORED else v for k, v in r.items()} for r in unsent]
+    return web.json_response({"hooks": result, "unsent": unsent})
 
 
 class _StoreUnavailable(Exception):
@@ -383,9 +390,10 @@ async def api_hook_test(request: web.Request) -> web.Response:
     hook = store.get(hook_id)
     if not hook:
         return web.json_response({"error": "not found", "code": "hook_not_found"}, status=404)
-    body = await _json_object(request, default_empty=True)
-    if body is None:
-        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    body, body_error = await _json_object(request, default_empty=True)
+    if body_error is not None:
+        return body_error
+    assert body is not None  # (dict, None) on success
     raw_context = body.get("context", "test")
     context = sanitize_string(raw_context)
     if len(context) > 10000:  # Max context length for hook test
@@ -682,22 +690,49 @@ def _commit_pinned_token(agent: str, commit: Callable[[], _T]) -> _T:
         return commit()
 
 
-async def _json_object(request: web.Request, *, default_empty: bool = False) -> dict | None:
-    """Parse a JSON **object** body. ``None`` means answer 400.
+async def _json_object(
+    request: web.Request, *, default_empty: bool = False
+) -> tuple[dict | None, web.Response | None]:
+    """Parse a JSON **object** body for the dashboard's hook/webhook routes.
 
-    ``await request.json()`` happily returns a list, string or number for a body
-    that is valid JSON but not an object, and every caller here then calls
-    ``.get()`` on it — which raises and turns a client mistake into a 500.
+    Returns ``(body, None)``, or ``(None, error_response)`` to return as-is.
+
+    Reads through :func:`read_bounded_json`, so a body that is present but not
+    declared JSON is refused 415 before it is read, and the read is capped at
+    ``_HOOK_BODY_MAX_BYTES`` -- the same ceiling the external
+    ``POST /api/hooks/agent`` webhook applies. These routes carry a handful of
+    control fields (a flag, a label, an agent name, a test message), so no
+    dashboard caller needs more than the webhook itself accepts. That route
+    reads through ``_read_hook_body`` instead and is not a caller.
+
+    A list, string or number body is refused with this module's existing
+    ``invalid_json`` 400: every caller calls ``.get()`` on the result, which
+    would turn a client mistake into a 500.
 
     *default_empty* keeps the handlers that treat an absent or unparseable body
     as "use the defaults" doing exactly that, while still rejecting a body the
-    caller clearly meant as data but shaped wrongly.
+    caller clearly meant as data but shaped wrongly. It defaults only the two
+    "no usable document" answers (absent, ``invalid_json``): the 415 and 413 are
+    returned whatever the flag says, so the gate and the cap hold on every route.
     """
-    try:
-        parsed = await request.json()
-    except Exception:
-        return {} if default_empty else None
-    return parsed if isinstance(parsed, dict) else None
+    # Body-scope import, like ``require_owner_dashboard_request`` in this module.
+    from kiro_crew.dashboard.handlers._shared import bounded_json_error_code, read_bounded_json
+
+    body, error = await read_bounded_json(
+        request, max_bytes=_HOOK_BODY_MAX_BYTES, allow_absent=default_empty
+    )
+    if error is None:
+        return body, None
+    code = bounded_json_error_code(error)
+    if default_empty and code == "invalid_json":
+        return {}, None
+    if code == "body_not_object":
+        # This module has always answered a non-object body with its
+        # ``invalid_json`` 400; keep that wire answer for the dashboard client.
+        return None, web.json_response(
+            {"error": "invalid JSON", "code": "invalid_json"}, status=400
+        )
+    return None, error
 
 
 # Deliberately NOT wrapped in @_store_failure_guard. This route is externally
@@ -1939,9 +1974,10 @@ async def api_webhooks_switch(request: web.Request) -> web.Response:
     denied = await require_owner_dashboard_request(request, "webhooks.switch")
     if denied is not None:
         return denied
-    body = await _json_object(request)
-    if body is None:
-        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    body, body_error = await _json_object(request)
+    if body_error is not None:
+        return body_error
+    assert body is not None  # (dict, None) on success
     enabled = body.get("enabled")
     if not isinstance(enabled, bool):
         return web.json_response(
@@ -2069,9 +2105,10 @@ async def api_webhook_token_create(request: web.Request) -> web.Response:
     denied = await require_owner_dashboard_request(request, "webhooks.token_create")
     if denied is not None:
         return denied
-    body = await _json_object(request)
-    if body is None:
-        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    body, body_error = await _json_object(request)
+    if body_error is not None:
+        return body_error
+    assert body is not None  # (dict, None) on success
     require_signature = body.get("require_signature", True)
     if not isinstance(require_signature, bool):
         return web.json_response(
@@ -2177,9 +2214,10 @@ async def api_webhook_token_update(request: web.Request) -> web.Response:
             },
             status=400,
         )
-    body = await _json_object(request)
-    if body is None:
-        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    body, body_error = await _json_object(request)
+    if body_error is not None:
+        return body_error
+    assert body is not None  # (dict, None) on success
     allowed = {"agent", "enabled", "label"}
     unknown = sorted(set(body) - allowed)
     if unknown or not body:
@@ -2352,9 +2390,10 @@ async def api_webhook_test(request: web.Request) -> web.Response:
     denied = await require_owner_dashboard_request(request, "webhooks.test")
     if denied is not None:
         return denied
-    body = await _json_object(request, default_empty=True)
-    if body is None:
-        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    body, body_error = await _json_object(request, default_empty=True)
+    if body_error is not None:
+        return body_error
+    assert body is not None  # (dict, None) on success
     message = sanitize_string(str(body.get("message") or "")).strip()
     if not message:
         message = (

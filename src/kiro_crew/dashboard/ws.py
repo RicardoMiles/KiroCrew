@@ -27,6 +27,7 @@ from kiro_crew.dashboard.state import (
     _slots_serialization_note,
 )
 from kiro_crew.dashboard.status_counts import cached_status_snapshot
+from kiro_crew.dashboard.warm_task_brief import handle_focus_frame
 from kiro_crew.dashboard.websocket_hub import SLOT_PATCH_CAPABILITY, SLOT_PATCH_WS_FLAG
 from kiro_crew.dashboard.ws_event_scope import (
     DASHBOARD_USER_AUDITEE,
@@ -872,9 +873,9 @@ async def _serve_ws(
         ensure_gitlab_hosts_loaded,
         gitlab_hosts_generation,
         is_owner_dashboard_request,
-        schedule_check_refresh,
         schedule_visibility_refresh,
     )
+    from kiro_crew.dashboard.source_providers.chip_refresh import schedule_tiered_check_refresh
     from kiro_crew.platform.governance_profiles import (
         governance_answer_generation,
         poll_profiles_fresh,
@@ -1099,7 +1100,12 @@ async def _serve_ws(
                 # (fail closed) — no non-owner-driven credentialed probe.
                 if owner_request:
                     schedule_visibility_refresh(urls, state.push_slots_update)
-                    schedule_check_refresh(urls, state.push_slots_update)
+                    # Idle slots' chips (every restored tab, until it is opened
+                    # or runs a turn) go to the slow tier, so a reconnect does
+                    # not re-read the whole sidebar history.
+                    schedule_tiered_check_refresh(
+                        urls, state.idle_source_link_urls(), state.push_slots_update
+                    )
     except Exception:
         pass
 
@@ -1223,7 +1229,15 @@ async def _serve_ws(
                     # read-only via is_repo_public. No non-owner-driven
                     # credentialed provider read.
                     schedule_visibility_refresh(urls, state.push_slots_update)
-                    schedule_check_refresh(urls, state.push_slots_update)
+                    # Two tiers. Chips on slots in use (a turn running, or a turn
+                    # ended / the owner opened it recently) keep the chip TTL.
+                    # Chips only idle slots link -- a restored history of tabs --
+                    # go to the idle tier: a slower clock and a small per-TTL
+                    # budget shared by every owner socket, so their cost does
+                    # not grow with the number of tabs ever left open.
+                    schedule_tiered_check_refresh(
+                        urls, state.idle_source_link_urls(), state.push_slots_update
+                    )
                 refresh_round += 1
             except asyncio.CancelledError:
                 raise
@@ -1731,6 +1745,15 @@ async def _serve_ws(
                             state, data.get("slot"), _focus_task, owner=owner_request
                         )
                         if owner_request:
+                            # Warm presence reads the registry's PREVIOUS row, so
+                            # it must run before retention applies this frame.
+                            # Socket-finally cleanup intentionally never calls it.
+                            handle_focus_frame(
+                                state,
+                                id(ws),
+                                data.get("slot"),
+                                hidden=data.get("hidden", False),
+                            )
                             note_foreground(state, id(ws), data.get("slot"))
                     elif msg_type == "slot_read":
                         _relayed = _handle_slot_read(

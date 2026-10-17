@@ -109,14 +109,14 @@ describe('the facade composition', () => {
   // The owner hooks in the order the facade calls them. Each sits where its block sat
   // before the owners were extracted, which is what keeps React's effect order.
   const CALL_ORDER = [
-    'useSessionSources', 'useDebouncedSessionSearch', 'useSessionRename', 'useSessionAutoTitle', 'useSidebarLane',
-    'useSessionFilterState', 'useSessionStatusFilters', 'useHistoryPane', 'usePinnedSessionOrder',
+    'useSessionSources', 'useDebouncedSessionSearch', 'useSessionRename', 'useSessionAutoTitle', 'useSessionSort', 'useSidebarLane',
+    'useSessionFilterState', 'useSessionStatusFilters', 'useHistoryPane', 'useSessionCleanup', 'useBulkModelSwitch', 'usePinnedSessionOrder',
     'useStaleCollapse', 'useFolderSort', 'useFolderRename', 'useSidebarTags',
     'useSidebarModels', 'useBoardColumns', 'useSidebarResize', 'useFullTitlesOnScrollSetting', 'usePinnedOrderAuthority', 'useColumnPopover', 'useBoardColumnMutations',
     'useColumnMatches', 'useFolderVisibility', 'useStaleMoveWatcher', 'useSearchMatches',
     'useCollapsedCrews', 'useCollapsedCrewSpaces', 'useCrewEnable', 'useHoverHold', 'useLineageAvailable', 'useHoverPinLiveness', 'useStaleNarrowBridge',
     'useFolderFilterReveal', 'useConductorLane', 'useLaneCycle', 'useSidebarScrollPeek', 'useShortcutOrder',
-    'useFolderFilterRows', 'useFolderMutations', 'useHoldPinnedHeaderOnCollapse', 'useBoardFolderCollapse',
+    'useFolderFilterRows', 'useFolderMutations', 'useHoldPinnedHeaderOnCollapse', 'useRowAnimSettled', 'useBoardFolderCollapse',
     'useNativeSessionDrag', 'useFolderDropOps',
     'useFolderTree', 'useSidebarReveal', 'useSidebarMoveUndo', 'useSidebarDragHandlers',
     'useFolderChatCreate', 'useSessionCreate', 'usePinnedKeyboardReorder', 'useRootFolderLanes',

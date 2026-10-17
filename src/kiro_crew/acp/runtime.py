@@ -52,6 +52,7 @@ from kiro_crew.acp._dispatch import (
     set_mode_params,
 )
 from kiro_crew.acp._frame_record import record_frame
+from kiro_crew.acp.agent_env import agent_env_overlay
 from kiro_crew.acp.client import (
     _apply_pod_home_remap,
     _is_safe_oauth_url,
@@ -182,6 +183,7 @@ from kiro_crew.config import live
 from kiro_crew.config.paths import data_home, kiro_agents_dir
 from kiro_crew.constants import (
     INITIALIZE_TIMEOUT_SECS,
+    KIROCREW_RUNTIME_AGENT_ENV,
     KIROCREW_SPAWN_HOME_ENV,
     KIROCREW_SPAWN_INSTANCE_ENV,
 )
@@ -768,7 +770,7 @@ async def _prepare_projection_to_completion(
 # unbounded STEADY STATE, not a burst. Measured on an operator host: ~60
 # lines/second for 6+ hours from one gateway PID, taking 33–59% of every
 # gateway.log rotation — which, at RotatingFileHandler(maxBytes=2MB,
-# backupCount=3) (see cli.py), rolls the genuine diagnostics needed for an
+# backupCount=3) (see cli_logging.py), rolls the genuine diagnostics needed for an
 # incident out of the retained 8MB window before anyone can read them.
 #
 # So the per-frame line is collapsed into a periodic count keyed by
@@ -966,6 +968,9 @@ class _MirroredSessionMcp(NamedTuple):
     it costs session start no scheduling point of its own (H13). ``None`` when the
     spec is unreadable, which the guard treats as nothing to say.
     """
+    agent_spec: Any = None
+    """The parsed spec the array was built from. A member session's loaded-check
+    compares THIS, never a later read of the file, against its saved intent."""
 
 
 def _point_private_state_at_scratch(
@@ -1069,6 +1074,7 @@ def _launch_tools() -> LaunchTools:
         bind_voice_safe_agent_workspace_async=bind_voice_safe_agent_workspace_async,
         create_subprocess_limited=create_subprocess_limited,
         retrying_spawn_factory=_retrying_spawn_factory,
+        agent_env_overlay=agent_env_overlay,
     )
 
 
@@ -2211,7 +2217,7 @@ class AcpRuntime:
                         # disabled ``skill_search`` -- and says so in a sentence
                         # that names the spec and the remedy. That sentence is
                         # the user's, so it travels as the error the startup
-                        # paths translate (``providers/acp.py`` handles
+                        # paths translate (``providers/acp_runtime_start.py`` handles
                         # ``AcpRuntimeError`` around ``spawn()``); a bare
                         # ``ValueError`` would leave ``spawn()`` as an internal
                         # failure with the actionable text unread. ``spawn_agent``
@@ -2376,6 +2382,18 @@ class AcpRuntime:
             # whose home is absent or differs, since the orphan-sweep marker is
             # shared by every install on this uid.
             env[KIROCREW_SPAWN_HOME_ENV] = str(data_home())
+            # Which authored agent it is spawned for -- the same name the spawn
+            # log line carries. A host that binds its agent over the wire (the KAS
+            # relay) shows no ``--agent`` in argv, so the environment is the one
+            # place a reader of /proc can learn which agent a live runtime runs;
+            # the process-leak gate reads it to tell the gateway's own background
+            # runtime from a session's. ``_agent`` is the authored name by this
+            # point (a stored skill-view alias is mapped back at spawn), so the
+            # value never needs the projection lookup to resolve.
+            if self._agent:
+                env[KIROCREW_RUNTIME_AGENT_ENV] = self._agent
+            else:
+                env.pop(KIROCREW_RUNTIME_AGENT_ENV, None)
 
         def _env_after_scratch(env: dict[str, str]) -> None:
             # A host whose state cannot be shared between processes (codex's SQLite
@@ -2419,7 +2437,7 @@ class AcpRuntime:
         # The subprocess is LIVE from here on but nothing has recorded it yet, so
         # this window needs the same guard AcpClient._spawn has. finish_suspended_spawn
         # documents its own resume failure as FATAL, and the identity read can fail;
-        # all four runtime.spawn() callers (providers/acp.py:726, :825 catch
+        # all four runtime.spawn() callers (providers/acp_runtime_start.py twice, catching
         # AcpRuntimeError; session.py:1416, :1490 catch AcpRuntimeDead) let anything
         # else through, so a raise here left a live process absent from both PID
         # files -- unreachable by every agent-runtime reaper and leaking until the
@@ -5419,6 +5437,7 @@ class AcpRuntime:
         request_id: str | int,
         *,
         before_write: Callable[[], None] | None = None,
+        withdrawal_check: Callable[[], None] | None = None,
     ) -> None:
         """Write a response/error frame under the write lock and a no-progress bound.
 
@@ -5434,24 +5453,27 @@ class AcpRuntime:
         ``AcpProcessDied`` so the caller takes the same session-reset +
         bounded-requeue recovery the broken-pipe case uses. The request id
         appears only through ``_loggable_request_id``. A caller's
-        ``before_write`` runs under the lock after the dead-runtime check.
+        ``before_write`` runs under the lock after the dead-runtime check, and
+        its ``withdrawal_check`` ahead of it (see :meth:`send_response`).
         """
         assert self._process is not None and self._process.stdin is not None
-        if before_write is None:
-            under_lock: Callable[[], None] = self._refuse_write_if_dead
-        else:
-            caller_check = before_write
 
-            def under_lock() -> None:
-                self._refuse_write_if_dead()
-                caller_check()
+        def checks() -> None:
+            # A frame its caller withdrew is not written, whatever the pipe's
+            # state; the caller's other check is read on a live runtime only, so
+            # a runtime that died while this writer waited reports the death.
+            if withdrawal_check is not None:
+                withdrawal_check()
+            self._refuse_write_if_dead()
+            if before_write is not None:
+                before_write()
 
         if await write_response_frame_bounded(
             self._process.stdin,
             self._stdin_write_lock(),
             data,
             bound_secs=_RESPONSE_WRITE_BOUND_SECS,
-            before_write=under_lock,
+            before_write=checks,
         ):
             return
         safe_id = _loggable_request_id(request_id)
@@ -5652,12 +5674,15 @@ class AcpRuntime:
         result: dict[str, Any],
         *,
         before_write: Callable[[], None] | None = None,
+        withdrawal_check: Callable[[], None] | None = None,
     ) -> None:
         """Send a JSON-RPC response (for server→client requests like permission).
 
         ``before_write`` runs under the write lock right before the frame is
         written, after the dead-runtime check, and may raise to abort the write
-        with nothing written.
+        with nothing written. ``withdrawal_check`` runs under the same lock ahead
+        of the dead-runtime check and may raise the same way: a frame its caller
+        withdrew is not written, whatever the pipe's state.
         """
         if not self._process or not self._process.stdin:
             raise AcpRuntimeDead("process not running")
@@ -5668,12 +5693,12 @@ class AcpRuntime:
         data = json.dumps(msg) + "\n"
 
         try:
-            if before_write is None:
-                await self._write_response_bounded(data.encode(), request_id)
-            else:
-                await self._write_response_bounded(
-                    data.encode(), request_id, before_write=before_write
-                )
+            await self._write_response_bounded(
+                data.encode(),
+                request_id,
+                before_write=before_write,
+                withdrawal_check=withdrawal_check,
+            )
         except (BrokenPipeError, ConnectionResetError) as exc:
             self._mark_dead(f"pipe broken: {exc}")
             raise AcpRuntimeDead(f"pipe broken: {exc}") from exc
@@ -6118,7 +6143,12 @@ class AcpRuntime:
                 markdown_spec_for_agent, spawn_agent, self._work_dir
             )
             if markdown_spec is not None:
-                capable = ", ".join(repr(b) for b in sorted(ACP_BACKENDS_MARKDOWN_AGENT_SPECS))
+                from kiro_crew.acp_backends import backend_to_stored
+
+                capable = ", ".join(
+                    repr(b)
+                    for b in sorted(map(backend_to_stored, ACP_BACKENDS_MARKDOWN_AGENT_SPECS))
+                )
                 return (
                     f"{spawn_agent!r} is defined in markdown ({markdown_spec.name}); the "
                     f"{self._harness.backend or 'kiro'!r} backend loads JSON agent specs "
@@ -6217,6 +6247,15 @@ class AcpRuntime:
         model = (params or {}).get("model")
         if isinstance(model, str) and model.strip():
             self._switched_model_record()[session_id] = model.strip()
+
+    def take_switched_model(self, session_id: str) -> str:
+        """Remove and return the model recorded for *session_id*, or ``""``.
+
+        For a session handle whose ``set_mode`` switches a live session's agent:
+        it clears the record before sending, so only that activation's frame is
+        read back, and takes it before the next turn.
+        """
+        return self._switched_model_record().pop(session_id, "")
 
     async def _served_default_after_mode(self, handle: AcpSessionHandle, session_id: str) -> None:
         """Re-run the served-default check for the model ``set_mode`` just applied.
@@ -6348,7 +6387,11 @@ class AcpRuntime:
             projection_now: Any = None
             used_generation = 0
             if getattr(self, "_native_skill_projection", None) is not None:
-                from kiro_crew.acp.skill_projection import prepare_native_skill_projection
+                from kiro_crew.acp.skill_projection import (
+                    CrossProcessProjectionLockTimeout,
+                    InProcessProjectionWaitTimeout,
+                    prepare_native_skill_projection,
+                )
 
                 # Preparation and adoption run under the per-runtime projection
                 # lock, so overlapping starts read the specs in the order their
@@ -6360,8 +6403,12 @@ class AcpRuntime:
                     try:
                         # Keep the transport mode selected at spawn for this process.
                         # The rollback environment switch takes effect after restart.
+                        lock_errors: list[OSError] = []
                         prepared, cancelled = await _prepare_projection_to_completion(
-                            prepare_native_skill_projection, self._work_dir, enabled=True
+                            prepare_native_skill_projection,
+                            self._work_dir,
+                            enabled=True,
+                            on_lock_unavailable=lock_errors.append,
                         )
                         if prepared is not None:
                             # set_mode always names the FRESH alias, never an older
@@ -6398,12 +6445,30 @@ class AcpRuntime:
                                 "refusing to start agent %r on a view it cannot verify",
                                 mode_agent,
                             )
+                            # Name a holder only when the preparer proved one: its
+                            # in-process wait timing out means another start in THIS
+                            # gateway; the alias file lock timing out means another
+                            # process. Anything else (a bad lock file, the settings
+                            # lock, a lease, a failed write) names no holder.
+                            if any(
+                                isinstance(e, InProcessProjectionWaitTimeout) for e in lock_errors
+                            ):
+                                held_by = (
+                                    "another session start in this gateway still "
+                                    "held the skill-view lock"
+                                )
+                            elif any(
+                                isinstance(e, CrossProcessProjectionLockTimeout)
+                                for e in lock_errors
+                            ):
+                                held_by = "the skill-view lock is held by another Kiro Crew process"
+                            else:
+                                held_by = "a lock or file it needs was unavailable"
                             raise AcpRuntimeError(
                                 f"Agent {mode_agent!r}: its skill view could not be "
-                                "prepared (the skill-view lock is held by another Kiro "
-                                "Crew process), so this session was not started. Try "
-                                "again in a moment; if it keeps failing, restart the "
-                                "gateway."
+                                f"prepared ({held_by}), so this session was not "
+                                "started. Try again in a moment; if it keeps failing, "
+                                "restart the gateway."
                             )
                     finally:
                         if not adopted:
@@ -6956,6 +7021,7 @@ class AcpRuntime:
             stub_token=stub_token,
             derived_spec_snapshot=projection.derived_spec_snapshot,
             ref_spec=ref_spec,
+            agent_spec=projection.agent_spec,
         )
 
     def _mirrored_spec_check_needed(self, snapshot: Any) -> bool:
@@ -6967,6 +7033,28 @@ class AcpRuntime:
         H13 requirement that keeps the array decision a synchronous read.
         """
         return snapshot is not None
+
+    def _member_projection_needs_confirmation(self, mirror_used: bool) -> bool:
+        """Whether this start must confirm the array a mirror built. Synchronous.
+
+        Asks about the ARRAY's origin, never about the derived spec: a member's own
+        saved template is not a derived agent, so ``require_fresh_derived_spec``
+        answers ``None`` for it and its ``derived_spec_snapshot`` is None while the
+        mirror still built the session's array from it. Keying the confirmation on
+        that snapshot -- the freshness bracket's own question -- skipped every
+        non-derived member, whose session then carried an empty
+        ``confirmed_projection_template`` for ``loaded_stamp`` to refuse as
+        ``capability_runtime_unverified``.
+
+        The member read keeps a non-member session on a mirrored host byte-identical
+        to before (``create_session``'s docstring promises as much for an empty
+        ``member_session_key``), and *mirror_used* is False on every host with no
+        mirror, so the kiro construction path takes no step of its own (H13). It is
+        a decision about the start, not about the spec's bytes: a member whose
+        projection consumed no spec at all is still confirmed, and refused by
+        :func:`~kiro_crew.agent_capabilities_consumed.confirm_consumed_projection`.
+        """
+        return mirror_used and bool(self._member_context)
 
     async def _require_unchanged_mirrored_spec(self, session_id: str, snapshot: Any) -> None:
         """End the session when the spec it was built from changed under it.
@@ -6993,6 +7081,38 @@ class AcpRuntime:
             # bracket terminates rather than returns).
             await self.terminate_session(session_id)
             raise AcpRuntimeError(str(exc)) from exc
+
+    async def _confirm_member_projection(self, handle: AcpSessionHandle) -> None:
+        """Refuse a member session whose consumed projection is not the saved intent.
+
+        Called from the adapter-only session permission-routing body for a member
+        whose array a mirror built. Kiro and KAS return before that body (H13).
+        The runtime records the consumed spec on *handle* from the session's array,
+        never from a re-read of the file after startup. A member session
+        whose array was withheld or built from a different spec than the saved intent
+        is refused; a session with no saved intent has nothing to confirm.
+        """
+        if not self._member_context:
+            return
+        from kiro_crew.acp.transport_errors import AcpError
+        from kiro_crew.agent_capabilities import CapabilityError
+        from kiro_crew.agent_capabilities_consumed import confirm_consumed_projection
+
+        try:
+            gaps = await asyncio.to_thread(
+                confirm_consumed_projection, self._agent, handle.consumed_agent_spec
+            )
+        except CapabilityError as exc:
+            # session/new (or session/load) already succeeded, so the shared
+            # process holds this session; a plain local unregister would leak it
+            # (the same reason the mirrored-spec bracket terminates rather than
+            # returns).
+            await self.terminate_session(handle.session_id)
+            raise AcpError(f"{exc.code}: saved spec projection could not be confirmed") from exc
+        if gaps is None:
+            return
+        handle.confirmed_projection_template = self._agent
+        handle.capability_projection_gaps = gaps
 
     async def _own_stub_session(
         self, entries: list[dict[str, Any]], session_key: str
@@ -7245,7 +7365,12 @@ class AcpRuntime:
         # spec declared. One call either way -- no path resolves it twice.
         session_work_dir = await self._session_work_dir(cwd)
         denied_tools: frozenset[tuple[str, str]] = frozenset()
+        # Defined for every path, not just the array-building one: a caller that
+        # supplied its own array never enters the block below, and the member
+        # confirmation asks whether a MIRROR built this session's array.
+        mirrored: Any = None
         mirrored_snapshot: Any = None
+        consumed_spec: Any = None
         ref_spec: Any = None
         if mcp_servers is None:
             # A mirrored host takes its whole array from the mirror; every other host
@@ -7254,7 +7379,6 @@ class AcpRuntime:
             # rather than awaiting an adapter seam (H13). Both branches resolve their
             # own I/O off the event loop: the lookup stats/reads files, and blocking
             # the loop stalls every other session's I/O.
-            mirrored = None
             if has_mirror(self.acp_backend):
                 mirrored = await self._mirrored_session_mcp(
                     agent,
@@ -7267,6 +7391,7 @@ class AcpRuntime:
                 stub_token = mirrored.stub_token
                 denied_tools = mirrored.denied_tools
                 mirrored_snapshot = mirrored.derived_spec_snapshot
+                consumed_spec = mirrored.agent_spec
                 ref_spec = mirrored.ref_spec
             else:
                 pooled, ref_spec = await asyncio.to_thread(
@@ -7484,6 +7609,8 @@ class AcpRuntime:
                 stub_token=stub_token,
                 denied_tools=denied_tools,
                 mirrored_snapshot=mirrored_snapshot,
+                consumed_spec=consumed_spec,
+                mirror_used=mirrored is not None,
                 ref_spec=ref_spec,
                 active_agent=active_agent,
                 session_work_dir=session_work_dir,
@@ -7517,6 +7644,8 @@ class AcpRuntime:
             stub_token=stub_token,
             denied_tools=denied_tools,
             mirrored_snapshot=mirrored_snapshot,
+            consumed_spec=consumed_spec,
+            mirror_used=mirrored is not None,
             ref_spec=ref_spec,
             active_agent=active_agent,
             session_work_dir=session_work_dir,
@@ -7539,6 +7668,8 @@ class AcpRuntime:
         stub_token: str,
         denied_tools: frozenset[tuple[str, str]],
         mirrored_snapshot: Any,
+        consumed_spec: Any = None,
+        mirror_used: bool = False,
         ref_spec: Any,
         active_agent: str,
         session_work_dir: str | Path,
@@ -7624,6 +7755,8 @@ class AcpRuntime:
                     stub_token=stub_token,
                     denied_tools=denied_tools,
                     mirrored_snapshot=mirrored_snapshot,
+                    consumed_spec=consumed_spec,
+                    mirror_used=mirror_used,
                     ref_spec=ref_spec,
                     active_agent=active_agent,
                     session_work_dir=session_work_dir,
@@ -7729,6 +7862,8 @@ class AcpRuntime:
         stub_token: str,
         denied_tools: frozenset[tuple[str, str]],
         mirrored_snapshot: Any,
+        consumed_spec: Any = None,
+        mirror_used: bool = False,
         ref_spec: Any,
         active_agent: str,
         session_work_dir: str | Path,
@@ -7776,6 +7911,9 @@ class AcpRuntime:
         # session's permission requests. Empty for a host with no mirror and for a
         # caller-supplied array, and the handle's check is a no-op on empty.
         handle.spec_denied_tools = denied_tools
+        # The spec the array was built from, for a member session's loaded-check.
+        handle.consumed_agent_spec = consumed_spec
+        handle.mirror_used = mirror_used
         # What the registered agent batch grants, recorded by the harness that
         # registered one; a host that took its agent at spawn time records nothing.
         self._harness.record_session_projection(handle, kas_agents, active_agent)
@@ -8150,7 +8288,7 @@ class AcpRuntime:
 
         # Re-declare the pooled broker stubs so a resumed session keeps talking
         # to the broker — same injection as create_session() and the AcpClient
-        # resume path (client.py). session/load re-initializes the session's MCP
+        # resume path (client_start.py). session/load re-initializes the session's MCP
         # servers (see the budget note below), so an empty list here is APPLIED,
         # not ignored: the stubs stop shadowing the agent spec's same-named
         # entries and kiro-cli spawns its own copy of every pooled server,
@@ -8163,6 +8301,7 @@ class AcpRuntime:
         session_work_dir = str(await self._session_work_dir(cwd))
         denied_tools: frozenset[tuple[str, str]] = frozenset()
         mirrored_snapshot: Any = None
+        consumed_spec: Any = None
         ref_spec: Any = None
         # A mirrored host re-declares the array its projection built, not the raw
         # pooled one: session/load re-initializes the session's servers, so an
@@ -8187,6 +8326,7 @@ class AcpRuntime:
             stub_token = mirrored.stub_token
             denied_tools = mirrored.denied_tools
             mirrored_snapshot = mirrored.derived_spec_snapshot
+            consumed_spec = mirrored.agent_spec
             ref_spec = mirrored.ref_spec
         else:
             pooled, ref_spec = await asyncio.to_thread(
@@ -8382,9 +8522,14 @@ class AcpRuntime:
         # Mirrors create_session: the resumed session's own stub token.
         handle.stub_session_token = stub_token
         handle.member_dispatch_mounted = member_mounted
+        # A fresh handle has no baseline for the restored ledger, whose counter
+        # already carries the session's earlier spend.
+        handle.last_prompt_stats.restore_cost_session(resume_sid)
         # Mirrors create_session: the resumed session re-declares the array, so it
         # re-derives the deny set that array came with and re-checks the generation.
         handle.spec_denied_tools = denied_tools
+        handle.consumed_agent_spec = consumed_spec
+        handle.mirror_used = mirrored is not None
         # Mirrors create_session: the re-registered batch is what this session now
         # runs.
         self._harness.record_session_projection(handle, kas_agents, active_agent)

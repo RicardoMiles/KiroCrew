@@ -5,14 +5,14 @@ another one, change its model, reload its agent process, and take another one un
 the sidebar. The tools come from the
 `kirocrew-dashboard` MCP server, so an agent that does not mount that server
 never has them — exactly like any other MCP server. This page is the reference
-for all 35 of its tools, written for the agent that is about to use them.
+for all 36 of its tools, written for the agent that is about to use them.
 
 The server is defined in `src/kiro_crew/mcp_dashboard.py`. Two halves:
 
 - **Session control** — `session_create`, `session_fork`, `session_send`,
   `session_read_message`, `session_summary`, `session_stop`, `session_end_wait`, `session_retry`,
   `session_continue`, `session_set_model`, `session_reload`, `session_rename`, `session_generate_title`, `session_close`, `session_revive`,
-  `session_broadcast`, `session_status`, `session_adopt`, `session_release`,
+  `session_history_list`, `session_broadcast`, `session_status`, `session_adopt`, `session_release`,
   `session_move_to_column`. These reach another session.
 - **Sidebar shape** — `chat_folder_tree`, `chat_folder_create`,
   `chat_folder_move`, `chat_folder_update`, `chat_folder_move_session`, `chat_folder_delete`,
@@ -45,11 +45,26 @@ conductor: a session that can dispatch but cannot edit a file. Always pass
 
 | Argument | Required | Meaning |
 |---|---|---|
-| `title` | no | Short sidebar name. Say what the session is FOR |
+| `title` | no | Short sidebar name. Say what the session is FOR. Follows `session_rename`'s character rules (`invalid_title`), then is cut to 200 characters; a title whose first 200 characters show nothing is refused |
 | `agent` | no (but always pass it) | Agent to bind the session to |
 | `agent_kind` | no | One value, `template`: run the shared template `agent` names on your own memory, even when a crewmate carries the same name. Omit for name-first resolution (a crewmate wins, with its own memory). Always pass it for `kirocrew-worker`, which needs no memory of its own. Requires `agent` (`agent_kind_requires_agent` otherwise); a kind that does not resolve is refused `agent_unresolved` rather than falling back to whoever answers by default |
 | `folder` | no | Sidebar folder id or `/`-separated path to file it into, atomically with creation. Missing path segments are created (`mkdir -p`). The create is checked first, so a create that would be refused normally leaves no new empty folder behind (a race can still leave one) |
-| `model` | no | Model the session starts on, pinned as if the person picked it in the model dropdown (same guard; refused with `model_rejected` when the picker would refuse it). Omit for the agent's or global default |
+| `model` | no | Model the session starts on, pinned as if the person picked it in the model dropdown (same guard; refused with `model_rejected` when the picker would refuse it). Omit to inherit, as below |
+| `reasoning_effort` | no | Reasoning effort the session starts at, one of the five standard levels: `low`, `medium`, `high`, `xhigh`, `max`. Any other value is refused with `effort_rejected` before anything is created. Omit to inherit, as below |
+
+An omitted `model` or `reasoning_effort` inherits from you when you are a
+crewmate: your profile's worker pair (`worker_model` / `worker_reasoning_effort`)
+when set, else your own model and effort, else the agent's or the global
+default. Your own effort carries over only while the child runs your own model:
+under a `worker_model` or a `model` you name, the only level it takes is
+`worker_reasoning_effort`. A caller that is not a crewmate (a template worker a
+crewmate dispatched is not one) gets the agent's or the global default. A child
+that is itself a crewmate (an `agent` naming one) runs its own profile and
+inherits nothing. A stale inherited model, one the picker would refuse or the
+worker's harness does not serve, is dropped rather than refused: the child
+starts on the default model. A model you name yourself is still refused with
+`model_rejected`. The reply names what came from your profile, and says so when
+the inherited model was dropped.
 
 No argument is formally required. The new session **starts empty** — nothing runs
 in it until the person types, or until you send it a message. The reply carries
@@ -71,7 +86,7 @@ use `session_fork` instead.
 | Argument | Required | Meaning |
 |---|---|---|
 | `source` | no | The session to copy from: a session key, slot key, or its exact unique title. Omit to fork **your own** session |
-| `title` | no | Short sidebar name, kept as given. Omit to start from `Fork of <source title>`, which is then renamed automatically after the latest question the copy holds |
+| `title` | no | Short sidebar name, kept as given within `session_create`'s title rules. Omit to start from `Fork of <source title>`, which is then renamed automatically after the latest question the copy holds |
 | `folder` | no | Sidebar folder id or `/`-separated path, created if missing (`mkdir -p`), as for `session_create`. Omit to leave the child in the source's folder |
 | `at_message_index` | no | Fork point: the position of the LAST message to carry, counting the source's user and assistant messages from 0. Omit to carry the whole transcript |
 
@@ -625,6 +640,23 @@ Refusals only a revive gives:
 | `reopen_failed` | HTTP 503: the session could not be reopened. Try again |
 | `reopen_rollback_failed` | HTTP 503: the revive was refused but the session's closed mark could not be put back, so it may come back as open. Close it again from the History tab |
 
+### `session_history_list`
+
+| Argument | Required | Meaning |
+|---|---|---|
+| `folder` | no | Only sessions filed in this folder: an id or `/`-separated path. Resolved read-only; an unknown folder is refused, never created |
+| `limit` | no | Most rows to return, 1 to 100 (default 20). The reply says when more exist |
+
+Lists archived sessions newest first, one row each: the slot key `session_revive`
+takes, the title, the last activity time and the folder id. Read-only. A row is
+listed only when `session_revive` would accept that session for this caller, so
+the same containment applies: same workspace, persistent memory mode (incognito
+and temporary sessions never appear), no app-scoped, channel-linked or mirrored
+sessions, no crew member DM threads or scheduled runs. An ownership-fenced caller
+sees only sessions it created, corroborated by the crew-log lineage as for a
+revive; with the log off such a caller gets an empty list, not an error. Live
+sessions are not listed; `chat_folder_tree` shows those.
+
 ### `session_rename`
 
 | Argument | Required | Meaning |
@@ -653,11 +685,15 @@ rather than cut down (`invalid_title`). The
 zero-width joiner and non-joiner and the tag characters stay allowed, because
 emoji sequences, flag emoji and scripts such as Persian need them. The stored title
 passes through `_scrub_text`, the scrub the dashboard applies to stored fields.
-It redacts credentials and exfiltration URLs like a `session_create` title, and
-a secret split by an invisible character (such as a zero-width joiner) is still
-redacted. A title that redaction lengthens past 200 characters is refused
-(`invalid_title`) rather than cut, so a stored title never holds a torn
-`[REDACTED]` marker.
+It redacts credentials and exfiltration URLs, and a secret split by an
+invisible character (such as a zero-width joiner) is still redacted. A title
+that redaction lengthens past 200 characters is refused (`invalid_title`)
+rather than cut, so a stored title never holds a torn `[REDACTED]` marker.
+
+`session_create` and `session_fork` titles follow the same character rules and
+the same scrub. Two things differ, because their title is optional: a blank
+title means no title, and a title over 200 characters is cut after the scrub
+rather than refused.
 
 If the new title cannot be written to the session's history right away, the call
 fails with `title_persist_failed`. The sidebar already shows the new title, and
@@ -883,7 +919,7 @@ gateway-issued key counts. Refusals you should expect, by code:
 | `invalid_agent_kind` | `agent_kind` is not `template`, the one value it takes |
 | `model_owner_only` | HTTP 403: `auto` and **Auto (Jev)** can only be picked by the owner from the model picker |
 | `model_rejected` | The model id is missing, malformed, looks like a credential, or is one the target's backend would refuse |
-| `effort_rejected` | session_set_model: `reasoning_effort` is not one of the five standard levels (low, medium, high, xhigh, max). `""` is refused too; set it from the target's effort dropdown |
+| `effort_rejected` | session_create or session_set_model: `reasoning_effort` is not one of the five standard levels (low, medium, high, xhigh, max). On session_set_model `""` is refused too; set it from the target's effort dropdown |
 | `target_replaced` | HTTP 409: the target was replaced by another session under the same key while the call ran (or, for title generation, closed); nothing was changed. Try again |
 | `title_rate_limited` | HTTP 429, title generation only: that target's title was generated less than 5 minutes ago |
 | `invalid_field_type` | An argument had the wrong type (for example a broadcast target list that is not a list of strings) |

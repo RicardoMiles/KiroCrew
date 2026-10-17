@@ -106,7 +106,7 @@ Not a goal:
 - MCP servers the gateway does not front. Without a pooled backend there is
   nothing for a holder to attach to.
 - Sessions without a dashboard slot, in the first version. `dashboard_slot_key`
-  returns an empty string for them (`src/kiro_crew/dashboard/chat_utils.py`).
+  returns an empty string for them (`src/kiro_crew/dashboard/chat_utils_slots.py`).
 - Changing how kiro-cli's own subscriptions behave.
 
 ## 4. Design
@@ -152,7 +152,7 @@ carries the session key, the session type derived from it, the gateway process's
 sets the holder connection's caller from it (`src/kiro_crew/mcp_gateway/daemon/control.py`,
 `_caller_from_register` in `daemon/identity.py`). The session token does not need
 to survive a restart. It is minted per client in `AcpClient.__init__`
-(`mint_stub_session_token` in `claim.py`, called from `src/kiro_crew/acp/client.py`),
+(`mint_stub_session_token` in `claim.py`, called from `src/kiro_crew/acp/client_class.py`),
 so a session's kiro-cli started after a restart is a fresh client with a fresh
 token, and the daemon's token-to-caller bindings live only in the daemon process
 (`_TOKEN_BINDINGS` in `daemon/identity.py`) and are gone after a restart. What
@@ -298,7 +298,7 @@ Two things depart from the webhook RFC, and this RFC records them as decisions:
   pauses and reports, as the webhook RFC §13 requires.
 - The gateway's own limits still apply: 1,024 subscriptions per stub
   (`_RESOURCE_SUBSCRIPTIONS_MAX_PER_STUB`) and 8,192 characters per URI
-  (`_RESOURCE_URI_MAX_LEN`), both in `backend.py`.
+  (`_RESOURCE_URI_MAX_LEN`), both in `backend_leases.py`.
 - A holder keeps its backend's refcount above zero, so the backend is never evicted
   while subscribed. A backend with refcount above zero is never an eviction
   target, and a spawn into a full pool is refused with a `capacity` rejection

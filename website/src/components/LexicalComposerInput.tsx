@@ -353,7 +353,10 @@ function ControlledValuePlugin({
 }) {
   const [editor] = useLexicalComposerContext()
 
-  useEffect(() => {
+  // Layout effect: a parent-pushed value reaches the editor in the commit
+  // that renders it, before the host's undo recorder (a layout effect of an
+  // ancestor, so it runs after this one) reads the caret for that value.
+  useLayoutEffect(() => {
     const emitted = lastEmittedRef.current
     if (emitted.value === value && sameBlocks(emitted.blocks, blocks)) return
     let current = { value: '', blocks: [] as PasteBlock[] }
@@ -650,6 +653,9 @@ function InteractionPlugin({
       const cursor = livePromptHistoryCursor(historyCursorRef.current, current)
       historyCursorRef.current = cursor
       if (direction === 'up' && current !== '' && selection.start !== 0) return false
+      // A held ↑ scrolling up through the user's own draft stops at its start;
+      // a fresh press recalls, and a held ↑ keeps walking recalled prompts.
+      if (direction === 'up' && event.repeat && !cursor && current !== '') return false
       if (direction === 'down' && selection.end !== current.length) return false
       const step = stepPromptHistory(sentMessages, cursor, direction === 'up' ? 'older' : 'newer', current)
       if (!step) return false

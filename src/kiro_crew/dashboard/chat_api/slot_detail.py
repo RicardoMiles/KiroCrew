@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 from aiohttp import web
 
 if TYPE_CHECKING:
+    from kiro_crew.dashboard import display_verdicts
     from kiro_crew.dashboard.chat_handlers import (
         _FLUSH_SNAPSHOT_RETRIES,
         _TRANSIENT_ROLES,
@@ -43,6 +44,7 @@ if TYPE_CHECKING:
         remember_unknown_row_fields,
         slot_history_key,
         slot_not_found,
+        stop_declined_armed,
     )
 
 
@@ -56,9 +58,9 @@ async def api_chat_slots(request: web.Request) -> web.Response:
     from kiro_crew.dashboard.handlers.source_providers import (
         ensure_gitlab_hosts_loaded,
         is_owner_dashboard_request,
-        schedule_check_refresh,
         schedule_visibility_refresh,
     )
+    from kiro_crew.dashboard.source_providers.chip_refresh import schedule_tiered_check_refresh
 
     # Same warm-up as the WebSocket connect path: slot source-link extraction is
     # synchronous and cannot load the self-managed GitLab allowlist itself, so a
@@ -105,7 +107,11 @@ async def api_chat_slots(request: web.Request) -> web.Response:
         ]
         if urls:
             schedule_visibility_refresh(urls, state.push_slots_update)
-            schedule_check_refresh(urls, state.push_slots_update)
+            # Same two tiers as the owner WebSocket driver: a sidebar fetch must
+            # not re-read every restored tab's chips at the fast cadence.
+            schedule_tiered_check_refresh(
+                urls, state.idle_source_link_urls(), state.push_slots_update
+            )
     # Same offender diagnostic as the slots broadcast, on the same
     # projection: ``web.json_response`` would run this exact dump internally and
     # raise a bare TypeError naming neither slot nor field. Dump here so the
@@ -298,7 +304,7 @@ def _same_persisted_body(
 
     Applying the transform is also what separates a persisted row from a foreign
     row that merely shares a ``ts``: on a coarse clock two writers flooring off the
-    same previous row both emit ``previous + 1µs`` (``history.py:1179-1219``), so
+    same previous row both emit ``previous + 1µs`` (``history_schema.monotonic_transcript_ts``), so
     matching on ``ts`` alone treats an unrelated row as the window's own and drops
     an un-flushed message from a response the client uses as a replacement.
 
@@ -337,7 +343,7 @@ def _is_answered_permission(m: dict) -> bool:
     moves it after them and the rendered order does not match what happened.
 
     The decision is written into the row's ``cls`` JSON in place
-    (``state.py`` ``_mark_permission_resolved``), which is also the only place the
+    (``state_parts/transcript_rows.py`` ``_mark_permission_resolved``), which is also the only place the
     stale-sweep and the slot resolver read it, so ``cls`` is the single source of
     truth here. Truthiness rather than key presence mirrors the client's own
     ``!meta.resolved`` test (``store/chat/selectors.ts`` ``selectSlotPendingApproval``), so an
@@ -443,7 +449,7 @@ def _append_unflushed_tail_from_offset(
     A row matches on role plus content, compared through the redaction transform
     on both sides (``_same_persisted_body``). A shared ``ts`` is never SUFFICIENT —
     on a coarse clock two writers flooring off the same previous row both emit
-    ``previous + 1µs`` (``history.py:1179-1219``), so accepting it alone drops an
+    ``previous + 1µs`` (``history_schema.monotonic_transcript_ts``), so accepting it alone drops an
     un-flushed message — but it is REQUIRED on the redaction-equivalent branch,
     where the only legitimate pair is a row and its own copy and the stamp is
     carried through verbatim.
@@ -618,7 +624,7 @@ def _append_unflushed_tail_from_offset(
         # mirrors it.
         #
         # Two symptoms, one cause. A trailing ``done`` reaches the bounded response and
-        # ``_prepare_messages`` then drops it while rendering (``chat_utils.py``), so a
+        # ``_prepare_messages`` then drops it while rendering (``chat_utils_display.py``), so a
         # page whose only row is that ``done`` renders EMPTY and replaces the transcript.
         # A trailing answered ``permission`` is instead re-ordered after every persisted
         # row -- the misordering ``_is_answered_permission`` exists to prevent.
@@ -751,6 +757,33 @@ def _bounded_slot_page(
     return messages, total, start > 0, start
 
 
+def _note_owner_focus(request: web.Request, state: "DashboardState", key: str) -> None:
+    """The owner opened this session: keep its chips fresh, starting now.
+
+    The slot's PR/MR chips move to the fast tier of the periodic driver for a
+    while, and any of them older than the chip TTL is re-read now -- a restored
+    tab otherwise sits on the idle tier's slow clock while the owner looks at it.
+    Owner only, like every path that drives a credentialed provider read, and
+    best-effort: it must never fail the transcript read it rides on.
+    """
+    from kiro_crew.dashboard.handlers.source_providers import (
+        is_owner_dashboard_request,
+        schedule_check_refresh,
+        schedule_visibility_refresh,
+    )
+
+    try:
+        if not is_owner_dashboard_request(request):
+            return
+        state.note_source_activity(key)
+        urls = state.source_link_urls_for_slot(key)
+        if urls:
+            schedule_visibility_refresh(urls, state.push_slots_update)
+            schedule_check_refresh(urls, state.push_slots_update)
+    except Exception:
+        logger.debug("focus chip refresh failed for %s", key, exc_info=True)
+
+
 async def api_chat_slot_detail(request: web.Request) -> web.Response:
     """GET /api/chat/slots/{slot} — message history for a slot.
 
@@ -760,6 +793,13 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
         no caller asking for 0 wanted exactly one message.
       - ``before``: return messages before this index (legacy pagination, still supported).
         ``before=0`` is valid and yields an empty page.
+      - ``cursor=1``: the response also carries ``cursor`` for an incremental
+        read. ``from`` + ``since`` + ``digest`` echo that cursor back, and the
+        response then holds only the rows from ``since`` on (marked ``delta``)
+        when the reader's copy of the earlier rows is still current, or the full
+        page when it is not. See ``kiro_crew.dashboard.slot_detail_delta``.
+        Either form routes to the paged read and cannot be combined with
+        ``before``.
 
     Either param being a non-integer is a 400, not an uncaught 500 out of the
     handler.
@@ -775,6 +815,7 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
     denied = deny_app_slot_access(request.get("app", ""), slot, name, "slot_detail")
     if denied is not None:
         return denied
+    _note_owner_focus(request, state, name)
 
     limit_raw = request.query.get("limit")
     before_raw = request.query.get("before")
@@ -797,12 +838,28 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "limit must be >= 1", "code": "limit_out_of_range"}, status=400
         )
+    # The incremental-read cursor (``slot_detail_delta``). Imported here, not at
+    # module scope: this function runs on the handlers module's globals.
+    from kiro_crew.dashboard import slot_detail_delta
+
+    try:
+        delta_cursor, cursor_mode = slot_detail_delta.parse_delta_query(request.query)
+    except slot_detail_delta.DeltaQueryError as exc:
+        return web.json_response({"error": str(exc), "code": "invalid_query_params"}, status=400)
+    if cursor_mode and before_raw is not None:
+        # A cursor addresses the newest page; an older page has its own cursor.
+        return web.json_response(
+            {"error": "a cursor read cannot also pass before", "code": "invalid_query_params"},
+            status=400,
+        )
+    # The rows composed: the reader's page, reaching back to its cursor's span.
+    read_limit = slot_detail_delta.read_limit(limit, delta_cursor)
 
     # No limit → load ALL messages (chained across gateway restarts).
     # In-memory slot.messages is authoritative for the current session.
     # _disk_older_count gates whether to read disk AND provides the stable
     # slice boundary (set at restore/resume, never drifts with new messages).
-    if limit_raw is None and before_raw is None:
+    if limit_raw is None and before_raw is None and not cursor_mode:
         mem_msgs = list(slot.messages)
         if slot._disk_older_count > 0 and state.conversation_log:
             history_key = slot_history_key(slot)
@@ -1024,7 +1081,7 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
         # index; the fallback below already serves it from the resident window.
         if state.conversation_log and not requires_full_reader:
             # Imported here, not at module scope: this function runs on the
-            # handlers module's globals (``chat_api.compose``).
+            # handlers module's globals (``_facade_compose.compose``).
             from kiro_crew.dashboard.transcript_snapshot import (
                 PAGE,
                 SNAPSHOT_ATTEMPTS,
@@ -1046,7 +1103,7 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
                         state.conversation_log,
                         paged_slot,
                         history_key,
-                        limit=limit,
+                        limit=read_limit,
                         before=before,
                         snapshot=tail_snapshot,
                         # The count the PAGE witness holds, so the read is measured
@@ -1177,7 +1234,7 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
             all_msgs = await asyncio.to_thread(_collapse_wire_rows, all_msgs)
             total = len(all_msgs)
             end = max(0, min(before, total)) if before is not None else total
-            start = max(0, end - limit)
+            start = max(0, end - read_limit)
             messages = all_msgs[start:end]
             has_more = start > 0
             next_before = start
@@ -1191,6 +1248,7 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
     key = slot.key
     workspace = slot.workspace
     turn_running = slot.turn_running
+    verdict_key = slot_history_key(slot)
     running = slot.running
     # Admission-only running has no numbered turn yet. Omitting the pair keeps
     # this response from naming the preceding turn as the one currently running.
@@ -1200,6 +1258,14 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
         else {"turn": slot._turn_generation, "turn_gen": chunk_generation()}
     )
     stopping = slot._stopping
+    # The stop machine's phase ('idle' | 'soft_pending' | 'killing'). A poll-only
+    # reader (the app SDK's ChatEmbed) has no WS frame to learn it from, and
+    # without it a pending soft cancel looks exactly like an unpressed Stop.
+    stop_state = slot._stop_state
+    # Whether a recent declined Stop (the session was compacting) makes the next
+    # press the session reset: the same read the slots frame and the stop route
+    # use, so a reader that opens or returns mid-window is warned as well.
+    stop_declined = stop_declined_armed(slot)
     display_title = slot.display_title
     # Shallow copies, so the off-loop render below reads a frozen entry while
     # the loop keeps editing the live one; the view helper does the redaction.
@@ -1217,15 +1283,69 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
         for q in slot._queue
     ]
     context_fields = await _context_snapshot_fields(state, slot)
+    # Imported here, not at module scope: this function runs on the handlers
+    # module's globals (``_facade_compose.compose``).
+    from kiro_crew.dashboard import wire_render
+
+    # One read shape of this session: the newest page (whatever its size),
+    # an older page by its cursor, or the whole history. Until its row memo
+    # has been filled in the background, it is rendered without the memo.
+    memo_scope = (slot_history_key(slot), before, limit_raw is None and before_raw is None)
+    use_memo, fill = wire_render.plan_read(memo_scope)
 
     def _render(live_child: str) -> str:
-        # Off-loop on purpose. _prepare_messages applies a regex-heavy
-        # redaction battery to the ENTIRE history; on a multi-MB session that
-        # blocked the event loop past the loop-stall watchdog's exit budget
-        # and hard-exited the gateway. json.dumps of the same payload is a
-        # second loop-blocking cost, so it lives in the thread too.
-        prepared = _prepare_messages(messages, running, live_child=live_child, workspace=workspace)
-        return json.dumps(
+        # Off-loop on purpose. Rendering applies a regex-heavy redaction
+        # battery to every row; on a multi-MB session that blocked the event
+        # loop past the loop-stall watchdog's exit budget and hard-exited the
+        # gateway. Serializing the payload is a second loop-blocking cost, so
+        # it lives in the thread too.
+        #
+        # The messages array is serialized on its own, reusing each unchanged
+        # row's rendered text once the page's memo is filled (``wire_render``),
+        # and spliced between the fields before and after it. The result is
+        # byte-for-byte the ``json.dumps`` of the single dict these two halves
+        # are cut from.
+        #
+        # The session's stored display verdicts (display_verdicts) let a cold
+        # render skip the scan for every string a save already judged.
+        with display_verdicts.session(verdict_key):
+            plan: slot_detail_delta.PagePlan | None = None
+            if cursor_mode:
+                # Row by row, so a position in the page can be checked against
+                # the reader's cursor and only the rows after it sent.
+                first = slot_detail_delta.render_from(next_before, total, limit, delta_cursor)
+                fragments, identities = wire_render.prepare_message_rows(
+                    messages[first - next_before :],
+                    running,
+                    live_child=live_child,
+                    workspace=workspace,
+                    use_memo=use_memo,
+                )
+                plan = slot_detail_delta.plan_page(
+                    fragments,
+                    identities,
+                    page_start=first,
+                    total=total,
+                    window=limit,
+                    cursor=delta_cursor,
+                )
+                messages_json = "[" + ", ".join(plan.fragments) + "]"
+            elif use_memo:
+                messages_json = wire_render.prepare_messages_json(
+                    messages, running, live_child=live_child, workspace=workspace
+                )
+            else:
+                messages_json = json.dumps(
+                    _prepare_messages(messages, running, live_child=live_child, workspace=workspace)
+                )
+        page_fields: dict[str, Any] = {"has_more": has_more, "next_before": next_before}
+        if plan is not None:
+            page_fields = {"has_more": plan.has_more, "next_before": plan.next_before}
+            if plan.cursor is not None:
+                page_fields["cursor"] = plan.cursor
+            if plan.delta is not None:
+                page_fields["delta"] = plan.delta
+        head = json.dumps(
             {
                 "key": key,
                 # Redacted at emit like every sibling path (_ChatSlot.to_dict
@@ -1236,11 +1356,15 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
                 "running": running,
                 **turn_identity,
                 "stopping": stopping,
-                "messages": prepared,
+                "stop_state": stop_state,
+                "stop_declined": stop_declined,
+            }
+        )
+        tail = json.dumps(
+            {
                 "queue": [queue_entry_view(q) for q in queue_snapshot],
                 "total": total,
-                "has_more": has_more,
-                "next_before": next_before,
+                **page_fields,
                 # Seeds the context meter on open. Turn-scoped WS frames alone
                 # leave it empty for a session reopened in a new tab; omitted
                 # entirely (not zeroed) when genuinely unknown, so the frontend
@@ -1248,6 +1372,7 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
                 **context_fields,
             }
         )
+        return "".join((head[:-1], ', "messages": ', messages_json, ", ", tail[1:]))
 
     # Per-slot single-flight: concurrent refetches of the same slot (WS
     # reconnect + switchSlot + chat_done all refetch) queue here instead of
@@ -1260,4 +1385,8 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
         # is two dict lookups plus a returncode read.
         live_child = _live_child_instance(state, slot)
         body = await asyncio.to_thread(_render, live_child)
+    if fill:
+        wire_render.schedule_fill(
+            memo_scope, messages, running, live_child=live_child, workspace=workspace
+        )
     return web.Response(text=body, content_type="application/json")

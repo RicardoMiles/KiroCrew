@@ -878,6 +878,20 @@ class TestQueueCancel:
         assert payload["queue_id"] == qid
         state.push_slots_update.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_a_send_already_in_the_conversation_is_not_cancelled(self, _sel):
+        # Its row is in the transcript already: dropping only the entry would
+        # leave the message there and give the text back to send twice.
+        slot = _ChatSlot("s1")
+        qid = slot.queue_append("orig")
+        slot._queue[0]["_responsive_row"] = slot.append("user", "orig", "msg msg-u")
+        state = _state(slot)
+        status, body = await self._delete(state, "s1", qid)
+        assert status == 409
+        assert body["code"] == "queue_item_already_sent"
+        assert [item["id"] for item in slot._queue] == [qid]
+        state.broadcast_ws.assert_not_called()
+
 
 class TestQueueEdit:
     async def _patch(self, state, name, qid, payload):
@@ -908,6 +922,20 @@ class TestQueueEdit:
         qid = slot.queue_append("orig")
         status, _ = await self._patch(_state(slot), "s1", qid, {"content": 5})
         assert status == 400
+
+    @pytest.mark.asyncio
+    async def test_a_send_already_in_the_conversation_is_not_edited(self, _sel):
+        # A waiting send whose row was written where it was sent is part of the
+        # conversation; editing only its entry would leave the old row and add
+        # a second one at the drain.
+        slot = _ChatSlot("s1")
+        qid = slot.queue_append("orig")
+        slot._queue[0]["_responsive_row"] = slot.append("user", "orig", "msg msg-u")
+        status, body = await self._patch(_state(slot), "s1", qid, {"content": "changed"})
+        assert status == 409
+        assert body["code"] == "queue_item_already_sent"
+        assert slot._queue[0]["content"] == "orig"
+        assert [m["content"] for m in slot.messages if m["role"] == "user"] == ["orig"]
 
     @pytest.mark.asyncio
     async def test_unknown_queue_id_is_404(self, _sel):

@@ -59,6 +59,8 @@ cron resume <id>
 
 A job's `timezone` (CLI `--timezone`) is the zone its wall clock is read in: a `cron_expr`'s hour and minute fields, and a clock time given as `at_time` / `--at` such as `"9am"` or `"tomorrow 17:30"`. Without one, both are read in the global config timezone, falling back to UTC. `cron_add(at_time="9am", timezone="America/Los_Angeles")` therefore fires at 9am in Los Angeles even on a gateway whose config timezone is UTC. A clock time the zone skips (such as the hour lost when daylight saving time starts) is refused rather than moved. A relative `at_time` (`"in 2 hours"`), a Unix `at` and a `delay` name an instant already, so the timezone only changes how the job is displayed.
 
+A zone's rules come from the timezone data the gateway's Python finds: the operating system's zoneinfo on macOS and Linux, the `tzdata` package on Windows. Out-of-date data still resolves every zone name, so a job in a zone whose rules changed runs at the old rule's hour (with data older than IANA tzdb 2026b, a 9am job in `America/Vancouver` runs at 10am from 2026-11-01). `kirocrew doctor` reports such data on its `tz data` row and names the update; restart the gateway afterwards, since it keeps every zone it already loaded.
+
 ## How It Works
 
 1. The cron timer fires at the scheduled time.
@@ -116,9 +118,11 @@ A command cron runs under `sh -c` and is vetted when it is added and again each 
 - command substitution: `$(...)`, backticks, `$((...))`;
 - any `${...}` other than a plain `${NAME}` (no `${X:-default}`, `${X#prefix}`, `${#X}`);
 - `$'...'` ANSI-C quoting;
-- brace expansion such as `{a,b}` or `{1..9}`, including a quoted regex interval like `'[0-9]{1,3}'`. For a basic-regex tool, escape the braces inside double quotes (`grep "[0-9]\{1,3\}"`);
+- brace expansion such as `{a,b}` or `{1..9}`, including a quoted regex interval like `'[0-9]{1,3}'`. A spaceless jq object such as `jq '{id,name}'` is accepted once a plain space follows the comma inside the same quotes (`jq '{id, name}'`). For a basic-regex tool, escape the braces inside double quotes (`grep "[0-9]\{1,3\}"`);
 - positional and special parameters: `$1`, `$@`, `$*`, `$#`;
-- loops and compound commands: `for`, `while`, `until`, `case`.
+- loops and compound commands: `for`, `while`, `until`, `case`;
+- a variable reference (`A=x; cmd $A`, `A=x cmd $A`, `A=x && cmd $A`): the check does not model how the shell scopes or rewrites a value, so any `$NAME` or `${NAME}` read anywhere in the text is refused, comments, quoted values and nested shells included, assigned or not. Only `$HOME` may be read, and `HOME` may appear only as `$HOME` or `${HOME}` (so `read HOME`, `HOME=x` and `export HOME` are refused);
+- a `$` followed by a quote, a backslash or another character that is not an expansion: allowed only at the end of the command or before whitespace or one of `/ | . , : )`, so `sed 's/x$/y/'` passes and `grep "x$" f` does not; `$!`, `$-`, `$?` and `$$` are refused too, because `$!` is empty before a background job and no other rule owns them.
 
 The `command` field is capped at 5000 characters. A command cron needs a working POSIX `/bin/sh` that passes the gateway's probe, so it never runs on Windows. For any of these, use a script cron instead: its body is scanned in full.
 
@@ -221,6 +225,14 @@ Add skip dates to an existing job:
 ```
 cron_update(job_id="abc123", skip_dates=["2026-12-25", "2026-12-26"])
 ```
+
+Remove every skip date, so the job fires on all its scheduled days again:
+
+```
+cron_update(job_id="abc123", clear_skip_dates=true)
+```
+
+`skip_dates=[]` means the same, but some clients drop an empty list before it reaches the server, and then the skip dates stay. `clear_skip_dates` is refused beside a non-empty `skip_dates`.
 
 ## Execution Jitter
 

@@ -203,14 +203,14 @@ no defined lifetime.
 
 **Not reachable at all, structurally.** Anything in `DashboardState`. The
 watchdog is in the session layer; slots, `slot.running`, `slot._approval_futures`,
-`slot._tool_stall_retries` are in `dashboard/state.py`, and `SessionManager`
+`slot._tool_stall_retries` are in `dashboard/state_parts/slot_ladder.py`, and `SessionManager`
 holds no reference to it. The session layer must not import the dashboard.
 
 **The blind spot that matters — and why it was not a plumbing problem.** From
 outside, a healthy 40-minute turn and a turn parked on an approval for 40 minutes
 look identical: `semaphore.locked()` is True for both, and `last_used` advances
 only on the allocation paths and on `touch()`, not on every LLM round-trip
-(`session.py`'s module docstring), so it does not track a turn's progress.
+(`session_parts/sweeps.py`'s module docstring), so it does not track a turn's progress.
 
 The tempting reading is that the signal has to be *injected* from the layer that
 can see it — a consumer-supplied reader in the shape of

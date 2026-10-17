@@ -22,7 +22,10 @@ interface SessionRostersOptions {
  * "set as default" write.
  */
 export function useSessionRosters({ activeSlot, activeSlotProject, refreshTrigger, dispatch }: SessionRostersOptions) {
-  const { agents: installedAgents, displayAgents, choices: catalogChoices, defaultAgent } = useAgents(refreshTrigger, activeSlot ?? undefined, activeSlotProject)
+  const { agents: installedAgents, displayAgents, choices: catalogChoices, displayChoices, defaultAgent } = useAgents(refreshTrigger, activeSlot ?? undefined, activeSlotProject)
+  // The picker's rows, unfolded, as the sidebar last loaded them: the session
+  // list marks a same-name pair's sessions from these (#19472).
+  const sidebarChoices = displayChoices
   // What the chat sidebar tints its rows from: the last LOADED roster, so a
   // session switch (which empties `installedAgents` until the new slot's fetch
   // lands) does not flash every agent label to muted and back. Falls back to
@@ -50,7 +53,7 @@ export function useSessionRosters({ activeSlot, activeSlotProject, refreshTrigge
   const filteredAgents = filteredAgentsByName
   const effectiveModels = useAvailableModels()
   return {
-    installedAgents, sidebarAgents, defaultAgent, effectiveAgents,
+    installedAgents, sidebarAgents, sidebarChoices, defaultAgent, effectiveAgents,
     defaultAgentFailed, toggleDefaultAgent,
     agentDropdown, setAgentDropdown, agentFilter, setAgentFilter, agentDropdownRef, agentInputRef, filteredAgents,
     effectiveModels,

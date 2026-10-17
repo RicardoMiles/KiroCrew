@@ -214,6 +214,7 @@ and every other concern has one owner under `components/markdown/`.
 | `markdown/streamingEffects.ts` | the streaming tail's glow, reveal and caret |
 | `markdown/linkBoundaryRepair.ts` | the source-level link repairs gated on remark's own parse: CJK autolink boundaries and refused link destinations |
 | `markdown/elements.tsx` | the restyle-only element overrides and the sanitizer-derived attribute forwarding they share (`sp` / `spa`) |
+| `markdown/typography.ts` | the heading, list, table-cell and inline-run class strings `markdown/elements.tsx` and the Office preview's `OfficeBlockList` (`FileRenderers.tsx`) both render; `markdownTypographyParity.test.tsx` pins the two surfaces to it |
 | `markdown/InlineCode.tsx`, `markdown/copyFeedback.tsx` | the inline-code chips (path, session, work item, sidebar folder (`FolderChip`), copy) and the copy outcome every chip shares |
 | `markdown/MarkdownTable.tsx` | a table, its Markdown / CSV copy row, and the Widen / Narrow toggle |
 | `markdown/useMarkdownTableColumns.tsx` | resizable table columns (the second `ColumnResizer` consumer) |
@@ -225,11 +226,57 @@ and every other concern has one owner under `components/markdown/`.
 Imports run one way. The facade imports the owners, and nothing under
 `components/markdown/` imports the facade: a module that did would receive the
 stub in every spec that mocks the renderer. Consumers keep importing from the
-facade for the same reason. Three things must stay in the facade's own text: the
+facade for the same reason. The one exception is `markdown/typography.ts`, which
+`FileRenderers.tsx` imports directly: it is plain data with no imports of its
+own, and reading it through the facade would hand the Office preview the
+renderer's stub in every spec that mocks the renderer. Three things must stay in the facade's own text: the
 seven remark/rehype package imports (`test/test_source_providers.py` pins that
 set against the backend converter), `import '../utils/hljs'`
 (`hljsCoreOnly.test.ts`), and the two lines the i18n added-line gate counts, in
 `MdAnchor` and `stripStrayToolUseTags`.
+
+### The file panel, the chat pane and the browser panel
+
+`components/MarkdownPanel.tsx` (a side-panel file tab), `components/ChatPane.tsx`
+(one chat session in split view or a crewmate's chat) and
+`components/WebPreviewPanel.tsx` (the Browser tab) are facades over sibling owners
+in `components/`. Each facade keeps its module id, its default export and every
+named export: hosts import it, and the specs that mount a host mock it by that id,
+so a consumer never imports an owner. Imports run one way, from the facade to its
+owners. Each owner hook is called once per render at a fixed place in its facade,
+so the panel's effects keep one order.
+
+| Owner | Holds |
+|---|---|
+| `MarkdownPanel.tsx` | `Props`, the panel and its two layouts (side panel, full screen), the edit, save, close and navigate guards, comment drafts and their anchor highlight, the line reveal |
+| `MarkdownPanelHeader.tsx` | the header's controls: the breadcrumb, the artifact and knowledge toggles, the ⋯ menu |
+| `useMarkdownPanelFileState.ts` | the file's knowledge-library and artifact-library state |
+| `MarkdownPanelBody.tsx` | the body's blocks: comment hint, missing-file banner, empty-diff notice, diff view, comment overlay, find bar |
+| `markdownPanelSourcePos.ts` | where a selection sits in the source (`resolveSourcePos`, `findCoords`) |
+| `useMarkdownPanelFind.ts` | the CSS Custom Highlight registry and preview find (Cmd+F) |
+| `useMarkdownPanelDisk.ts` | the disk truth (the panel's reads, the catch-up latch, the watch, the missing-file retry, the last-copy rescue) and the working-tree diff against HEAD |
+| `ChatPane.tsx` | the pane's layout and dock, its store reads, the follow-up chips, the queue-card actions, and the transcript mount (`transcript={{ … }}`) |
+| `ChatPaneProps.ts` | the props interface and `PaneLeading` |
+| `useChatPaneDraft.ts` | the pane-local composer draft, parked and restored per slot |
+| `useChatPaneUploads.ts` | uploads, drops, and their per-slot notices |
+| `useChatPanePickers.ts`, `ChatPanePickerMenus.tsx` | the agent and model pickers' data and actions, and their two portaled menus |
+| `useChatPaneSend.ts` | send, steer, the slash commands the pane intercepts, the message quote, the question card's one-click answer (its 404 fallback, `onFallbackSend`, stays in `ChatPane.tsx`) |
+| `useChatPaneTurnControl.ts` | the Stop press protocol and the run-state reconciliation |
+| `useChatPaneContinue.ts` | the pane's side of Resume: the composer's and the newest error row's offer for the pane's own slot, and the notice when the gateway refuses it. The press and its spinner are `hooks/useContinuePress.ts`, the one ChatPage's `useTurnRecovery` uses too |
+| `ChatPaneTranscript.tsx` | the transcript row set and the rows above the first message |
+| `WebPreviewPanel.tsx` | the panel: address bar, frame, device presets, liveness probe, launcher, the CLI browser view |
+| `webPreviewPanelUrl.ts` | what a target may be: URL coercion, the loopback and embed rules, the self-origin check, the session feed (`setSessionPreviewUrl`, `setSessionPreviewPending`) |
+| `useWebPreviewPanelAnnotate.ts` | Annotate: per-slot notes on picks in the native page |
+| `WebPreviewPanelNativeSurface.tsx` | the native browse surface |
+
+New work for a responsibility in the table goes to its owner, and work that
+belongs to none of them starts in the facade. Two kinds of line stay in a
+facade's own text: the ones the i18n added-line gate counts (the comment-highlight
+paint rules in `MarkdownPanel.tsx`; `DEVICE_PRESETS` and `RELOAD_PARAM` in
+`WebPreviewPanel.tsx`), and the constructs a source-reading spec pins there (in
+`ChatPane.tsx` the transcript and dock wiring and the question card's
+`onFallbackSend` with `answerRejectedMessage`; in `MarkdownPanel.tsx` the reveal
+effect, the header's `onToggleDiffSplit` call site and the `pathBasename` use).
 
 ### Which switcher
 
@@ -258,6 +305,44 @@ stays behind every tab label while crossing between segments.
 A navigation rail sits in `TABS_RAIL_ROW_CLASS` (rail, rule, then content). The
 rule is load-bearing rather than decoration: it is the only thing telling a
 navigation rail apart from a filter pill, and the System page stacks both.
+
+### The About, Chat and MCP settings panels
+
+`pages/settings/AboutPanel.tsx` (Settings ▸ About), `pages/settings/ChatPanel.tsx`
+(Settings ▸ Chat) and `pages/settings/McpManagement.tsx` (the Developer page's MCP
+pool) are facades over sibling owners in `pages/settings/`. Each facade keeps its
+module id and every export, so hosts and the specs that mock a panel keep naming the
+facade. Nothing outside a panel's own files imports one of its owners, and no owner
+imports its facade; the only edges between owners are `AboutPanelGatewayUpdate.tsx` to
+`AboutPanelUpdateFlow.tsx`, the three `useChatPanel*` hooks to `chatPanelOptions.ts`, and
+the two MCP views to `mcpManagementModel.ts`. A facade calls each owner hook once per
+render, in a fixed place among its own hooks, so each panel registers its hooks in one
+fixed order.
+
+| Owner | Holds |
+|---|---|
+| `AboutPanel.tsx` | the panel: the identity hero and both channel switchers, the desktop update card and its errors (`UPDATE_ERROR_KEYS`), the auto-download and auto-update switches |
+| `AboutPanelUpdateFlow.tsx` | `InAppUpdateFlow` (arm, approve on the host, apply), `AgentUpdateRequestCard`, `RestartGatewayButton`, `copyCommand` |
+| `AboutPanelGatewayUpdate.tsx` | a gateway install's update flow: its state hook, the Updates card body, the apply confirm |
+| `ChatPanel.tsx` | the rail (`railItems`), every page's `case` with its controls, the save-error banner, the composer, About-you and session toggles' state |
+| `chatPanelOptions.ts` | option tables, bounds and the config shapes the controls read |
+| `ChatPanelLinkPatternsEditor.tsx` | the `dashboard.link_patterns` rule editor |
+| `useChatPanelDashboard.ts` | the `dashboardConfig` read and writes, Feature Tips and the feature-video readout |
+| `useChatPanelTypedFields.ts` | the draft-backed number and path fields (Advanced, Sessions) |
+| `useChatPanelModels.ts` | the Model page: fallback models, defaults, selectable models, the agent-pin notice, per-role rows |
+| `McpManagement.tsx` | the page: the view tabs, the sharing and pre-resolve cards, the servers table, both dialogs |
+| `mcpManagementModel.ts` | wire types, error-key tables, the row-state derivation and the sharing-evidence verdict |
+| `McpManagementLaunchReview.tsx` | the launch lines, the review a STUB switch opens, the refused-row panel |
+| `McpManagementAssessment.tsx` | the Sharing assessment view and its Measure control |
+
+New work for a responsibility in the table goes to its owner, and work that belongs
+to none of them starts in the facade. Three kinds of construct stay in a facade's own
+text, because a generator or a gate reads them there: every Settings* primitive and
+settings-search anchor (`website/scripts/settingsExtract.ts` maps files by name), the
+Chat rail's `railItems` (`website/scripts/gen-ui-index.mjs`), and the lines the i18n
+and unit-literal added-line gates count. The tier labels and the contrary-tier set
+that `test/test_mcp_shareability_frontend_parity.py` pins live in
+`mcpManagementModel.ts`.
 
 ## Accessibility
 

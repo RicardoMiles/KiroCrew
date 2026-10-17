@@ -64,9 +64,9 @@ def test_the_bound_block_the_page_lists_is_what_select_crew_returns(doc_text: st
     ), "the page says the empty call returns the roster plus a top-level default_agent"
     for field in ("kiro_agent", "workspace", "memory_store", "model"):
         assert f"`{field}`" in doc_text, f"the page no longer names the bound field {field}"
-    src = (Path(__file__).parent.parent / "src" / "kiro_crew" / "mcp_core.py").read_text(
-        encoding="utf-8"
-    )
+    src = (
+        Path(__file__).parent.parent / "src" / "kiro_crew" / "mcp_core_parts" / "crew.py"
+    ).read_text(encoding="utf-8")
     assert '"model": cfg.agents[crew].model,' in src, (
         "the page says `model` is the configured pin verbatim; _do_select_crew no "
         "longer reads it straight off the crew record"

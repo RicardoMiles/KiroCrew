@@ -6,16 +6,22 @@ plus a real :class:`ArtifactStore` rooted at a tmp dir for end-to-end coverage.
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import json
 import threading
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+from body_stream_helpers import attach_json_body
 
 from conftest import cap_project_root_walk
 from kiro_crew import artifacts as art_mod
+from kiro_crew import mcp_core
 from kiro_crew.artifacts import ArtifactStore
 from kiro_crew.dashboard.handlers.artifacts import (
     _MAX_BODY_BYTES,
@@ -66,11 +72,11 @@ def _request(
     req.query = query or {}
     if isinstance(body, dict):
         encoded = json.dumps(body).encode()
-        req.read = AsyncMock(return_value=encoded)
+        attach_json_body(req, encoded)
     elif isinstance(body, bytes):
-        req.read = AsyncMock(return_value=body)
+        attach_json_body(req, body)
     else:
-        req.read = AsyncMock(return_value=b"")
+        attach_json_body(req, b"")
     # Attach the restricted-session flag via a stub on the request app.
     # Provide a non-None state so handlers don't short-circuit on the
     # state-is-None deny-by-default guard.
@@ -444,9 +450,7 @@ class TestList:
         assert {a["slug"] for a in _json_body(resp)["artifacts"]} == {"mine"}
 
     @pytest.mark.asyncio
-    async def test_empty_touched_by_does_not_scope(
-        self, isolated_store, patch_restricted
-    ) -> None:
+    async def test_empty_touched_by_does_not_scope(self, isolated_store, patch_restricted) -> None:
         """``?touched_by=`` is a no-op, NOT the no-origin bucket.
 
         Unlike ``?session=`` there is no useful "nobody touched it" view, so an
@@ -1146,9 +1150,7 @@ class TestDetail:
         assert events[0]["by"] == "agent"
 
     @pytest.mark.asyncio
-    async def test_agent_read_still_returns_content(
-        self, isolated_store, patch_restricted
-    ) -> None:
+    async def test_agent_read_still_returns_content(self, isolated_store, patch_restricted) -> None:
         """Regression guard: recording must not strip the body off the response.
 
         ``record_impression`` returns a meta loaded WITHOUT content, so assigning
@@ -1166,9 +1168,7 @@ class TestDetail:
         assert _json_body(resp)["content"] == "<x/>"
 
     @pytest.mark.asyncio
-    async def test_browser_read_records_nothing(
-        self, isolated_store, patch_restricted
-    ) -> None:
+    async def test_browser_read_records_nothing(self, isolated_store, patch_restricted) -> None:
         """A dashboard page view is not session activity and must not mutate."""
         isolated_store.create(name="x", content="<x/>", slug="x")
         resp = await api_artifact_detail(_request(match={"slug": "x"}))
@@ -1221,9 +1221,7 @@ class TestDetail:
         assert len(events) == 1
 
     @pytest.mark.asyncio
-    async def test_missing_state_records_nothing(
-        self, isolated_store, patch_restricted
-    ) -> None:
+    async def test_missing_state_records_nothing(self, isolated_store, patch_restricted) -> None:
         """Deny by default: no dashboard state means the breadcrumb is withheld.
 
         Guards the fail-open shape ``not (state is not None and restricted(...))``,
@@ -1298,6 +1296,79 @@ class TestDetail:
         isolated_store.create(name="x", content="<x/>", slug="x")
         await api_artifact_detail(_request(match={"slug": "x"}))
         sel_stub.log_tool_invocation.assert_not_called()
+
+
+class TestJsonBodyGate:
+    """``_read_json_body`` reads through ``read_bounded_json``.
+
+    A present body that does not declare JSON is refused 415 before it is read,
+    on every route the helper serves; and the byte cap bounds what is buffered,
+    not only what is accepted.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("content_type", ["text/plain", "application/octet-stream"])
+    async def test_create_refuses_a_non_json_media_type_415(
+        self, isolated_store, patch_restricted, content_type
+    ) -> None:
+        req = _request(body={"name": "Hello", "content": "<p>hi</p>"})
+        req.content_type = content_type
+        with pytest.raises(web.HTTPUnsupportedMediaType) as exc:
+            await api_artifacts_create(req)
+        assert exc.value.status == 415
+        assert json.loads(exc.value.text)["code"] == "unsupported_media_type"
+        with pytest.raises(art_mod.ArtifactNotFoundError):
+            isolated_store.get("hello")
+
+    @pytest.mark.asyncio
+    async def test_update_refuses_a_non_json_media_type_415(
+        self, isolated_store, patch_restricted
+    ) -> None:
+        isolated_store.create(name="page", content="<p>ok</p>", slug="page")
+        req = _request(body={"name": "Renamed"}, match={"slug": "page"})
+        req.content_type = "text/plain"
+        with pytest.raises(web.HTTPUnsupportedMediaType):
+            await api_artifact_update(req)
+        assert isolated_store.get("page").name == "page"
+
+    @pytest.mark.asyncio
+    async def test_an_oversize_chunked_body_stops_streaming_at_the_cap(
+        self, isolated_store, patch_restricted, monkeypatch
+    ) -> None:
+        from kiro_crew.dashboard.handlers import artifacts as art_handlers
+
+        cap = 1024
+        monkeypatch.setattr(art_handlers, "_MAX_BODY_BYTES", cap)
+        raw = json.dumps({"name": "big", "content": "x" * (cap * 50)}).encode()
+        req = _request(body=None)
+        attach_json_body(req, raw)
+        req.content_length = None  # chunked: no declared length to refuse on
+        served: list[int] = []
+        drain = req.content.iter_chunked
+
+        async def _counting(n: int):
+            async for chunk in drain(n):
+                served.append(len(chunk))
+                yield chunk
+
+        req.content.iter_chunked = _counting
+        resp = await api_artifacts_create(req)
+        assert resp.status == 400
+        assert "exceeds" in _json_body(resp)["error"]
+        # Stopped one chunk past the cap rather than draining the whole body.
+        assert sum(served) <= cap + 8192
+        assert sum(served) < len(raw)
+        with pytest.raises(art_mod.ArtifactNotFoundError):
+            isolated_store.get("big")
+
+    @pytest.mark.asyncio
+    async def test_an_absent_body_is_still_an_empty_object(
+        self, isolated_store, patch_restricted
+    ) -> None:
+        resp = await api_artifacts_create(_request(body=None))
+        # {} reaches the route's own validation, not a body refusal.
+        assert resp.status == 400
+        assert "JSON" not in _json_body(resp)["error"]
 
 
 class TestUpdate:
@@ -1454,7 +1525,10 @@ class TestDelete:
         isolated_store.set_publication(
             "x",
             ArtifactPublication(
-                provider="default", artifact_id="uuid-1", view_url="https://d/x", visibility="PUBLIC"
+                provider="default",
+                artifact_id="uuid-1",
+                view_url="https://d/x",
+                visibility="PUBLIC",
             ),
         )
         order: list[str] = []
@@ -1493,7 +1567,10 @@ class TestDelete:
         isolated_store.set_publication(
             "x",
             ArtifactPublication(
-                provider="default", artifact_id="uuid-1", view_url="https://d/x", visibility="PUBLIC"
+                provider="default",
+                artifact_id="uuid-1",
+                view_url="https://d/x",
+                visibility="PUBLIC",
             ),
         )
 
@@ -1531,7 +1608,10 @@ class TestDelete:
         isolated_store.set_publication(
             "x",
             ArtifactPublication(
-                provider="default", artifact_id="uuid-1", view_url="https://d/x", visibility="PUBLIC"
+                provider="default",
+                artifact_id="uuid-1",
+                view_url="https://d/x",
+                visibility="PUBLIC",
             ),
         )
 
@@ -1555,9 +1635,9 @@ class TestDelete:
         resp = await api_artifact_delete(_request(match={"slug": "x"}))
         assert resp.status == 200
         assert after_threads, "the post-withdrawal re-read never happened"
-        assert all(t != loop_thread for t in after_threads), (
-            f"re-read ran on the event-loop thread {loop_thread!r}: {after_threads!r}"
-        )
+        assert all(
+            t != loop_thread for t in after_threads
+        ), f"re-read ran on the event-loop thread {loop_thread!r}: {after_threads!r}"
 
     @pytest.mark.asyncio
     async def test_a_republish_landing_after_the_withdrawal_refuses_the_delete(
@@ -1583,7 +1663,10 @@ class TestDelete:
         isolated_store.set_publication(
             "x",
             ArtifactPublication(
-                provider="default", artifact_id="uuid-1", view_url="https://d/x", visibility="PUBLIC"
+                provider="default",
+                artifact_id="uuid-1",
+                view_url="https://d/x",
+                visibility="PUBLIC",
             ),
         )
 
@@ -1615,9 +1698,9 @@ class TestDelete:
         survivor = isolated_store.get("x")
         assert survivor is not None, "the artifact must survive so the new copy keeps a handle"
         assert survivor.publication is not None, "the new publication record must survive"
-        assert survivor.publication.artifact_id == "uuid-2", (
-            "the surviving record must be the NEW publication, not the withdrawn one"
-        )
+        assert (
+            survivor.publication.artifact_id == "uuid-2"
+        ), "the surviving record must be the NEW publication, not the withdrawn one"
 
     @pytest.mark.asyncio
     async def test_an_unregistered_destination_refuses_the_delete_and_the_handler_adds_no_guard(
@@ -1641,7 +1724,10 @@ class TestDelete:
         isolated_store.set_publication(
             "x",
             ArtifactPublication(
-                provider="default", artifact_id="uuid-1", view_url="https://d/x", visibility="PUBLIC"
+                provider="default",
+                artifact_id="uuid-1",
+                view_url="https://d/x",
+                visibility="PUBLIC",
             ),
         )
 
@@ -1681,7 +1767,10 @@ class TestDelete:
         isolated_store.set_publication(
             "x",
             ArtifactPublication(
-                provider="default", artifact_id="uuid-1", view_url="https://d/x", visibility="PUBLIC"
+                provider="default",
+                artifact_id="uuid-1",
+                view_url="https://d/x",
+                visibility="PUBLIC",
             ),
         )
 
@@ -1716,7 +1805,10 @@ class TestDelete:
         isolated_store.set_publication(
             "x",
             ArtifactPublication(
-                provider="default", artifact_id="uuid-1", view_url="https://d/x", visibility="PUBLIC"
+                provider="default",
+                artifact_id="uuid-1",
+                view_url="https://d/x",
+                visibility="PUBLIC",
             ),
         )
 
@@ -1747,7 +1839,10 @@ class TestDelete:
         isolated_store.set_publication(
             "x",
             ArtifactPublication(
-                provider="default", artifact_id="uuid-1", view_url="https://d/x", visibility="PUBLIC"
+                provider="default",
+                artifact_id="uuid-1",
+                view_url="https://d/x",
+                visibility="PUBLIC",
             ),
         )
 
@@ -1823,9 +1918,7 @@ class TestReprobeNotice:
         """A restricted session cannot reprobe (403), matching the other
         meta.json-mutating routes."""
         isolated_store.create(name="x", content="a", slug="x")
-        resp = await api_artifact_reprobe_notice(
-            _request(match={"slug": "x"}, restricted=True)
-        )
+        resp = await api_artifact_reprobe_notice(_request(match={"slug": "x"}, restricted=True))
         assert resp.status == 403
 
     @pytest.mark.asyncio
@@ -2319,8 +2412,14 @@ class TestTeardown:
 
         # Create a webapp artifact to tear down
         isolated_store.create(
-            name="My App", content="<h1>App</h1>", slug="my-app", kind="webapp",
-            webapp_metadata={"lifecycle": {"status": "deployed"}, "deploy_target": {"public_url": "https://x.cloudfront.net/my-app/"}},
+            name="My App",
+            content="<h1>App</h1>",
+            slug="my-app",
+            kind="webapp",
+            webapp_metadata={
+                "lifecycle": {"status": "deployed"},
+                "deploy_target": {"public_url": "https://x.cloudfront.net/my-app/"},
+            },
         )
         req = _request(match={"slug": "my-app"}, body={"confirm": True})
         resp = await _handle_teardown(req)
@@ -2334,7 +2433,9 @@ class TestTeardown:
         assert "reaper" in body["note"]
 
     @pytest.mark.asyncio
-    async def test_manifest_expiry_success(self, isolated_store, patch_restricted, monkeypatch) -> None:
+    async def test_manifest_expiry_success(
+        self, isolated_store, patch_restricted, monkeypatch
+    ) -> None:
         """When engine.run_aws succeeds, manifest field should be 'expired-now'."""
         from kiro_crew.deploy import engine
         from kiro_crew.deploy import profiles as profiles_mod
@@ -2347,13 +2448,19 @@ class TestTeardown:
         profiles_mod.save_registry(reg)
 
         isolated_store.create(
-            name="Expire App", content="<h1>App</h1>", slug="expire-app", kind="webapp",
+            name="Expire App",
+            content="<h1>App</h1>",
+            slug="expire-app",
+            kind="webapp",
             webapp_metadata={
                 "lifecycle": {"status": "deployed", "created_at": "2026-01-01T00:00:00Z"},
                 # R17 F1: fail-closed identity check requires BOTH the metadata
                 # and the existing manifest to carry a matching distribution_id.
-                "deploy_target": {"profile": "test-profile", "region": "us-west-2",
-                                  "distribution_id": "EDEPLOY1"},
+                "deploy_target": {
+                    "profile": "test-profile",
+                    "region": "us-west-2",
+                    "distribution_id": "EDEPLOY1",
+                },
                 "slug": "expire-app",
             },
         )
@@ -2363,6 +2470,7 @@ class TestTeardown:
         def mock_run_aws(args, profile, timeout=30):
             calls.append((args, profile))
             import json as _j
+
             if "describe-stacks" in args:
                 outputs = [
                     {"OutputKey": "BucketName", "OutputValue": "test-bucket"},
@@ -2372,9 +2480,13 @@ class TestTeardown:
                 return (0, _j.dumps(outputs), "")
             if "s3" in args and "cp" in args:
                 if "-" in args:  # manifest READ (download to stdout)
-                    return (0, _j.dumps({"slug": "expire-app",
-                                         "distribution_id": "EDEPLOY1",
-                                         "arch": "engine"}), "")
+                    return (
+                        0,
+                        _j.dumps(
+                            {"slug": "expire-app", "distribution_id": "EDEPLOY1", "arch": "engine"}
+                        ),
+                        "",
+                    )
                 return (0, "", "")
             return (0, "", "")
 
@@ -2392,7 +2504,9 @@ class TestTeardown:
             assert any("expire-app/.kirocrew-deploy.json" in a for a in call[0])
 
     @pytest.mark.asyncio
-    async def test_teardown_fail_closed_when_aws_unreachable(self, isolated_store, patch_restricted, monkeypatch) -> None:
+    async def test_teardown_fail_closed_when_aws_unreachable(
+        self, isolated_store, patch_restricted, monkeypatch
+    ) -> None:
         """When engine.run_aws fails, the reaper check cannot be confirmed —
         teardown must fail closed (409, NO tombstone) rather than expiring the
         manifest into the void (round-18: reaper-not-installed guard)."""
@@ -2400,7 +2514,10 @@ class TestTeardown:
         from kiro_crew.deploy.handlers import _handle_teardown
 
         isolated_store.create(
-            name="Fail App", content="<h1>App</h1>", slug="fail-app", kind="webapp",
+            name="Fail App",
+            content="<h1>App</h1>",
+            slug="fail-app",
+            kind="webapp",
             webapp_metadata={
                 "lifecycle": {"status": "deployed"},
                 "deploy_target": {"profile": "bad-profile", "region": "us-west-2"},
@@ -2415,11 +2532,16 @@ class TestTeardown:
         # F2 (r4): register the profile so this test exercises the
         # AWS-unreachable path, not the unregistered-profile 409.
         from kiro_crew.deploy import profiles as _profiles_mod
-        monkeypatch.setattr(_profiles_mod, "load_registry", lambda: {
-            "version": 2,
-            "profiles": [{"name": "bad-profile", "region": "us-west-2"}],
-            "default": "bad-profile",
-        })
+
+        monkeypatch.setattr(
+            _profiles_mod,
+            "load_registry",
+            lambda: {
+                "version": 2,
+                "profiles": [{"name": "bad-profile", "region": "us-west-2"}],
+                "default": "bad-profile",
+            },
+        )
         req = _request(match={"slug": "fail-app"}, body={"confirm": True})
         resp = await _handle_teardown(req)
         assert resp.status == 409
@@ -2448,9 +2570,7 @@ class TestSettleBlankEndpoint:
     async def test_saves_a_draft(self, isolated_store, patch_restricted) -> None:
         isolated_store.create(name=self.UNTITLED, content="", slug="u")
         resp = await api_artifact_settle_blank(
-            _request(
-                body={"untitled_name": self.UNTITLED, "draft": "# notes"}, match={"slug": "u"}
-            )
+            _request(body={"untitled_name": self.UNTITLED, "draft": "# notes"}, match={"slug": "u"})
         )
         assert _json_body(resp)["outcome"] == "saved"
         assert isolated_store.get("u").content == "# notes"
@@ -2459,9 +2579,7 @@ class TestSettleBlankEndpoint:
     async def test_keeps_an_invested_document(self, isolated_store, patch_restricted) -> None:
         isolated_store.create(name="Release plan", content="# real", slug="u")
         resp = await api_artifact_settle_blank(
-            _request(
-                body={"untitled_name": self.UNTITLED, "draft": "# stale"}, match={"slug": "u"}
-            )
+            _request(body={"untitled_name": self.UNTITLED, "draft": "# stale"}, match={"slug": "u"})
         )
         assert _json_body(resp)["outcome"] == "kept"
         assert isolated_store.get("u").content == "# real"
@@ -2580,6 +2698,110 @@ class TestSettleBlankEndpoint:
         assert _json_body(resp)["outcome"] == "kept"
 
 
+class TestClearTagsFromTheToolReachesTheStore:
+    """``artifact_update clear_tags: true`` empties the stored tags.
+
+    A client that drops empty lists never delivers ``tags: []``, so the tool takes
+    ``clear_tags: true`` and sends the route the empty list itself. The tool runs from
+    its own entry (schema validation and handler) with its ``_patch`` bridged onto a
+    loopback test server that holds the real update route and the real store.
+    """
+
+    @staticmethod
+    def _tool_calls(monkeypatch, *calls: dict[str, Any]) -> tuple[list[str], list[Any]]:
+        sent: list[Any] = []
+        replies: list[str] = []
+
+        @web.middleware
+        async def internal(request: web.Request, handler):
+            # What the gateway's auth layer leaves on the tool's internal-secret call.
+            request["internal_auth"] = True
+            return await handler(request)
+
+        async def main() -> None:
+            app = web.Application(middlewares=[internal])
+            state = MagicMock()
+            state.get_slot.return_value = None
+            app["state"] = state
+            app.router.add_patch("/api/artifacts/{slug}", api_artifact_update)
+            async with TestClient(TestServer(app)) as client:
+                addrs = [a[0] for a in client.server.runner.addresses]
+                assert addrs and all(a == "127.0.0.1" for a in addrs), addrs
+                loop = asyncio.get_running_loop()
+
+                def patch(path: str, body: Any = None, *, session_key: Any = None) -> Any:
+                    async def send() -> Any:
+                        sent.append(body)
+                        headers = {"X-Internal-Secret": "test", "X-Session-Key": "dashboard:t"}
+                        response = await client.patch(path, json=body, headers=headers)
+                        return await response.json()
+
+                    return asyncio.run_coroutine_threadsafe(send(), loop).result(timeout=30)
+
+                monkeypatch.setattr(mcp_core, "_patch", patch)
+                for args in calls:
+                    replies.append(
+                        await asyncio.wait_for(
+                            asyncio.to_thread(mcp_core._call_tool, "artifact_update", args),
+                            timeout=30,
+                        )
+                    )
+
+        asyncio.run(main())
+        return replies, sent
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            # What a client that drops empty lists delivers for ``tags: []`` beside
+            # the flag: the flag alone.
+            {"clear_tags": True},
+            {"clear_tags": True, "tags": []},
+            # Beside another field, the case where a dropped ``[]`` was silently lost.
+            {"clear_tags": True, "name": "Final"},
+        ],
+    )
+    def test_clear_tags_empties_the_tags(
+        self, isolated_store, patch_restricted, monkeypatch, args
+    ) -> None:
+        isolated_store.create(name="Report", content="# notes", slug="report", tags=["q3", "draft"])
+
+        (reply,), sent = self._tool_calls(monkeypatch, {"slug": "report", **args})
+
+        assert reply.startswith("Updated artifact"), reply
+        assert sent == [{"tags": [], **({"name": "Final"} if "name" in args else {})}]
+        stored = isolated_store.get("report")
+        assert stored.tags == []
+        assert stored.name == ("Final" if "name" in args else "Report")
+
+    @pytest.mark.parametrize("flag", [{}, {"clear_tags": False}])
+    def test_a_tag_list_still_replaces_the_tags(
+        self, isolated_store, patch_restricted, monkeypatch, flag
+    ) -> None:
+        isolated_store.create(name="Report", content="# notes", slug="report", tags=["q3", "draft"])
+
+        (reply,), sent = self._tool_calls(
+            monkeypatch, {"slug": "report", "tags": ["final"], **flag}
+        )
+
+        assert reply.startswith("Updated artifact"), reply
+        assert sent == [{"tags": ["final"]}]
+        assert isolated_store.get("report").tags == ["final"]
+
+    def test_clear_tags_beside_tags_is_refused_before_anything_is_sent(
+        self, isolated_store, patch_restricted, monkeypatch
+    ) -> None:
+        isolated_store.create(name="Report", content="# notes", slug="report", tags=["q3", "draft"])
+
+        (reply,), sent = self._tool_calls(
+            monkeypatch, {"slug": "report", "tags": ["final"], "clear_tags": True}
+        )
+
+        assert reply.startswith("Error: clear_tags"), reply
+        assert sent == []
+        assert isolated_store.get("report").tags == ["q3", "draft"]
+
+
 class TestUpdateDocumentType:
     """The artifact page's type control -- ``PATCH {"kind": ...}``.
 
@@ -2675,11 +2897,16 @@ class TestUpdateWebappMetadata:
         isolated_store.create(name="app", content="draft app", slug="app", kind="webapp")
         resp = await api_artifact_update(
             _request(
-                body={"webapp_metadata": {
-                    "deploy_target": {"provider": "aws", "profile": "deploy-mvp",
-                                      "public_url": "https://d.cloudfront.net/app/"},
-                    "lifecycle": {"status": "live"},
-                }},
+                body={
+                    "webapp_metadata": {
+                        "deploy_target": {
+                            "provider": "aws",
+                            "profile": "deploy-mvp",
+                            "public_url": "https://d.cloudfront.net/app/",
+                        },
+                        "lifecycle": {"status": "live"},
+                    }
+                },
                 match={"slug": "app"},
             )
         )
@@ -2690,13 +2917,17 @@ class TestUpdateWebappMetadata:
         assert art.webapp_metadata.lifecycle.status == "live"
 
     @pytest.mark.asyncio
-    async def test_update_rejects_invalid_metadata_url(self, isolated_store, patch_restricted) -> None:
+    async def test_update_rejects_invalid_metadata_url(
+        self, isolated_store, patch_restricted
+    ) -> None:
         isolated_store.create(name="app2", content="draft", slug="app2", kind="webapp")
         resp = await api_artifact_update(
             _request(
-                body={"webapp_metadata": {
-                    "deploy_target": {"public_url": "javascript:alert(1)"},
-                }},
+                body={
+                    "webapp_metadata": {
+                        "deploy_target": {"public_url": "javascript:alert(1)"},
+                    }
+                },
                 match={"slug": "app2"},
             )
         )
@@ -2720,7 +2951,9 @@ class TestUpdateConflictToken:
         path.write_text(json.dumps(meta), encoding="utf-8")
         body = _json_body(await api_artifact_detail(_request(match={"slug": "x"})))
         assert body["content_token"]
-        assert json.loads(path.read_text(encoding="utf-8"))["content_token"] == body["content_token"]
+        assert (
+            json.loads(path.read_text(encoding="utf-8"))["content_token"] == body["content_token"]
+        )
 
     @pytest.mark.asyncio
     async def test_detail_carries_the_persisted_token(
@@ -3031,7 +3264,15 @@ class TestDashboardBindingTargets:
         # rollback whose old version names a dead target must still land. Reading the
         # submitted value as a rebind would refuse a rollback over a binding the store
         # was never going to store.
-        isolated_store.update(bound, content=_package("crewmate:atlas"), snapshot=True)
+        # Under the record's own token, as the route's write does: a dashboard
+        # record is never written without the token of the read it was authorized
+        # against, so a setup standing in for the owner's write names one too.
+        isolated_store.update(
+            bound,
+            content=_package("crewmate:atlas"),
+            snapshot=True,
+            snapshot_token=isolated_store.get(bound, assign_token=True).content_token,
+        )
         resp = await api_artifact_update(
             _request(
                 body={
@@ -3085,9 +3326,7 @@ class TestDashboardBindingTargets:
         assert b"REDACTED" in resp.body
 
     @pytest.mark.asyncio
-    async def test_the_session_scope_refusal_is_redacted_too(
-        self, isolated_store, bound
-    ) -> None:
+    async def test_the_session_scope_refusal_is_redacted_too(self, isolated_store, bound) -> None:
         # Both scopes build their sentences through the same helper, so neither can
         # return one that was never redacted.
         resp = await api_artifact_update(_bound_request(bound, "session:AKIAIOSFODNN7EXAMPLE"))

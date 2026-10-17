@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import sys
 import zipfile
 from contextlib import ExitStack, contextmanager
@@ -27,7 +28,7 @@ from typing import Any, Callable, Container, Iterable, Iterator, Optional
 from urllib.parse import urlparse, urlunparse
 
 from kiro_crew import cron as cron_seams
-from kiro_crew import platform_compat
+from kiro_crew import pinned_fs, platform_compat
 from kiro_crew.apps import deps_boot as _deps_boot_module
 from kiro_crew.apps.cron_sdk import CronSDK
 from kiro_crew.apps.execution import (
@@ -49,8 +50,11 @@ from kiro_crew.apps.manager import (
 )
 from kiro_crew.apps.manifest import (
     AppManifest,
+    Containment,
+    contained_in_screened_root,
     has_stdio_mcp_server,
     is_module_style_entry_point,
+    screen_app_path,
 )
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import (
@@ -991,10 +995,23 @@ def _register_agents(
         policy = _agent_mcp_policy(app_name)
         own_servers = _own_mcp_servers(app_name)
 
+        screened_root = screen_app_path(app_root) if manifest.agents else Containment.UNCHECKED
         for agent_path_str in manifest.agents:
             agent_path = app_root / agent_path_str
             # Path containment check — reject paths that escape the app root
-            if not agent_path.resolve().is_relative_to(app_root.resolve()):
+            contained = contained_in_screened_root(agent_path, screened_root)
+            if contained is Containment.UNCHECKED:
+                # Unverified is not refused: report it as retryable.
+                logger.warning("App %s: agent path could not be checked: %s", app_name, agent_path)
+                if io_failures is not None:
+                    io_failures.append(str(agent_path))
+                continue
+            if contained is Containment.REFUSED:
+                logger.warning(
+                    "App %s: agent path is refused by the path screen: %s", app_name, agent_path
+                )
+                continue
+            if contained is Containment.OUTSIDE:
                 logger.warning("App %s: agent path escapes app root: %s", app_name, agent_path)
                 continue
             if not agent_path.is_file():
@@ -1190,6 +1207,114 @@ def _deregister_agents(app_name: str) -> int:
     return removed
 
 
+def _unlink_unheld_app_lock(path: Path, identity: tuple[int, int]) -> bool:
+    """Remove the lock file at *path* only while nobody holds it, and only that inode.
+
+    A launcher may still hold an old ``<stem>.lock``; unlinking it then would let
+    the next launcher lock a fresh inode while the first still holds the old one.
+    So the file is opened without following links (with delete-sharing on
+    Windows, so our own handle does not block the unlink), its identity and
+    emptiness checked, and an exclusive lock taken without waiting: a held lock is
+    left alone, and the identity-verified unlink happens while ours is held.
+
+    Local to the apps package rather than reused from ``kiro_crew.acp``: the
+    agent-SDK import boundary (``scripts/check_agent_sdk_boundary.py``) forbids
+    application code from importing the ACP backend directly.
+    """
+    try:
+        fd = platform_compat.open_lock_file_for_sweep(path)
+    except OSError:
+        return False
+    try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != identity or opened.st_size != 0:
+            return False
+        if not platform_compat.try_acquire_lock(fd, exclusive=True):
+            return False
+        return pinned_fs.unlink_verified_by_name(path.parent, path.name, identity)
+    except OSError:
+        return False
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def purge_uninstalled_agent_residue(app_name: str) -> None:
+    """Remove the per-agent files an uninstalled app's agents left behind.
+
+    :func:`_deregister_agents` unlinks ``<app>--<agent>.json`` from the agents
+    directory, but two files derived from that same name outlive it:
+
+    * ``~/.kiro/agents/<app>--<agent>.lock`` -- the empty per-spec lock a
+      launcher takes beside each spec it rewrites.
+    * ``<mcp_gateway.overlay_dir>/<app>--<agent>.json`` -- the MCP gateway's
+      rewritten copy of the spec. The rewriter prunes it only on its next pass
+      (broker start), so until then a session asking for the agent by its bare
+      name -- including one of a DIFFERENT app reinstalled under this name --
+      would be handed stubs for servers the removed app declared.
+
+    Called at uninstall only, never on disable: a disabled app's overlay is still
+    the one its re-enable would want. Both names are derived exactly as
+    registration derives them (the ``<app>--`` namespace; kebab app names cannot
+    contain ``--``, so the prefix never matches another app), and each is left
+    alone while its source spec still exists. A lock goes through
+    :func:`_unlink_unheld_app_lock`, which removes only a regular, empty, unheld
+    file and unlinks it while holding its lock, so a launcher that still holds it
+    is never raced. Best-effort: a missing file or an unreadable
+    directory is not an error.
+    """
+    prefix = _safe_link_name(app_name + "/")
+    agents_dir = _kiro_agents_dir()
+    removed: list[str] = []
+
+    def _spec_present(stem: str) -> bool:
+        return (agents_dir / f"{stem}.json").exists()
+
+    try:
+        locks = list(agents_dir.glob(f"{prefix}*.lock"))
+    except OSError:
+        locks = []
+    for lock in locks:
+        if _spec_present(lock.stem):
+            continue
+        try:
+            info = os.lstat(lock)
+        except OSError:
+            continue
+        # lstat: a link or junction at the name is not S_ISREG, so it is refused
+        # outright and never followed.
+        if not stat.S_ISREG(info.st_mode):
+            continue
+        if _unlink_unheld_app_lock(lock, (info.st_dev, info.st_ino)):
+            removed.append(str(lock))
+
+    try:
+        from kiro_crew.config.loader import KiroCrewConfig
+        from kiro_crew.mcp_gateway.rewriter import resolve_overlay_dir
+
+        overlay_dir = resolve_overlay_dir(KiroCrewConfig.load().mcp_gateway.overlay_dir)
+        overlays = list(overlay_dir.glob(f"{prefix}*.json"))
+    except Exception:  # noqa: BLE001 - best-effort cleanup must not fail an uninstall
+        logger.debug("could not list MCP gateway overlays for %s", app_name, exc_info=True)
+        overlays = []
+    for overlay in overlays:
+        if _spec_present(overlay.stem):
+            continue
+        try:
+            # lstat, so a link at the name is refused rather than followed.
+            if not stat.S_ISREG(os.lstat(overlay).st_mode):
+                continue
+            overlay.unlink()
+            removed.append(str(overlay))
+        except OSError:
+            pass
+
+    if removed:
+        logger.info("Removed %d leftover agent file(s) for app %s", len(removed), app_name)
+
+
 # ---------------------------------------------------------------------------
 # Skill registration
 # ---------------------------------------------------------------------------
@@ -1197,12 +1322,20 @@ def _deregister_agents(app_name: str) -> int:
 _RESERVED_SKILL_DIRS = {"auto"}
 
 
-def _register_skills(app_name: str, manifest: AppManifest, app_root: Path) -> list[str]:
+def _register_skills(
+    app_name: str,
+    manifest: AppManifest,
+    app_root: Path,
+    io_failures: list[str] | None = None,
+) -> list[str]:
     """Symlink app skill directories into ~/.kiro/crew/skills/.
 
     Creates both a namespaced link (``skills/{app_name}/{skill_name}``) and a
     flat link (``skills/{skill_name}``) so the skill scanner finds the skill
     regardless of whether it walks subdirectories or only checks the top level.
+
+    ``io_failures``, when supplied, collects the skills skipped because the path
+    screen could not check them, which a later registration can still link.
 
     Returns list of registered skill names (namespaced).
     """
@@ -1222,9 +1355,22 @@ def _register_skills(app_name: str, manifest: AppManifest, app_root: Path) -> li
     app_skills_dir = skills_root / app_name
     app_skills_dir.mkdir(parents=True, exist_ok=True)
 
+    screened_root = screen_app_path(app_root)
     for skill_path_str in manifest.skills:
         skill_path = app_root / skill_path_str
-        if not skill_path.resolve().is_relative_to(app_root.resolve()):
+        contained = contained_in_screened_root(skill_path, screened_root)
+        if contained is Containment.UNCHECKED:
+            # Unverified is not refused: report it as retryable.
+            logger.warning("App %s: skill path could not be checked: %s", app_name, skill_path)
+            if io_failures is not None:
+                io_failures.append(str(skill_path))
+            continue
+        if contained is Containment.REFUSED:
+            logger.warning(
+                "App %s: skill path is refused by the path screen: %s", app_name, skill_path
+            )
+            continue
+        if contained is Containment.OUTSIDE:
             logger.warning("App %s: skill path escapes app root: %s", app_name, skill_path)
             continue
         if not skill_path.is_dir():
@@ -3768,10 +3914,17 @@ def _prune_stale_app_resources(app_name: str, manifest: AppManifest, app_root: P
     # Agents: the current link names the manifest still declares (same derivation
     # as _register_agents: the JSON's `name`, falling back to the file stem).
     current_links: set[str] = set()
+    screened_root = screen_app_path(app_root) if manifest.agents else Containment.UNCHECKED
     for agent_path_str in manifest.agents or []:
         agent_path = app_root / agent_path_str
         try:
-            if not agent_path.resolve().is_relative_to(app_root.resolve()):
+            contained = contained_in_screened_root(agent_path, screened_root)
+            if contained is Containment.UNCHECKED:
+                # An unverified path is not a removed agent: abort like an unreadable one.
+                raise OSError("containment could not be verified")
+            if contained is not Containment.INSIDE:
+                # Outside the root or refused by the path screen: registration
+                # never links it, so it carries no current name either.
                 continue
             data = json.loads(agent_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as exc:
@@ -3910,10 +4063,16 @@ def register_app(app_name: str) -> RegistrationResult:
             "-- agent source missing or unreadable"
         )
 
+    unchecked_skills: list[str] = []
     try:
-        result.skills = _register_skills(app_name, manifest, app_root)
+        result.skills = _register_skills(app_name, manifest, app_root, unchecked_skills)
     except Exception as exc:
         result.errors.append(f"skill registration failed: {exc}")
+    if unchecked_skills:
+        result.errors.append(
+            "skill path(s) could not be checked yet, retry registration: "
+            + ", ".join(unchecked_skills)
+        )
 
     try:
         result.crons = _register_crons(app_name, manifest)

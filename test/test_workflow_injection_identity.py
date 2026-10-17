@@ -9,6 +9,7 @@ from test_workflows_private_outputs import world as _world
 
 from kiro_crew.dashboard.workflow_inject import inject_bound_workflow_result
 from kiro_crew.execution_context import bind_session_execution
+from kiro_crew.testing.wait import await_until
 from kiro_crew.workflow_memory import WorkflowScope
 
 world = _world
@@ -40,7 +41,7 @@ async def test_completion_rechecks_target_after_binding(world, monkeypatch, repl
     }
     delivery = asyncio.create_task(inject_bound_workflow_result(state, scope.run_id, snapshot))
     try:
-        await asyncio.wait_for(bound.wait(), 2)
+        await await_until(bound, what="the session binding finishing")
         target = "alice" if replacement == "origin" else f"workflow-{scope.run_id}"
         slot = _FakeSlot(target)
         slot.agent = "bob"

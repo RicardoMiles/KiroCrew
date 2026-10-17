@@ -826,6 +826,8 @@ class LaunchTools:
     bind_voice_safe_agent_workspace_async: Callable[[Any], Awaitable[tuple[str, int | None]]]
     create_subprocess_limited: Callable[..., Awaitable[asyncio.subprocess.Process]]
     retrying_spawn_factory: Callable[..., Awaitable[asyncio.subprocess.Process]] | None = None
+    #: ``agent.env`` (``acp.agent_env.agent_env_overlay``); blocking, run off-loop.
+    agent_env_overlay: Callable[[], dict[str, str]] = field(default=dict)
 
 
 def _unscoped(argv: list[str]) -> tuple[list[str], str]:
@@ -871,6 +873,10 @@ class LaunchRequest:
     env_after_marker: Callable[[dict[str, str]], None] = field(default=_no_env_step)
     env_after_scratch: Callable[[dict[str, str]], None] = field(default=_no_env_step)
     scope_argv: Callable[[list[str]], tuple[list[str], str]] = field(default=_unscoped)
+    #: ``agent.env`` as the driver already read it for this spawn, or ``None`` to
+    #: read it here. A driver whose harness verifies its config before the spawn
+    #: passes the snapshot that verification used, so both see the same values.
+    agent_env: Mapping[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -879,6 +885,47 @@ class LaunchedProcess:
 
     process: asyncio.subprocess.Process
     scope_unit: str = ""
+
+
+def _well_formed_port(value: str) -> bool:
+    """1-5 ASCII decimal digits naming a port in 1..65535 (the KAS projection's gate)."""
+    return 1 <= len(value) <= 5 and value.isascii() and value.isdecimal() and 0 < int(value) < 65536
+
+
+def drop_foreign_inherited_port(env: dict[str, str]) -> None:
+    """Remove an inherited ``KIROCREW_PORT`` that names a gateway other than this one.
+
+    A gateway started from a shell that already exports ``KIROCREW_PORT`` (an
+    agent shell of ANOTHER gateway carries one) keeps that value in its own
+    environment beside the ``KIROCREW_BOUND_PORT`` its listener exports
+    (``dashboard.server_runtime.listener._export_bound_port``). Every child it
+    spawns -- the agent CLI and the managed MCP servers that CLI starts --
+    inherits both, and ``port_resolution.resolve_client_port_src`` reads
+    ``KIROCREW_PORT`` first. The child then dials the OTHER gateway with THIS
+    gateway's credential and every tool call fails ``internal_auth_mismatch``.
+
+    Dropping the foreign value, rather than overwriting it with the bound port,
+    is deliberate: the listener keeps the two variables apart so the transient
+    bound port is never written under the operator-intent name (which
+    ``service_environment()`` would bake into a unit file), and nothing here is
+    persisted -- it shapes one child's environment at spawn time. With the
+    foreign value gone the child's chain falls to ``KIROCREW_BOUND_PORT``, the
+    gateway that spawned it.
+
+    A no-op when no well-formed bound port is exported (nothing to prove the
+    inherited value foreign) or when the inherited value already equals it (the
+    operator's own ``KIROCREW_PORT`` that this gateway bound). Mutates *env*.
+    """
+    bound = env.get("KIROCREW_BOUND_PORT", "")
+    if not _well_formed_port(bound):
+        return
+    inherited = env.get("KIROCREW_PORT")
+    if inherited is None:
+        return
+    value = inherited.strip()
+    if value.isascii() and value.isdecimal() and int(value) == int(bound):
+        return
+    env.pop("KIROCREW_PORT", None)
 
 
 async def launch(host: LaunchHost, request: LaunchRequest, tools: LaunchTools) -> LaunchedProcess:
@@ -992,6 +1039,18 @@ async def launch(host: LaunchHost, request: LaunchRequest, tools: LaunchTools) -
     argv, scope_unit = request.scope_argv(argv)
 
     env = {**os.environ}
+    # Before any configured layer: only the INHERITED value can be foreign.
+    drop_foreign_inherited_port(env)
+    # ``agent.env``: the operator's variables for everything the agent runs, over
+    # the inherited gateway environment and under everything below -- the
+    # driver's ``extra_env``, its session identity and credential repair, and the
+    # scrub, which still removes any denied name. Off-loop (reads config);
+    # guarded because the sandbox launcher above is live. A driver that already
+    # read it for this spawn hands that snapshot over instead.
+    if request.agent_env is not None:
+        env.update(request.agent_env)
+    else:
+        env.update(await host._to_thread_guarding_sandbox(tools.agent_env_overlay))
     if request.extra_env:
         env.update(request.extra_env)
     env["PATH"] = tools.augmented_path(env.get("PATH", ""))

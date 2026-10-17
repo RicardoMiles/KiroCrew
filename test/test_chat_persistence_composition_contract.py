@@ -76,7 +76,6 @@ _FACADE_DEFINED = frozenset(
         "_LOCAL_TURN_PROMPT_MAX_FIELD_CHARS",
         "_LOCAL_TURN_PROMPT_META_KEYS",
         "_LOCAL_TURN_PROMPT_ROLES",
-        "_MAX_HISTORY_CHARS",
         "_META_LAST_USER_AT",
         "_PENDING_MEMORY_MODE_LOCK",
         "_REASONING_EFFORT_FALLBACK",
@@ -378,7 +377,7 @@ _MOVED: dict[str, str] = {
 
 #: The signature of every function the facade defined, as it was at that base.
 _SIGNATURES: dict[str, str] = {
-    "_apply_recent_session": "(state: 'DashboardState', key: 'str', slot_name: 'str', session: 'dict', meta: 'dict', messages: 'list[dict]', *, conv_log: \"'ConversationLog'\", kiro_model_map: 'dict[str, str]', restore_cfg: \"'KiroCrewConfig | None'\", member_identity: 'tuple[str, str] | None' = ('', '__unresolved__'), agent: 'str | None' = None, effort_marker: 'bool' = False) -> 'None'",
+    "_apply_recent_session": "(state: 'DashboardState', key: 'str', slot_name: 'str', session: 'dict', meta: 'dict', messages: 'list[dict]', *, conv_log: \"'ConversationLog'\", kiro_model_map: 'dict[str, str]', restore_cfg: \"'KiroCrewConfig | None'\", member_identity: 'tuple[str, str] | None' = ('', '__unresolved__'), agent: 'str | None' = None, effort_marker: 'bool' = False, pending_backfills: 'list[tuple[str, dict]] | None' = None) -> 'None'",
     "_apply_restored_open_slot": "(state: 'DashboardState', key: 'str', *, meta: 'dict', readable: 'bool', messages: 'list[dict] | None', model_map: 'dict[str, str] | None', unrestored: 'set[str]', member_identity: 'tuple[str, str] | None' = ('', '__unresolved__'), agent: 'str | None' = None, effort_marker: 'bool' = False, conv_log: 'ConversationLog | None' = None, started: 'float | None' = None, preserve_remote_only: 'bool' = False, tail: 'list[dict] | None' = None, dropped: 'set[str] | None' = None) -> 'int'",
     "_approx_window_payload_bytes": "(window: 'list[dict]') -> 'int'",
     "_archive_dropped_lines": "(state: 'DashboardState', history_key: 'str', old_lines: 'list[str]', new_lines: 'list[str]') -> 'None'",
@@ -1313,7 +1312,7 @@ _GOLDEN: dict[str, dict] = {
     },
     "empty_window_merge": {
         "file": (
-            '{"_type": "metadata", "created_at": "2026-01-02T03:04:05", "last_consolidated": 0, "title": "New", "rotation_generation": 4, "other_layer": "kept", "folder_id": "folder-2", "tags": ["a", "b"], "pinned": false, "mutes_opened": false, "muted": false, "mode": "", "artifact": "", "reasoning_effort": "", "color_index": null, "color_hex": "", "color_theme": "", "memory_mode": "persistent", "model": "", "queued_prompts": [], "autocompact_pct": null, "turn_timeout_secs": null, "title_low_signal": false, "workspace": "default", "memory_store": "", "agent_kind": "", "project": "", "turn_in_flight_generation": 0, "turn_in_flight_prompt": null, "tab_id": "tab-golden-empty", "closed": true, "closed_at": 1767225600.0, "dismissed_source_links": [], "deferred_notes": []}\n'
+            '{"_type": "metadata", "created_at": "2026-01-02T03:04:05", "last_consolidated": 0, "title": "New", "rotation_generation": 4, "other_layer": "kept", "folder_id": "folder-2", "tags": ["a", "b"], "pinned": false, "mutes_opened": false, "muted": false, "mode": "", "artifact": "", "reasoning_effort": "", "color_index": null, "color_hex": "", "color_theme": "", "memory_mode": "persistent", "model": "", "queued_prompts": [], "autocompact_pct": null, "turn_timeout_secs": null, "title_low_signal": false, "workspace": "default", "memory_store": "", "agent_kind": "", "app_agent_owner": "", "project": "", "turn_in_flight_generation": 0, "turn_in_flight_prompt": null, "tab_id": "tab-golden-empty", "closed": true, "closed_at": 1767225600.0, "dismissed_source_links": [], "deferred_notes": []}\n'
         ),
         "ok": True,
     },

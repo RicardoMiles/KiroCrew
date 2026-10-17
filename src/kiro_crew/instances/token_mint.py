@@ -27,7 +27,12 @@ import shutil
 
 from kiro_crew.config.paths import CONFIG_DIR_NAME, LEGACY_CONFIG_DIR_NAME
 from kiro_crew.deploy.engine import tool_spawn_env
-from kiro_crew.instances.constants import DEFAULT_MINT_TIMEOUT_SECS, TTL_PATTERN
+from kiro_crew.instances.constants import (
+    DEFAULT_MINT_TIMEOUT_SECS,
+    DEFAULT_SSM_MINT_TIMEOUT_SECS,
+    MINT_TIMEOUT_CEILING_SECS,
+    TTL_PATTERN,
+)
 from kiro_crew.platform_compat import kill_and_reap
 from kiro_crew.security import redact
 
@@ -71,7 +76,7 @@ _TOKEN_RE = re.compile(r"[?&]token=([^\s&]+)")
 # outside a URL before a stdout tail is put into an exception message.
 #
 # The segment count is `{1,4}` REPEATED, not a fixed `head.payload.sig` triple:
-# `generate_token` (dashboard/token_auth.py) mints `payload.signature` — only
+# `generate_token` (dashboard/token_auth_tokens.py) mints `payload.signature` — only
 # TWO segments — so a three-segment pattern would never match the shape this app
 # actually produces, leaving the scrub layer inert against its own tokens. The
 # upper bound covers a compact JWE (five segments) so a partial match cannot
@@ -114,6 +119,29 @@ _CLIPPED_MARKER = "<clipped>"
 # Canonical default lives in instances.constants (user-tunable via
 # ``instances.mint_timeout_secs``); aliased here for the local call sites.
 _DEFAULT_MINT_TIMEOUT_SECS = DEFAULT_MINT_TIMEOUT_SECS
+
+
+def _mint_timeout_advice(timeout_secs: float) -> str:
+    """Name the setting that budgets a mint, for the end of a timeout message.
+
+    Both transports share it so the next step reads the same over SSH and SSM.
+    A budget already at ``MINT_TIMEOUT_CEILING_SECS`` cannot be raised (the
+    config loader clamps it), so that case points at the host instead. The one
+    setting overrides the mint budget of BOTH transports, so the advice says so:
+    a value picked for a slow SSH host could otherwise lower every SSM crew's
+    budget below its own default.
+    """
+    if timeout_secs >= MINT_TIMEOUT_CEILING_SECS:
+        return (
+            "This budget is already at its maximum, so check that the host is "
+            "reachable rather than raising it."
+        )
+    return (
+        "If the host is reachable but slow to answer, raise the budget with "
+        "`kirocrew config set instances.mint_timeout_secs <value>` and connect again. "
+        "The setting applies to SSH and SSM mints alike, so keep it at or above "
+        f"{DEFAULT_SSM_MINT_TIMEOUT_SECS:g}s if any crew connects over SSM."
+    )
 
 
 class TokenMintError(Exception):
@@ -580,7 +608,12 @@ async def mint_remote_token(
         stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_secs)
     except asyncio.TimeoutError as e:
         await kill_and_reap(proc)
-        raise TokenMintError(f"timed out minting token on {ssh_host} after {timeout_secs}s") from e
+        raise TokenMintError(
+            f"timed out minting token on {ssh_host} after {timeout_secs}s; ssh had not "
+            f"returned the token when the budget ran out. If the host is reached "
+            f"through a jump host or proxy, the mint pays that handshake again; "
+            f"otherwise the host may not be answering. {_mint_timeout_advice(timeout_secs)}"
+        ) from e
 
     stdout = stdout_b.decode("utf-8", "replace")
     stderr = stderr_b.decode("utf-8", "replace").strip()

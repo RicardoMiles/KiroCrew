@@ -53,6 +53,26 @@ PERSISTENT_SOURCE_TYPES = frozenset({"local_folder", "obsidian_vault", "quip"})
 # top out around 0.89 -- so 0.95 separates them with margin.
 DEFAULT_FUZZY_THRESHOLD = 0.95
 
+# Scheduled-sweep guard for a pathological single-signature bucket. The fuzzy
+# near-stem adjacency build is O(d^2) in the number of DISTINCT cross-source stems
+# that share one embedding_sig (see _near_stem_adjacency). When a settled Library
+# has re-embedded so the whole corpus lands in one signature, that build holds the
+# GIL in the gateway's worker thread for a noticeable time (about 20 s at 4,000
+# documents in one signature). Above this many distinct stems in a single signature
+# bucket, the SCHEDULED sweep skips that bucket's near-stem adjacency (and logs one
+# warning); exact-content duplicates and equal-stem fuzzy matches in the bucket are
+# unaffected, as is the O(n) per-ingest ``dedup_document`` path.
+#
+# The cap is chosen so the worst case it still ALLOWS is a few seconds, not the
+# multi-second stall a pathological Library hits: measured single-signature build
+# times are about 3 s at 2,000 distinct stems and about 19 s at 4,000, so a cap at
+# 4,000 would still permit a ~19 s stall. 2,000 bounds the allowed build to about
+# 3 s while sitting well above a normal Library (hundreds to low thousands of
+# documents), so no realistic Library changes behaviour; only a pathological
+# single-signature corpus does. CLI/MCP backfill passes ``max_fuzzy_bucket=None``
+# so a human-invoked full sweep is never capped.
+SCHEDULED_FUZZY_BUCKET_CAP = 2000
+
 # Filename near-match floor: ratio on the normalized stem for names that are not
 # exactly equal after normalization (tolerates minor edits/typos).
 _FILENAME_RATIO_FLOOR = 0.9
@@ -572,7 +592,8 @@ class DedupAction:
     reason: str
 
 
-def find_duplicates(store, docs: list[DocRef], threshold: float) -> list[DedupAction]:
+def find_duplicates(store, docs: list[DocRef], threshold: float,
+                    *, max_fuzzy_bucket: int | None = None) -> list[DedupAction]:
     """Greedy pairwise collapse. Each loser is removed from further consideration, and a
     document that has already won a collapse is protected from later becoming a loser --
     so a deleted document's designated survivor is never itself deleted, and content
@@ -588,11 +609,17 @@ def find_duplicates(store, docs: list[DocRef], threshold: float) -> list[DedupAc
     list is identical to the dense O(n^2) scan -- same pairs, same order. The whole
     pair graph is never retained, so a corpus of thousands of same-stem cross-source
     files cannot exhaust memory. See ``_CandidateIndex``.
+
+    ``max_fuzzy_bucket`` is the one exception to "identical to the dense scan": on a
+    scheduled pass it drops the near-filename-match tier for a single ``embedding_sig``
+    bucket with more distinct stems than the cap (exact-content and identical-stem
+    matches are kept). Left ``None`` -- the default, used by the CLI/MCP backfill --
+    the result is exactly the dense scan's.
     """
     actions: list[DedupAction] = []
     removed: set[tuple[str, str]] = set()
     survivors: set[tuple[str, str]] = set()  # designated winners; must not be deleted
-    index = _CandidateIndex(docs)
+    index = _CandidateIndex(docs, max_fuzzy_bucket=max_fuzzy_bucket)
     for i in range(len(docs)):
         if docs[i].key in removed:
             continue
@@ -637,7 +664,7 @@ class _CandidateIndex:
     memory the way retaining every pair would.
     """
 
-    def __init__(self, docs: list[DocRef]) -> None:
+    def __init__(self, docs: list[DocRef], *, max_fuzzy_bucket: int | None = None) -> None:
         self._docs = docs
         self._item_sets = [set(d.item_ids) for d in docs]
 
@@ -669,10 +696,26 @@ class _CandidateIndex:
             self._sig_stems.setdefault(d.embedding_sig, {}).setdefault(s, []).append(idx)
             self._sig_stem_sources.setdefault(d.embedding_sig, {}).setdefault(
                 s, set()).add(d.source_id)
-        self._sig_adjacency: dict[str, dict[str, list[str]]] = {
-            sig: _near_stem_adjacency(list(stems), self._sig_stem_sources[sig])
-            for sig, stems in self._sig_stems.items()
-        }
+        self._sig_adjacency: dict[str, dict[str, list[str]]] = {}
+        for sig, stems in self._sig_stems.items():
+            distinct_stems = len(stems)
+            if max_fuzzy_bucket is not None and distinct_stems > max_fuzzy_bucket:
+                # Pathological single-signature bucket on a SCHEDULED pass: the
+                # near-stem adjacency build is O(distinct_stems^2) and would hold the
+                # GIL for a noticeable time. Skip it for this bucket (equal-stem and
+                # exact-content matches still collapse); warn once naming the count
+                # and threshold so the skip is observable.
+                logger.warning(
+                    "Scheduled knowledge dedup: skipping the near-filename-match pass "
+                    "for an embedding-signature group of %d distinct document names "
+                    "(above the %d cap) to avoid stalling the gateway; exact-content "
+                    "and identical-name duplicates in this group are still collapsed. "
+                    "Run `kiro-crew knowledge dedup` manually for a full near-match "
+                    "pass.", distinct_stems, max_fuzzy_bucket)
+                self._sig_adjacency[sig] = {}
+                continue
+            self._sig_adjacency[sig] = _near_stem_adjacency(
+                list(stems), self._sig_stem_sources[sig])
 
     def _can_match(self, a: int, b: int) -> bool:
         da, db = self._docs[a], self._docs[b]
@@ -917,7 +960,8 @@ def _audit_collapse(action: DedupAction) -> None:
 
 
 def dedup_sweep(store, *, threshold: float = DEFAULT_FUZZY_THRESHOLD,
-                apply: bool = False, certain_only: bool = False) -> list[dict]:
+                apply: bool = False, certain_only: bool = False,
+                max_fuzzy_bucket: int | None = None) -> list[dict]:
     """Find (and optionally collapse) all cross-source duplicate documents.
 
     O(n^2) full-corpus pass intended for the one-time backfill (CLI/MCP) and the
@@ -933,9 +977,17 @@ def dedup_sweep(store, *, threshold: float = DEFAULT_FUZZY_THRESHOLD,
     document its unique text -- and a filename-plus-cosine match is a judgement, not a
     fact: two same-named weekly reports can clear the threshold while saying different
     things. Every result is still returned either way, so nothing is hidden.
+
+    ``max_fuzzy_bucket`` guards the SCHEDULED pass against a pathological
+    single-signature bucket: above that many distinct filename stems in one
+    ``embedding_sig`` group, the near-filename-match pass for that group is skipped
+    (and logged once) so the O(d^2) adjacency build cannot stall the gateway;
+    exact-content and identical-name duplicates there still collapse. ``None`` (the
+    default, used by the CLI/MCP backfill) never caps -- a human-invoked full sweep
+    always does the complete near-match pass.
     """
     docs = enumerate_docs(store)
-    actions = find_duplicates(store, docs, threshold)
+    actions = find_duplicates(store, docs, threshold, max_fuzzy_bucket=max_fuzzy_bucket)
     results = [_action_dict(a) for a in actions]
     if apply:
         for action in actions:

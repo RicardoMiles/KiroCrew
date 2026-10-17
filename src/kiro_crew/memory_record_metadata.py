@@ -186,6 +186,19 @@ def record_id_for(kind: str, record_id: str) -> str:
     return record_id if kind == "episode" or record_id.startswith("key:") else f"key:{record_id}"
 
 
+def record_identity_or_none(kind: str, record_id: Any) -> str | None:
+    """The record id for a row, or ``None`` when its identity is NULL or empty.
+
+    SQLite lets a TEXT PRIMARY KEY hold NULL and older importers wrote such
+    rows; ``reconcile`` leaves them untouched rather than let one stop the
+    store from opening. Read paths share that contract through this helper so a
+    legacy row carries no metadata but never raises.
+    """
+    if not isinstance(record_id, str) or not record_id:
+        return None
+    return record_id_for(kind, record_id)
+
+
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 

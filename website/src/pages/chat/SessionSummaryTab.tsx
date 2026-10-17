@@ -154,9 +154,9 @@ function useOverflowFade<T extends HTMLElement>(enabled: boolean) {
 function StateChip({ state }: { state: IntentState }) {
   const tone =
     state === 'needs-you'
-      ? 'bg-warn-subtle border-warn/40 text-warn'
+      ? 'bg-warn-subtle border-warn/40 text-warn-text'
       : state === 'done'
-        ? 'bg-ok-subtle border-ok/45 text-ok'
+        ? 'bg-ok-subtle border-ok/45 text-ok-text'
         : state === 'in-progress'
           ? 'bg-accent-subtle border-accent/45 text-accent'
           : 'border-border-strong text-muted-strong'

@@ -74,7 +74,7 @@ is to scroll past everything or open a new session.
 the slot a fresh *model* conversation while keeping the slot open. With
 `{"replay": false}` it also suppresses the `[CONVERSATION HISTORY]` re-injection
 that would otherwise rebuild what was just discarded
-(`session_lifecycle.py`). It does not
+(`session_lifecycle_parts/teardown.py`). It does not
 solve this, for two independent reasons.
 
 **It deliberately does not touch the view**, per its own docstring:
@@ -151,7 +151,7 @@ if role == "system" and cls_val:
 ```
 
 — `dashboard/chat_persistence.py`. Meanwhile `ConversationLog.append`
-persists any truthy `cls` (`history.py`, `append`). A `cls`-carried marker on any role
+persists any truthy `cls` (`history_append.py`, `append`). A `cls`-carried marker on any role
 other than `system` is silently dropped on the dashboard's persist path. `meta`
 persists for every role (`chat_persistence.py`), which is where the
 label belongs.
@@ -165,7 +165,7 @@ un-picking a deliberate "carries state, not something to read" classification.
 **Why not `role="inject"`** (what `/note` writes) — two concrete harms. It is in
 `RECALL_ROLES` (`context_assembly/replay.py`), so every marker would be replayed into the model
 as conversation content; a chapter break must not enter the prompt. And it is in
-`_PROMPT_ROLES` (`dashboard/state.py`), so a marker would rank as an inbound
+`_PROMPT_ROLES` (`dashboard/state_parts/slot_transcript.py`), so a marker would rank as an inbound
 prompt for the sidebar's `last_turn_ts`, making a session look freshly asked-of
 every time a break was drawn.
 
@@ -305,10 +305,10 @@ Why this over an HTTP route, in the module's own words
 
 **Explicitly rejecting `/note` reuse.** `/note` always performs *two* writes: a
 visible `inject` row and a `_pending_context` entry drained into the next user
-message (`chat_handlers.py`). The context half is the one thing a marker
+message (`dashboard/chat_api/slot_note.py`). The context half is the one thing a marker
 must never do. There is no visible-only mode, and the docstring says why — "there
 is no visible-only mode, because no caller wanted one"
-(`chat_handlers.py`). Adding one would graft a second, quieter feature
+(`dashboard/chat_api/slot_note.py`). Adding one would graft a second, quieter feature
 onto an endpoint whose contract is "both writes always happen".
 
 ### 5.6 MCP tool signature
@@ -318,7 +318,7 @@ section_marker(label?: string, collapse_earlier?: boolean = true) -> string
 ```
 
 - `label` — optional, ≤120 chars, control characters rejected. Validate with the
-  helper `/note` uses (`_validate_content` at `chat_handlers.py`).
+  helper `/note` uses (`_validate_content` at `dashboard/chat_api/pending_context.py`).
 - `collapse_earlier` — whether this marker sets the default viewport or is a
   visual rule only. Defaults true; present so a caller can annotate a boundary
   without moving the reader's window.
@@ -481,7 +481,7 @@ Exit criteria:
 `POST /api/chat/slots/{slot}/section`, mirroring `/note`'s auth and
 re-authorization shape (`deny_app_slot_session_access` in
 `dashboard/slot_ownership.py`, and `_reauthorize_after_await` in
-`chat_handlers.py`, which delegates to it), body `{label?, collapseEarlier?}`,
+`dashboard/chat_api/app_admission.py`, which delegates to it), body `{label?, collapseEarlier?}`,
 returning `{"ok", "appended", "visibleDeferred"}`.
 
 Listed so the directive design does not foreclose it. Not proposed for the first
@@ -527,7 +527,7 @@ existing write-boundary redaction rather than needing its own: because the role 
 not `user`, `_build_message_entry_uncached` runs `redact_exfiltration_urls` and
 `redact_credentials` over `content` (`dashboard/chat_persistence.py`),
 and `meta` goes through `_redact_meta_for_role`
-(`dashboard/chat_utils.py`, called at `chat_persistence.py`). Validation
+(`dashboard/chat_utils_display.py`, called at `chat_persistence.py`). Validation
 is still required at the boundary — length cap and control-character rejection
 (§5.6) — and the rendered label must go through the same markdown/escaping path as
 other row content rather than being injected as markup.

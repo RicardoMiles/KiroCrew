@@ -16,7 +16,7 @@ import { postNativeNotification } from '../../lib/nativeNotify'
 import { normalizeRunSessionKey } from '../../apps/workflows/runModel'
 import { dashboardAutomationSlotKey } from '../../monitoring/automation'
 import { i18nT } from '../../i18n/t'
-import { attendArrival } from './attention'
+import { attendArrival, isSlotOnScreen } from './attention'
 import { takeIdleRowRefresh } from './idleRowRefresh'
 import { refreshPullRequestsAfterTurn, refreshSessionControlStatusesAfterTurn } from './serverState'
 import type { FrameData } from './frames'
@@ -135,6 +135,15 @@ export function useTurnCompletion({ dispatch, queryClient, reconnectingRef }: Tu
         if ((!muted || turnErrored) && (!memberThread || memberSpoke)) dispatch(markSlotUnread({ slot, ts: (data as { ts?: string }).ts || undefined }))
         dispatch(warmSlotCache(slot))
       })
+      // A pane on screen that is not the Redux active slot -- the Crew Members
+      // DM thread is the standing case -- is reached by neither the off-screen
+      // warm above nor `refreshSlot` below, which declines any non-active slot.
+      // A reply row that never reduced live would stay missing until a page
+      // reload, so the turn end reconciles it to the server transcript the same
+      // way a reconnect does. Reconnect replays are skipped: catch-up warms them.
+      if (data.slot && !reconnectingRef.current && data.slot !== store.getState().chat.activeSlot && isSlotOnScreen(data.slot)) {
+        dispatch(warmSlotCache(data.slot))
+      }
       if (data.slot) {
         dispatch(setSlotStatusDetail({ slot: data.slot, kind: 'idle', ts: Date.now() }))
       }

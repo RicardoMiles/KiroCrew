@@ -19,7 +19,7 @@ export function useStaleCollapse({ pinned, activeSlot, runningSet, subagentCount
 }) {
   // ── Stale-session collapse ─────────────────────────────────────────────────
   // Sessions idle past the threshold collapse behind a per-container
-  // "N dormant sessions hidden" expander row, independently at every tree level (each
+  // "Show N sleeping sessions" expander row, independently at every tree level (each
   // folder body + the ungrouped root). Pinned, focused, running and
   // needs-input sessions are exempt: collapsing de-noises settled work, it is
   // never a place where live or deliberately-kept rows can disappear.

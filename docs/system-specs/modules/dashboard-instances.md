@@ -15,6 +15,21 @@ The instance store is two modules and one route, each with one job:
 
 The agent-facing surface is separate and MCP-only: `dashboard/handlers/agent_panel.py` serves the `/api/agent-panel/dashboard/{fields,write,templates,preview,apply,rollback}` routes, `dashboard_agentic.py` checks and records agentic field writes and the mistake book, and `dashboard_feed.py` is the O(fields) subscription channel a filled page reads fold values through.
 
+An array or object field is emptied with `dashboard_write` `clear: true` and no
+`value`. The MCP server (`mcp_panel.py`) reads the field's declared type from the
+`/api/agent-panel/dashboard/fields` route, then posts `value: {}` for an object field
+and `value: []` for any other field, so the write route and its body schema
+(`DASHBOARD_WRITE_SCHEMA`) see an ordinary write and type-check it the same way; the
+tool's own argument schema is `DASHBOARD_WRITE_TOOL_SCHEMA`. The MCP server does not
+refuse a clear for the field's type or source: a string, number or boolean field, a
+fold-sourced field and an unknown field all reach the write route, which refuses them
+(`wrong_type`, `field_not_agentic`, `unknown_field`) and records each refusal in the
+mistake book. When the field list cannot be read, the server posts `value: []`, so
+emptying an array field does not depend on the fields route. The flag exists because
+an MCP client can drop an empty list, an empty object or a top-level null from a tool
+call's arguments before the server reads them, so `value: []` or `value: {}` arrives
+as no value at all and is refused as missing; a boolean arrives intact.
+
 The sharing and snapshot modules are designed in the RFC and built behind the surface
 that calls each -- a chooser, an export button -- because a module with no caller is
 one nobody can review against a use. Neither is in the tree yet, so this table names
@@ -75,6 +90,23 @@ after it landed. The two need opposite answers from a human -- one is a fresh cr
 the other is a dashboard that stopped working -- so a 404, or one word for both, would
 hide the second behind the first.
 
+An `empty` crewmate is still SHOWN a page, from `default_instance(slug)`: the shipped page
+whose id is the crewmate's slug, else `DEFAULT_TEMPLATE_ID`. Only shipped pages match by
+name; an operator's page never does. The read route and the `[DASHBOARD]` turn block both
+resolve through it, and nothing is written. No shipped page may be named `default`.
+The crewmate's Dashboard tab on `/members` does not draw the generic `DEFAULT_TEMPLATE_ID`
+fallback: it shows the suggestions page (`CrewDashboardEmpty`) instead, and the turn block
+says so and lists no fields and no upkeep pointer (a value written there would land on a
+page nobody sees). A shipped page named for the crewmate is drawn as before. The decision
+is made ONCE, by `dashboard_agentic.shows_suggestions` (template instance served, record
+`empty`, template not named for the slug, no package on screen): the read route sends it as
+`suggestions: true` and the website draws what that says, and `turn_block` and the
+profile's upkeep view ask the same function, with the same package lookup
+(`dashboard_agentic.bound_package`) and the same lock rule as the route.
+`dashboard_fields` and `dashboard_write` are NOT changed by this: a crewmate or script that
+still writes to the default while the suggestions page shows is accepted and the value is
+kept as before, only not drawn. Nothing here deletes or migrates it.
+
 `stale` covers two cases with different sentences: the template moved ahead of the copy,
 and the template left the registry. Nothing is missing from the copy in either case --
 it still renders -- which is exactly what the frame's stale band says.
@@ -100,7 +132,7 @@ whether or not the append lands, because the committed version must not be a ver
 its own history does not mention.
 
 `action` is a CLOSED enum, and the vocabulary lives beside the entry type in
-`crew_log/entry_types.py` with the store importing it. One tuple, two readers: a fourth
+`crew_log/entry_types_surfaces.py` with the store importing it. One tuple, two readers: a fourth
 action added in the store alone would be a change the store reports as taken and the log
 drops.
 
@@ -223,6 +255,42 @@ All five rules live in one `_resolve` chokepoint, so a route added later cannot 
 one of them, and a test reads the handlers' own syntax trees to assert every one calls it
 and every write calls the owner gate.
 
+The page is scrubbed before it is served, in both halves of the body (the raw `html` and the
+composed `rendered_html`), by `_template_text_safe`. Markup, attributes and prose get every
+redaction pass. The text of a `<script>` or `<style>` element gets every pass but the
+bare-secret guess for two shapes, so a page's code arrives as its author wrote it (a long alphabet to index
+into, a base64 data URI) while a key id, PEM block, JWT or prefixed token written into that
+code is still masked.
+
+`dashboard_frame.map_page_text` takes the full pass over the whole page as its baseline, and the
+one change it allows is to put the code pass's result for a script or style element's text where
+the baseline had the full pass's. So the page differs from the baseline only inside that text,
+and only by an ordered alphabet and a data URI payload, the two shapes the code pass spares. The baseline is cut at that text and the pieces are
+scrubbed one by one; a rule that reaches across a cut (a PEM block, a labelled value) makes them
+differ from the baseline, and then the baseline is the answer. The browser reads the page that
+comes out, so the result is scanned again, and unless the kept text is still exactly its script
+and style text the baseline is the answer as well. A page the full pass leaves alone, or with no
+such text, is the baseline.
+
+`dashboard_frame.code_spans` finds that text, and what it finds is a licence to apply a
+weaker rule, so it reads the page the way the HTML tokenizer does where that decides what is
+code: a `<script` inside a comment, a quoted attribute value or a `<textarea>` opens nothing,
+a `>` inside a quoted value does not end its tag, a bare value runs to white space or `>`, a
+script that holds `<!--` ends where the tokenizer's escape states end it (a `</script>` that
+closes a nested `<script>` does not), and names fold ASCII case and split on ASCII white space
+only. Where the tree builder decides
+instead, the scan reads a simple `<svg>` or `<select>` (text and ordinary tags up to its end
+tag) whole and goes on; any other `<svg>` or `<select>`, and every `<math>` and `<template>`
+(a column group inside one ignores a `<style>`), ends the scan.
+A frame may run with scripting on or off, and `<noscript>` holds text in one and markup in the
+other, so the scan ends at it too. It also ends at anything it cannot read (an element or tag
+that never ends, `<script/>` in HTML, `<plaintext>`) and after `_MAX_SCAN_STEPS` constructs.
+Everything after that point keeps every pass, as does every element past the first
+`MAX_CODE_PIECES`, so a page the scan doubts gets more masking, never less. A key in any other shape, labelled or not, is masked as it is anywhere. A key-shaped window inside
+a data URI payload of 64 characters or more is served as written, and a shuffled table is rewritten
+as before. A base64 data URI in an attribute (an `img` `src`) is markup, so it still gets every
+pass.
+
 ## The staged preview is beside the record, never in it
 
 A preview is a page somebody is being SHOWN before anything is recorded, and the store
@@ -266,7 +334,9 @@ pair passed at staging, but staging and applying are two cycles with a person be
 them, and the parity rule is about the pair being committed.
 
 **One size ceiling, and it is the frame's.** `MAX_INSTANCE_HTML_BYTES` reads
-`dashboard_frame.MAX_PAGE_BYTES` rather than stating a number of its own. A page passes
+`dashboard_frame.MAX_PAGE_BYTES` (3 MiB) rather than stating a number of its own. The
+`MAX_RETAINED_VERSIONS` (20) versions one crewmate keeps therefore hold at most 60 MiB
+of pages. A page passes
 two size checks -- this store's before it becomes a version, and the frame's before the
 document that renders it is assembled -- and two independent numbers meant the store
 could refuse a page the frame would happily draw. It did: `project-report` is over
@@ -282,6 +352,30 @@ describe a change the existing three already name.
 
 The preview is discarded once the version lands, so "keep this one" cannot be answered
 twice and quietly write two versions of one page.
+
+**The person can answer from the tab too.** A crewmate's staged page is drawn under
+**Keep** and **Discard** buttons in the host chrome (the Dashboard tab on `/members`
+and the chat side panel's preview tab), outside the sandboxed frame, so a page can
+never press them. Keep posts `POST /api/members/{slug}/dashboard/preview/apply` with
+the `staged_ms` the preview read returned; the route calls `apply_preview(...,
+expected_staged_ms=...)`, which refuses `PreviewChanged` (409 `preview_changed`)
+inside the instance lock when a different page was staged after the one shown. That
+is the button's version of `dashboard_apply`'s guarantee: what lands is what was
+drawn. Nothing staged answers 404 `no_preview` and a locked layout 423
+`dashboard_locked`. Discard posts `.../preview/discard` with the same `staged_ms`;
+`discard_shown_preview` drops only that page, refuses `preview_changed` for one staged
+since, and answers ok when nothing is staged any more. The route reads back and
+answers 500 `dashboard_failed` if a page is still there. The `staged_ms` the host sends
+is the one of the document the frame has MOUNTED, never a newer read still being
+minted, so both buttons stay disabled until the frame shows the page they would act
+on. Both carry the lock route's gates: an internal-secret caller is
+refused `human_only` first, then the owner gate, then the CSRF middleware every
+cookie POST passes. On a successful Keep the host leaves preview mode at once
+(dropping `?dashboard=preview`) and refetches the live page, with one line saying
+the page was kept and that the crewmate can roll it back. When the staged page goes
+any other way (the agent's `dashboard_apply`, a discard, expiry), the preview view
+hands over to the live page the same way, with a line that says so. Template
+previews only: a session's page has no person route.
 
 ## The structure lock is the person's, and only theirs
 

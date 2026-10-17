@@ -455,6 +455,12 @@ async def api_members(request: web.Request) -> web.Response:
                 # vocabulary ("" = never chosen, which opens the thread in trust).
                 "reasoning_effort": _roster_mask(agent_cfg.reasoning_effort),
                 "approval_mode": agent_cfg.approval_mode,
+                # The dispatched-worker pair, the profile card's other two
+                # pickers: what `session_create` pins on a child this crewmate
+                # opens without naming a model or effort. Masked like the
+                # crewmate's own model; the effort is load-time coerced.
+                "worker_model": _roster_mask(agent_cfg.worker_model),
+                "worker_reasoning_effort": agent_cfg.worker_reasoning_effort,
                 # Presentation-only, but `_safe_avatar` pins only the SHAPE:
                 # its `traits` and `expressions` values are free text, so the
                 # avatar is masked leaf-by-leaf (`_roster_avatar`) rather than
@@ -711,8 +717,8 @@ async def api_members(request: web.Request) -> web.Response:
             try:
                 if slug_rows[slug] > 1:
                     logger.warning(
-                        "member slug %r is shared by %d members, so none of them "
-                        "gets a projection; rename one member so their slugs differ",
+                        "member slug %r is shared by %d members, so none of them gets a "
+                        "projection; recreate the one not owning its thread under a new slug",
                         slug,
                         slug_rows[slug],
                     )
@@ -768,8 +774,8 @@ async def api_members(request: web.Request) -> web.Response:
                 logged_name = svc.logged_name(slug)
                 if logged_name is not None and logged_name not in (row["name"], slug):
                     logger.warning(
-                        "member slug %r logs %r, so %r gets no projection; "
-                        "rename one member so their slugs differ",
+                        "member slug %r logs %r, so %r gets no projection; recreate "
+                        "the member not owning this slug's thread under a new slug",
                         slug,
                         logged_name,
                         row["name"],
@@ -1016,6 +1022,46 @@ async def _bind_member_workspace(
     state.push_slots_update()
 
 
+async def _guard_and_pin_private_store(
+    state: "DashboardState",
+    slug_owners: list[str],
+    member_store: str,
+    canonical_key: str,
+    member_name: str,
+    cfg: "KiroCrewConfig",
+) -> "tuple[str, web.Response | None]":
+    """Run the v2 slug-collision guard and private-store pin.
+
+    Returns ``(assigned_store, None)`` on success and ``("", error_response)``
+    when the collision guard fires (409) or the pin raises (503).  The caller
+    is responsible for setting ``slot._memory_assignment_from_history`` and
+    for applying ``slot.memory_store = assigned_store`` on success.
+
+    Both the pre-mint path (no slot yet) and the post-publication lock path
+    (existing slot under ``slot._lock``) call this helper so the collision
+    guard and the 503 mapping stay in one place.
+    """
+    from kiro_crew.dashboard.handlers.memory import _store_unavailable_response
+    from kiro_crew.member_memory_auth import read_private_session_store
+
+    try:
+        if (
+            len(slug_owners) != 1
+            and (await asyncio.to_thread(read_private_session_store, canonical_key)) != member_store
+        ):
+            return "", web.json_response(
+                {
+                    "error": "choose distinct member names before opening this private thread",
+                    "code": "member_pin_mismatch",
+                },
+                status=409,
+            )
+        assigned = await pin_private_agent_store(state, canonical_key, member_name, cfg)
+        return assigned, None
+    except Exception as exc:
+        return "", _store_unavailable_response(member_store, exc)
+
+
 async def api_member_thread(request: web.Request) -> web.Response:
     """POST /api/members/{slug}/thread — idempotent get-or-create of a DM thread.
 
@@ -1173,16 +1219,50 @@ async def api_member_thread(request: web.Request) -> web.Response:
         # the same workspace below (both openers derive it from one config).
         slot = state._slots.get(slot_key)
         if slot is None:
-            minted = True
-            with state.suspend_slots_push():
-                slot = state.get_or_create_slot(
-                    name=slot_key,
-                    agent=member_name,
-                    workspace=member_workspace,
-                    mode=members_mod.DM_SLOT_MODE,
-                    origin=request_slot_origin(request.get("app", "")),
+            # Pin the v2 private store BEFORE minting the slot.  A refused
+            # pin returns without ever creating a slot, leaving nothing
+            # registered or broadcast.  A concurrent opener can still create
+            # the slot during the awaits below, so we re-check after them:
+            # if it is already there we fall through to the non-minted path,
+            # which validates it under the slot lock as usual.
+            _pre_member_store = getattr(cfg.agents[member_name], "memory_store", "")
+            _pre_store_record = (
+                cfg.memory_stores.get(_pre_member_store) if _pre_member_store else None
+            )
+            _pre_assigned = ""
+            if _pre_store_record is not None and _pre_store_record.memory_version == 2:
+                _pre_canonical = members_mod.member_thread_session_alias(slug, generation)
+                _pre_assigned, _pre_err = await _guard_and_pin_private_store(
+                    state,
+                    slug_owners,
+                    _pre_member_store,
+                    _pre_canonical,
+                    member_name,
+                    cfg,
                 )
-                slot.project = project
+                if _pre_err is not None:
+                    return _pre_err
+            # Re-check: a concurrent opener may have published the same key
+            # during the awaits above.  If so, fall through to the non-minted
+            # path so the lock does its full existing-slot validation.
+            slot = state._slots.get(slot_key)
+            if slot is None:
+                minted = True
+                with state.suspend_slots_push():
+                    slot = state.get_or_create_slot(
+                        name=slot_key,
+                        agent=member_name,
+                        workspace=member_workspace,
+                        mode=members_mod.DM_SLOT_MODE,
+                        origin=request_slot_origin(request.get("app", "")),
+                    )
+                    slot.project = project
+                    if _pre_assigned:
+                        # Stamp synchronously before the slot is visible:
+                        # no await follows inside this block, so no other
+                        # code can observe the slot before the assignment.
+                        slot._memory_assignment_from_history = True
+                        slot.memory_store = _pre_assigned
     if slot.mode != members_mod.DM_SLOT_MODE:
         # The derived key is already occupied by a foreign slot (mode is set at
         # creation only, so a pre-existing non-member slot keeps its own). Never
@@ -1232,7 +1312,7 @@ async def api_member_thread(request: web.Request) -> web.Response:
 
     member_store = getattr(cfg.agents[member_name], "memory_store", "")
     store_record = cfg.memory_stores.get(member_store) if member_store else None
-    if store_record is not None and store_record.memory_version == 2:
+    if store_record is not None and store_record.memory_version == 2 and not minted:
         from kiro_crew.member_memory_auth import read_private_session_store
 
         canonical_key = members_mod.member_thread_session_alias(slug, generation)
@@ -1322,21 +1402,16 @@ async def api_member_thread(request: web.Request) -> web.Response:
                     # The owner selected this slug, not an editable transcript
                     # or DM binding. A collision needs a protected assignment.
                     slot._memory_assignment_from_history = True
-                    if (
-                        len(slug_owners) != 1
-                        and (await asyncio.to_thread(read_private_session_store, canonical_key))
-                        != member_store
-                    ):
-                        return web.json_response(
-                            {
-                                "error": "choose distinct member names before opening this private thread",
-                                "code": "member_pin_mismatch",
-                            },
-                            status=409,
-                        )
-                    assigned_store = await pin_private_agent_store(
-                        state, canonical_key, member_name, cfg
+                    assigned_store, _lock_err = await _guard_and_pin_private_store(
+                        state,
+                        slug_owners,
+                        member_store,
+                        canonical_key,
+                        member_name,
+                        cfg,
                     )
+                    if _lock_err is not None:
+                        return _lock_err
             except Exception as exc:
                 from kiro_crew.dashboard.handlers.memory import _store_unavailable_response
 
@@ -1721,6 +1796,9 @@ async def api_member_fresh_start(request: web.Request) -> web.Response:
         return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
     name = slot.key
     key = effective_session_key(slot)
+    from kiro_crew.dashboard.warm_task_brief import cancel_warm_task_brief
+
+    cancel_warm_task_brief(state, name)
 
     # A soft stop keeps the queue and the unconsumed steers, and the runner
     # drains them the moment the turn ends: they would start on the conversation

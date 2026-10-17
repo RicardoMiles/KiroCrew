@@ -63,7 +63,9 @@ from typing import Any, Iterator
 
 import pytest
 from e2e.process_inventory import (
+    RUNTIME_AGENT_ENV,
     Inventory,
+    ProcessFact,
     SliceCleanupError,
     assert_slice_contract,
     crew_log_write_handles,
@@ -132,36 +134,79 @@ EXPECTED_POOL_SIZE = 0
 EXPECTED_BACKGROUND_RUNTIMES = 1
 
 
-def _authored_agent(home: Path, argv: str) -> str:
-    """The agent a runtime was spawned FOR, from the ``--agent`` it was spawned with.
+@contextlib.contextmanager
+def _pinned_homes(home: Path) -> Iterator[None]:
+    """Point the product's path resolvers at the homes the gateway under test runs on.
 
-    The product hands the backend a projected skill-view alias
-    (``kirocrew-skill-view-<hash>``), not the authored name, and the same
-    authored agent yields the same alias, so the alias alone cannot say whether
-    a process is the background agent. The projection writes a sidecar per
-    alias into the agents directory the harness pins (``KIRO_HOME`` is
-    ``<home>/kiro`` -- ``harness_environment``), and that sidecar names the
-    authored agent. An un-aliased ``--agent`` is returned as written; a runtime
-    with no ``--agent`` at all, or an alias with no sidecar, answers ``""`` so
-    the caller classifies it as foreign rather than guessing.
+    The projection lookup reads this home's side files through ``data_home()``
+    (``KIROCREW_HOME``) and the legacy agents directory through
+    ``kiro_agents_dir()`` (``KIRO_HOME``), both resolved from the process
+    environment on every call. The harness pins the gateway's copies in
+    ``harness_environment``; this pins the same two for the test process while
+    one lookup runs, then restores whatever was there.
     """
-    from kiro_crew.acp.skill_projection import _MANAGED_AGENT, _PROJECTION_METADATA_DIR_NAME
-    from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX
+    pinned = {"KIROCREW_HOME": str(home), "KIRO_HOME": str(home / "kiro")}
+    previous = {key: os.environ.get(key) for key in pinned}
+    os.environ.update(pinned)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
-    words = argv.split()
+
+def _authored_agent(home: Path, fact: ProcessFact) -> str:
+    """The agent a runtime was spawned FOR, from the product's own record of it.
+
+    The product names the authored agent in every runtime child's environment
+    (``KIROCREW_RUNTIME_AGENT``, read back as ``ProcessFact.runtime_agent``), and
+    that is the answer whenever it is present: it is the one record a host that
+    binds its agent over the wire (the KAS relay, whose argv carries no
+    ``--agent``) leaves on the process at all.
+
+    A runtime spawned with ``--agent`` in argv is read through that word when
+    the environment says nothing. The product hands such a backend a projected
+    skill-view alias (``kirocrew-skill-view-<hash>``), not the authored name,
+    and the same authored agent yields the same alias, so the alias alone cannot
+    say whether a process is the background agent. The product records which
+    authored agent each alias projects (a sidecar and a view ledger under the
+    data home's ``skill-projection`` side directory, with a legacy copy in the
+    agents directory), and ``source_agent_name`` is its own answer for that
+    question, so this reads through it rather than naming a file layout of its
+    own. An un-aliased ``--agent`` is returned as written.
+
+    A runtime with neither record, or an alias nothing on this home records,
+    answers ``""`` so the caller classifies it as foreign rather than guessing.
+    """
+    from kiro_crew.acp.skill_projection import RetiredSkillView, source_agent_name
+    from kiro_crew.agent_spec_format import NATIVE_SKILL_ALIAS_PREFIX
+    from kiro_crew.constants import KIROCREW_RUNTIME_AGENT_ENV
+
+    # The inventory restates the variable's name so it stays product-free; a
+    # rename on either side must fail here by name, not read every runtime as
+    # foreign.
+    assert RUNTIME_AGENT_ENV == KIROCREW_RUNTIME_AGENT_ENV, (
+        f"process_inventory reads {RUNTIME_AGENT_ENV!r} but the product sets "
+        f"{KIROCREW_RUNTIME_AGENT_ENV!r}; update RUNTIME_AGENT_ENV to match"
+    )
+    if fact.runtime_agent:
+        return fact.runtime_agent
+
+    words = fact.argv.split()
     try:
         agent = words[words.index("--agent") + 1]
     except (ValueError, IndexError):
         return ""
     if not agent.startswith(NATIVE_SKILL_ALIAS_PREFIX):
         return agent
-    sidecar = home / "kiro" / "agents" / _PROJECTION_METADATA_DIR_NAME / f"{agent}.json"
-    try:
-        record = json.loads(sidecar.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return ""
-    authored = record.get(_MANAGED_AGENT) if isinstance(record, dict) else None
-    return authored if isinstance(authored, str) else ""
+    with _pinned_homes(home):
+        try:
+            return source_agent_name(agent)
+        except RetiredSkillView:
+            return ""
 
 
 def _split_background_runtimes(home: Path, alive: tuple) -> tuple[list, list]:
@@ -173,7 +218,7 @@ def _split_background_runtimes(home: Path, alive: tuple) -> tuple[list, list]:
     """
     from kiro_crew.session import BACKGROUND_AGENT
 
-    background = [f for f in alive if _authored_agent(home, f.argv) == BACKGROUND_AGENT]
+    background = [f for f in alive if _authored_agent(home, f) == BACKGROUND_AGENT]
     foreign = [f for f in alive if f not in background]
     return background, foreign
 
@@ -373,9 +418,7 @@ def test_closing_every_session_leaves_nothing(real_user_session: Any) -> None:
         assert not foreign, (
             f"{len(foreign)} tracked process(es) that are not the gateway's own "
             "background runtimes survived closing every session: "
-            + ", ".join(
-                f"pid={f.pid} agent={_authored_agent(home, f.argv) or '?'}" for f in foreign
-            )
+            + ", ".join(f"pid={f.pid} agent={_authored_agent(home, f) or '?'}" for f in foreign)
             + f"\n{final.render()}"
         )
         assert len(background) == EXPECTED_BACKGROUND_RUNTIMES, (

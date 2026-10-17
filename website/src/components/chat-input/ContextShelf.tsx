@@ -13,6 +13,8 @@ import { usePressActivation } from '../../hooks/usePressActivation'
 import { useActionShortcutHint } from '../../hooks/useActionShortcutHint'
 import { IS_MAC } from '../../hooks/useKeyboardShortcuts'
 import type { ChatInputProps } from './props'
+import type { MemorySource } from '../../lib/agentMemorySource'
+import { withMemorySource } from '../../utils/agentLabel'
 import type { useAutoCompactThreshold } from './autoCompact'
 import { uiLocation } from '../../uiLocations/uiLocation'
 import { useGuidePredicate } from '../../guide/guidePredicates'
@@ -148,10 +150,11 @@ export function SessionControlChips({ sessionControls, shelfCompact, onSessionCo
  *  would pin `var(--mono)`, which Settings → Display → Font Family writes only
  *  for OpenDyslexic, so for every other family it would make the shelf ignore
  *  the user's typeface. */
-export function AgentChip({ agentName, agentLabel, agentIsInheritedDefault, agentSource, isRunning, shelfCompact, onAgentClick }: {
+export function AgentChip({ agentName, agentLabel, agentIsInheritedDefault, agentMemory, agentSource, isRunning, shelfCompact, onAgentClick }: {
   agentName: string
   agentLabel?: string
   agentIsInheritedDefault?: boolean
+  agentMemory?: MemorySource | null
   agentSource?: string
   isRunning: boolean
   shelfCompact: boolean
@@ -165,11 +168,15 @@ export function AgentChip({ agentName, agentLabel, agentIsInheritedDefault, agen
   // because the marker alone reads as opaque. No glyph, no
   // layout change -- text on demand. A pinned chip keeps the plain
   // switch hint; it has nothing to explain.
+  // A same-name crewmate and custom agent read alike, so the chip says which
+  // memory this session runs on, in the visible text and the spoken name both.
+  // Null for every other agent, which leaves both unchanged.
+  const spokenName = withMemorySource(agentName, agentMemory ?? null)
   const label = isRunning
     ? i18nT('components.chatInput.stop_the_current_response_to_switch_agents')
     : agentIsInheritedDefault
-      ? i18nT('components.chatInput.agent_inherited_default', { name: agentName })
-      : i18nT('components.chatInput.agent', { name: agentName })
+      ? i18nT('components.chatInput.agent_inherited_default', { name: spokenName })
+      : i18nT('components.chatInput.agent', { name: spokenName })
   // The chip is the only visible place an agent switch happens, so it is where
   // the keyboard route to the same switch gets taught: a second tooltip line
   // naming the cycle chords. Spelled by a catalog string per platform, so it
@@ -191,7 +198,7 @@ export function AgentChip({ agentName, agentLabel, agentIsInheritedDefault, agen
       aria-keyshortcuts={!isRunning && nextHint ? nextHint.ariaKeyshortcuts : undefined}
     >
       <Bot size={13} className="shrink-0 opacity-70" />
-      {!shelfCompact && <span className="truncate max-w-[160px]">{agentLabel ?? agentName}</span>}
+      {!shelfCompact && <span className="truncate max-w-[160px]">{withMemorySource(agentLabel ?? agentName, agentMemory ?? null)}</span>}
     </button>
   )
 }

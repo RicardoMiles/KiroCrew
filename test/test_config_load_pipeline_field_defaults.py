@@ -44,6 +44,9 @@ _READ_STAGE_DEPARTURES = {
     ("agent", "session_control"): False,
     ("agent", "member_dispatch"): False,
     ("agent", "crew_panel"): False,
+    # A present but malformed harness choice is an unusable explicit choice, not
+    # an absent key: it takes the Kiro CLI floor, never the KAS product default.
+    ("agent", "acp_backend"): "",
     ("skills", "project_skills_enabled"): False,
     # Resolved by the loader's own degradation rule before the enum check runs.
     ("stt", "provider"): "off",
@@ -624,6 +627,13 @@ def _move_cases() -> list:
             {"dashboard": {"folder_sort": "by colour"}},
             lambda c: c.dashboard.folder_sort,
             "name",
+        ),
+        _case(
+            "dashboard.session_sort-unknown",
+            [(dashboard, "session_sort", "name-asc")],
+            {"dashboard": {"session_sort": "by colour"}},
+            lambda c: c.dashboard.session_sort,
+            "name-asc",
         ),
         _case(
             "dashboard.title_refresh_every_turns-malformed",

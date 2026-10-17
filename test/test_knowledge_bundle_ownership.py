@@ -724,7 +724,10 @@ class TestTheSameDocumentExceptionCoversEverySite:
 
     @staticmethod
     def _store_source():
-        return Path(store_module.__file__).read_text(encoding="utf-8")
+        import importlib
+
+        family = (store_module, *map(importlib.import_module, store_module._STORE_OWNERS))
+        return "\n".join(Path(module.__file__).read_text(encoding="utf-8") for module in family)
 
     def _gate_sites(self):
         tree = ast.parse(self._store_source())
@@ -1074,6 +1077,79 @@ class TestWithholdingIsNeverSilent:
 
         assert result["items_withheld"] == 0
         assert result["withheld"] == []
+
+
+class TestEveryUnownedArrivalIsAccountedFor:
+    """Three accepting-pass row skips leave their items owned by nothing. Two of them
+    name the ids this import wrote for the refused row -- an id another document claims,
+    and an id filed under a different source -- so a caller can say WHICH content arrived
+    unowned. The third, an empty or non-text document key, stays silent on purpose: it
+    names no document key a caller could search by. Each item below is INSERTED (the
+    content is here) yet owned by nothing, which is exactly what the account must flag.
+    """
+
+    def test_an_id_another_document_claims_is_named(self, exporter, importer):
+        """Two bundle rows name the SAME imported id. The first row owns it; the second
+        hits the already-claimed check and is refused whole, so the id it also named
+        arrives owned by nothing and must be named in the account."""
+        _, item_id = _owned_doc(exporter, slug="first", name="First")
+        bundle = exporter.export_all()
+        first = bundle["agent_item_state"][0]
+        bundle["agent_item_state"].append({**first, "slug": "second", "name": "Second"})
+
+        result = importer.import_bundle(bundle)
+
+        # The item arrived; only the second row's ownership of it was refused.
+        assert result["ownership_rows_imported"] == 1
+        assert _item_count(importer, "artifact body") == 1
+        named = [
+            w
+            for w in result["withheld"]
+            if w.get("reason") == "ownership_row_item_claimed_elsewhere"
+        ]
+        assert named, f"the claimed-elsewhere skip was silent: {result['withheld']}"
+        assert named[0]["key"] == "second"
+        assert named[0]["table"] == "agent_item_state"
+        assert item_id in named[0]["items"]
+
+    def test_an_id_filed_under_a_different_source_is_named(self, exporter, importer):
+        """A row names an id this import filed under a DIFFERENT source. The row is an
+        inconsistent ownership statement and refused whole, so the ids it named that
+        this import wrote arrive owned by nothing and must be named."""
+        _, artifact_item = _owned_doc(exporter, slug="doc", name="Doc")
+        other_sid = exporter.add_source(
+            name="Elsewhere", source_type="local_file", uri="/elsewhere.md"
+        )
+        stray = exporter.add_item(
+            title="Stray", content="stray text", item_type="document", source_id=other_sid
+        )
+        bundle = exporter.export_all()
+        bundle["agent_item_state"][0]["item_ids"] = json.dumps([artifact_item, stray])
+
+        result = importer.import_bundle(bundle)
+
+        # Both items arrived; the row that claimed them across two sources did not.
+        assert result["items_imported"] == 2
+        assert result["ownership_rows_imported"] == 0
+        named = [
+            w for w in result["withheld"] if w.get("reason") == "ownership_row_item_source_mismatch"
+        ]
+        assert named, f"the source-mismatch skip was silent: {result['withheld']}"
+        assert named[0]["key"] == "doc"
+        assert named[0]["table"] == "agent_item_state"
+        assert artifact_item in named[0]["items"]
+
+    def test_an_empty_document_key_stays_silent(self, exporter, importer):
+        """The row names no key a caller could look for, so a withheld entry would have
+        nothing to key on. This skip is the one unowned-arrival path left silent."""
+        _owned_doc(exporter, slug="doc", name="Doc")
+        bundle = exporter.export_all()
+        bundle["agent_item_state"][0]["slug"] = ""
+
+        result = importer.import_bundle(bundle)
+
+        assert result["ownership_rows_imported"] == 0
+        assert result["withheld"] == [], f"an empty-key skip spoke up: {result['withheld']}"
 
 
 class TestAKeyThisStoreAlreadyHoldsBlocksTheItems:

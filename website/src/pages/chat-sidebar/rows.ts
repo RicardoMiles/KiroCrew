@@ -28,6 +28,7 @@ import { crewOf } from '../../hooks/useInstanceSessions'
 import { isWithinRecentWindow } from '../recentWindow'
 import { splitStaleSlots, type StaleSplit } from '../staleCollapse'
 import { isPeerRow, sessionRowIdentity } from './rowIdentity'
+import type { MemorySourceRow } from '../../lib/agentMemorySource'
 import type { AgentInfo, FilterDimension, RevealBlockingFilter, SessionFilterKey, SidebarSourceLink, Slot } from './types'
 
 /** What the chip prints. The serializer decides it; this only covers its absence,
@@ -154,6 +155,9 @@ export interface RowPlacement {
   orderStamp: number
   /** Layout projection on for this copy (the facade's displacement-window gate). */
   rowAnimEnabled: boolean
+  /** The lane's first population is still settling: the row keeps its projection
+   *  but snaps instead of springing and skips its mount slide-in (rowAnimSettle.ts). */
+  rowMotionHeld?: boolean
   conductor?: ConductorRowView
   /** This copy is the one its FOLDER is drawn around: lifted to the top of the
    *  folder body, before the sub-folders and before the sorted rows. It is NOT a
@@ -178,6 +182,9 @@ export interface RowShell {
   colorMode: string
   defaultAgent: string
   installedAgents: AgentInfo[]
+  /** The picker's unfolded rows: a row whose agent has a same-name crewmate and
+   *  custom agent says which memory it runs on (#19472). */
+  memoryRows: MemorySourceRow[]
   tagById: Record<string, ChatTag>
   paletteColors: string[]
   boost: PaletteBoost
@@ -238,6 +245,7 @@ export interface SessionRowView {
   showDivider: boolean
   orderStamp: number
   rowAnimEnabled: boolean
+  rowMotionHeld: boolean
   conductor: ConductorRowView | null
   /** See `RowPlacement.folderConductor`. False in every lane but the folder tree. */
   folderConductor: boolean
@@ -871,6 +879,7 @@ function rowView(slot: Slot, placement: RowPlacement, scene: RowScene, model: Vi
     showDivider: placement.showDivider,
     orderStamp: placement.orderStamp,
     rowAnimEnabled: placement.rowAnimEnabled,
+    rowMotionHeld: placement.rowMotionHeld ?? false,
     conductor: placement.conductor ?? null,
     folderConductor: placement.folderConductor ?? false,
     isActive: isActiveIn(scene, slot),
@@ -890,18 +899,25 @@ function rowView(slot: Slot, placement: RowPlacement, scene: RowScene, model: Vi
     // refuses keyboard reorder, so a key collision cannot rewrite the local pin order.
     pinnedOrderIndex: local === null ? -1 : (model.pinnedRank.get(local) ?? -1),
     pinnedReorderEnabled: !model.searchRanks && local !== null,
-    opensElsewhere: local !== null && !isChatPageSurface(slot.surface ?? slot.mode)
-      ? (slot.mode === 'member' && slot.agent ? `/members?member=${encodeURIComponent(slot.agent)}` : '/members')
-      : null,
+    opensElsewhere: opensElsewhereOf(slot),
     shell: scene.shell,
   }
+}
+
+/** The page a LOCAL row's session lives on when the chat page does not render its
+ *  surface, else null; a peer row opens as a window instead. A row's click goes
+ *  there rather than switching the pane (`SessionRowView.opensElsewhere`). */
+export function opensElsewhereOf(slot: Slot): string | null {
+  return localKeyOf(slot) !== null && !isChatPageSurface(slot.surface ?? slot.mode)
+    ? (slot.mode === 'member' && slot.agent ? `/members?member=${encodeURIComponent(slot.agent)}` : '/members')
+    : null
 }
 
 /** Every `SessionRowView` field. A `Record` over `keyof`, so a field added to the view
  *  without a line here is a type error rather than a field equality never compares. */
 const VIEW_FIELDS: Record<keyof SessionRowView, true> = {
   slot: true, identity: true, localKey: true, peerId: true, peerName: true, scope: true, navScope: true,
-  holdContainer: true, showDivider: true, orderStamp: true, rowAnimEnabled: true, conductor: true,
+  holdContainer: true, showDivider: true, orderStamp: true, rowAnimEnabled: true, rowMotionHeld: true, conductor: true,
   folderConductor: true,
   isActive: true, isOut: true, isPinned: true, isUnread: true, isRunning: true, recent: true,
   subagentCount: true, subagentApprovalCount: true, digitBadge: true, isRenaming: true, renamingHere: true,

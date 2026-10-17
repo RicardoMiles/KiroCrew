@@ -159,6 +159,8 @@ if TYPE_CHECKING:  # served by ``__getattr__`` at runtime; named here for mypy
         _fork_refresh_settled,
         _refresh_forked_templates,
         _refresh_forked_templates_locked,
+        fork_origin_is_owned,
+        hold_spawn_gate,
     )
     from kiro_crew.agent_materialization.guide_platform import (  # noqa: F401
         grant_guide_platform_once,
@@ -211,6 +213,7 @@ if TYPE_CHECKING:  # served by ``__getattr__`` at runtime; named here for mypy
         is_unc_shape,
         normalize_spec_hooks,
         unc_probe_allowed,
+        unsent_kiro_hook_rows,
     )
     from kiro_crew.agent_materialization.managed_mcp import (  # noqa: F401
         _HOME_DERIVING_ENV_KEYS,
@@ -231,6 +234,7 @@ if TYPE_CHECKING:  # served by ``__getattr__`` at runtime; named here for mypy
         crew_owned_mcp_servers,
         emission_eligible_mcp_servers,
         managed_mcp_spec_entry,
+        managed_member_transport,
         sanitize_spec_env,
     )
     from kiro_crew.agent_materialization.mcp_aliases import (  # noqa: F401
@@ -283,6 +287,10 @@ if TYPE_CHECKING:  # served by ``__getattr__`` at runtime; named here for mypy
         _install_lite_agent_fallback,
         _install_research_agent,
         _install_team_lead_agent,
+    )
+    from kiro_crew.agent_materialization.skill_resources import (  # noqa: F401
+        map_prompt_skills,
+        prompt_skill_uris,
     )
     from kiro_crew.agent_materialization.worker_agent import (  # noqa: F401
         _DEFAULT_SPEC_OBSERVATION_ATTEMPTS,
@@ -2116,6 +2124,7 @@ _EXPORTS_BY_OWNER: dict[str, tuple[str, ...]] = {
         "_HOOK_SUPPRESSED_CONFIRM",
         "hook_documents_suppressed_commands",
         "hook_documents_to_object_form",
+        "unsent_kiro_hook_rows",
         "_FILENAME_EVENT_SUFFIXES",
         "_HOOK_HEADER_SCAN_LINES",
         "_HOOK_HEADER_RE",
@@ -2143,6 +2152,7 @@ _EXPORTS_BY_OWNER: dict[str, tuple[str, ...]] = {
         "crew_owned_mcp_servers",
         "_gated_off_servers",
         "managed_mcp_spec_entry",
+        "managed_member_transport",
         "_enforce_managed_mcp_ownership",
         "_managed_opt_in_entry",
         "CU_MCP_SERVER",
@@ -2174,6 +2184,10 @@ _EXPORTS_BY_OWNER: dict[str, tuple[str, ...]] = {
         "_filter_auto_approve",
         "may_skip_gate_now",
         "strip_ungoverned_auto_approve",
+    ),
+    "kiro_crew.agent_materialization.skill_resources": (
+        "prompt_skill_uris",
+        "map_prompt_skills",
     ),
     "kiro_crew.agent_materialization.mcp_sources": (
         "_extra_mcp_scope_globals",
@@ -2211,6 +2225,8 @@ _EXPORTS_BY_OWNER: dict[str, tuple[str, ...]] = {
         "_FORK_REFRESH_WAIT_SECS",
         "_refresh_forked_templates",
         "_refresh_forked_templates_locked",
+        "fork_origin_is_owned",
+        "hold_spawn_gate",
     ),
     "kiro_crew.agent_materialization.service_agents": (
         "_install_guest_agent",
@@ -5184,6 +5200,12 @@ _MATE_AUTO_GRANTS = (
     f"@{_MATE_SERVER}/set_model",
     f"@{_MATE_SERVER}/set_approval_mode",
     f"@{_MATE_SERVER}/request_capabilities",
+    f"@{_MATE_SERVER}/goal_read",
+    f"@{_MATE_SERVER}/set_goal",
+    f"@{_MATE_SERVER}/set_key_results",
+    f"@{_MATE_SERVER}/set_check_ins",
+    f"@{_MATE_SERVER}/key_result_progress",
+    f"@{_MATE_SERVER}/save_goal_report",
 )
 
 
@@ -5374,9 +5396,16 @@ dashboard, use the widgets below. In a messaging
 channel or a scheduled run, give the same content as short plain text instead,
 because those surfaces show widget markup as raw text.
 
-**Your first reply in a chat opens with a short introduction**, then gets to
-work on what they asked. Show it as one inline widget with a plain-words title in
-their language (`<mcwidget title="Your Conductor">`), under ten short lines, and
+**In the dashboard chat with a Dashboard tab, skip the introduction.** That
+is when the `[RUNTIME]` line names the Kiro Crew dashboard AND a `[DASHBOARD]`
+block says your Dashboard tab shows a template, whichever one: the tab already
+says who you are and what is on the table, so the card only repeats it. Get
+straight to work on what they asked. A messaging channel cannot see that tab,
+so there you still open with the short plain-text introduction.
+
+**Otherwise, your first reply in a chat opens with a short introduction**, then
+gets to work on what they asked. Show it as one inline widget with a plain-words
+title in their language (`<mcwidget title="Your Conductor">`), under ten short lines, and
 with nothing in it that looks clickable: no buttons, boxed tiles or links.
 
 - "I'm your Conductor", and one line on what that means: you split the job into
@@ -5749,15 +5778,13 @@ _MEMBER_DASHBOARD_GRANTS: tuple[str, ...] = _CONDUCTOR_DASHBOARD_GRANTS + (
 #: ``dashboard_apply`` and ``dashboard_rollback`` do change the page -- and they are
 #: granted rather than prompted on the same ownership test the tuple above is judged
 #: by. The page is the calling crewmate's own, resolved from the calling session and
-#: not from any argument; apply installs the page that was STAGED and takes no
-#: argument at all, so it cannot be pointed at a page nobody looked at; and every
-#: earlier version stays on disk, so the worst case is a crewmate changing its own
-#: page and the person saying "go back".
+#: not from any argument; apply installs a template the catalog serves (or the one
+#: staged by a preview); and every earlier version stays on disk, so the worst case
+#: is a crewmate changing its own page and the person saying "go back".
 #:
-#: What makes the person's YES part of the flow is the preview/apply SPLIT and the
-#: ``dashboard`` skill that drives it, not an approval dialog: a prompt on apply
-#: would ask the person to confirm a page the agent has not shown them yet, which is
-#: the wrong question at the wrong time.
+#: No approval step guards a page swap: a person cannot judge a page's script by
+#: looking at it, so a preview gate adds a click and no safety. The frame contains
+#: every page the same way, and the history makes every swap one rollback away.
 _MEMBER_PANEL_GRANTS: tuple[str, ...] = (
     "@kirocrew-panel/panel_templates",
     "@kirocrew-panel/panel_publish",
@@ -5770,6 +5797,7 @@ _MEMBER_PANEL_GRANTS: tuple[str, ...] = (
     # exist -- which is the read that stops it guessing one.
     "@kirocrew-panel/dashboard_types",
     "@kirocrew-panel/dashboard_write",
+    "@kirocrew-panel/dashboard_save",
     "@kirocrew-panel/dashboard_templates",
     "@kirocrew-panel/dashboard_preview",
     "@kirocrew-panel/dashboard_apply",
@@ -5790,29 +5818,22 @@ Your whole job is to carry that out and say what happened.
    search covers each template's title, its description AND the fold paths its
    fields read, so a person asking for "cost" finds the page that shows a usage
    number whose author never used the word.
-2. `dashboard_preview` -- stage the one that fits, by `template_id`. That is the
-   only argument. This records NOTHING: no version is written and the page they
-   are reading is untouched. It hands back a link.
-3. ASK. Give them the link and wait for an answer. This is not a formality: the
-   page is theirs, and a page swapped without asking is one they have to undo.
-4. `dashboard_apply` -- only after they say yes. It takes no arguments, so what
-   lands is the page they looked at.
+2. `dashboard_apply` with the `template_id` that fits. The page goes live as a
+   new version; the one they had stays on disk.
+3. `dashboard_preview` is optional: use it, by `template_id`, only when they ask
+   to look before choosing. It records nothing and hands back a link; then
+   `dashboard_apply` with that `template_id` puts it live.
 
-"Go back" skips all of that: `dashboard_fields` lists the versions a rollback can
-still reach, and `dashboard_rollback` restores one. A rollback moves FORWARD --
-version 1 over version 2 becomes version 3 -- so going back is itself undoable.
+"Go back": `dashboard_fields` lists the versions a rollback can still reach, and
+`dashboard_rollback` restores one. A rollback moves FORWARD -- version 1 over
+version 2 becomes version 3 -- so going back is itself undoable.
 
-## You cannot write the page
+## You do not write the page here
 
-Only a template that shipped with the product can be previewed or kept. A
-dashboard page runs its own script against this crewmate's task titles and
-summaries, inside a frame that can navigate itself, so a page nobody here has
-looked at could carry them out. Custom templates come later, behind a wrapper
-document this gateway mints.
-
-So if nothing in the catalog fits, say so and name the one that came closest. Do
-not write a manifest and html: the preview refuses them, and the refusal is a
-cycle you can spend on the answer instead.
+You pick from the catalog. A page the crewmate composes itself is its own
+dashboard package, saved by that crewmate with `dashboard_save`. So if nothing in
+the catalog fits, say so and name the one that came closest.
+Do not write a manifest and html: the preview refuses them.
 
 ## The rule behind the whole design
 
@@ -6401,8 +6422,8 @@ to write to).
   status, a file change, an external page state). When you see it, report.
   When you don't, respond with `HEARTBEAT_KEEP` so the task stays armed for the
   next cycle.
-- **No write actions.** Tool approval is gated at the gateway against
-  `HEARTBEAT_SAFE_TOOLS` (read-only allowlist). Any write tool you try will
+- **No write actions.** Tool approval is gated at the gateway by
+  `_heartbeat_approval` (a read-only allowlist). Any write tool you try will
   be rejected and audited; do not waste a turn attempting one. If a task
   asks you to "fix" or "update" something, treat it as "observe and notify
   the user so they can fix" — never the action itself.
@@ -6443,17 +6464,13 @@ the response — the operator will add it after observing the SEL `denied` event
 def _install_heartbeat_agent() -> None:
     """Generate and install the kirocrew-heartbeat agent config.
 
-    A dedicated agent for HeartbeatService.  Minimal MCP surface — only
-    ``kirocrew-core`` (learn/cron/spawn list and status, artifact reads,
-    local_knowledge_search) on
-    public installs.  Tool approval is enforced gateway-side against
-    ``HEARTBEAT_SAFE_TOOLS`` regardless; the per-agent MCP narrowing here
+    A dedicated agent for HeartbeatService.  Minimal MCP surface: the default
+    spec's ``kirocrew-core`` entry (learn/spawn list and status, artifact
+    reads, local_knowledge_search) plus the default-spec servers behind the
+    edition's ``heartbeat_safe_tools()`` pins (none on a standalone install).  Tool approval is enforced gateway-side by
+    ``_heartbeat_approval``'s read-only allowlist regardless; the per-agent MCP narrowing here
     keeps cold-start cost low and reduces the surface the gateway has to
     police.
-
-    (The Amazon-internal MCP server code-review/ticket/pipeline read wiring is
-    omitted on public installs, matching ``_install_research_agent`` /
-    ``_install_knowledge_agent``.)
 
     SEL audit logging stays at the gateway side — see
     ``GatewayOrchestrator._heartbeat_approval``.
@@ -6483,8 +6500,8 @@ def _write_heartbeat_spec(path: Path, main_path: Path, model: str) -> None:
     # commands and security still come from bundled hooks). Strip the main
     # agent's ``--include-tools``/``--include-tool-tags``/``--exclude-tools``
     # filters so all read tools surface to the heartbeat agent — security is
-    # enforced gateway-side against ``HEARTBEAT_SAFE_TOOLS`` via
-    # ``_heartbeat_approval``, not by per-agent MCP filtering. Read through the
+    # enforced gateway-side by ``_heartbeat_approval``'s read-only
+    # allowlist, not by per-agent MCP filtering. Read through the
     # capped reader: a refused main spec degrades as absent, but with an
     # operator-visible signal, because the result is a heartbeat agent with no
     # MCP servers -- a worker that fails every task.
@@ -6494,13 +6511,23 @@ def _write_heartbeat_spec(path: Path, main_path: Path, model: str) -> None:
             "Main agent spec %s unusable; heartbeat agent installs with no MCP servers", main_path
         )
     mcp = worker_agent.heartbeat_mcp_servers(main_config)
+    # An edition's servers ride along verbatim minus ``autoApprove`` (see
+    # ``heartbeat_mcp_servers``); say so where the operator reads the install log,
+    # since a dropped grant otherwise shows up only as SEL ``denied`` rows.
+    edition = [name for name in mcp if name not in worker_agent.HEARTBEAT_MIRRORED_SERVERS]
+    if edition:
+        logger.info(
+            "Heartbeat agent also mounts edition MCP servers %s; their autoApprove is "
+            "withheld, every call goes through _heartbeat_approval",
+            ", ".join(edition),
+        )
 
     config: dict[str, object] = {
         "name": "kirocrew-heartbeat",
         "description": (
             "Unattended polling worker — runs one HeartbeatService task per "
             "cycle with a read-only MCP toolset. Tool approval is gated "
-            "gateway-side against HEARTBEAT_SAFE_TOOLS."
+            "gateway-side by _heartbeat_approval's read-only allowlist."
         ),
         "model": model,
         "includeMcpJson": False,
@@ -6660,6 +6687,7 @@ from kiro_crew.agent_materialization import (  # noqa: E402, F401 -- the owners 
     mcp_aliases,
     mcp_sources,
     service_agents,
+    skill_resources,
     worker_agent,
 )
 

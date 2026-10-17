@@ -109,11 +109,10 @@ def schemas() -> list[dict[str, Any]]:
                             "-- and no values anywhere in it, because values stay in "
                             "the crew log and reach the page through the fold. The "
                             "store refuses anything else, naming the rule it broke. "
-                            "Saving one BINDS that crewmate's page to it: while the "
-                            "page still draws from its template instance, agentic "
-                            "field writes to that crewmate are refused "
-                            "package_display_pending, so compose a package only for "
-                            "a page the user asked for."
+                            "To put your own page LIVE, use the dashboard_save tool "
+                            "instead: it writes this package for you and makes it "
+                            "the page your Dashboard tab draws, as a version a "
+                            "rollback can undo."
                         ),
                     },
                     "source": {
@@ -211,7 +210,18 @@ def schemas() -> list[dict[str, Any]]:
                     "tags": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Replacement tag list (optional).",
+                        "description": (
+                            "Replacement tag list (optional). To remove every "
+                            "tag, pass clear_tags: true instead of an empty list."
+                        ),
+                    },
+                    "clear_tags": {
+                        "type": "boolean",
+                        "description": (
+                            "true removes every tag. Use it rather than tags: [], "
+                            "which some clients drop before it reaches the "
+                            "server. Refused beside a non-empty tags."
+                        ),
                     },
                     "webapp_metadata": {
                         "type": "object",
@@ -842,6 +852,13 @@ def artifact_get(name: str, args: dict[str, Any]) -> str:
 def artifact_update(name: str, args: dict[str, Any]) -> str:
     args = validate_tool_args(args, ARTIFACT_UPDATE_SCHEMA)
     slug = args["slug"]
+    # ``clear_tags`` is not a field of the artifact: it is the spelling of
+    # ``tags: []`` that survives a client which drops an empty list before it
+    # reaches this server, so it becomes that list here and never reaches the route.
+    if args.pop("clear_tags", None) is True:
+        if args.get("tags"):
+            return "Error: clear_tags removes every tag; pass it without tags"
+        args["tags"] = []
     update_body = {k: v for k, v in args.items() if k != "slug" and v is not None}
     if not update_body:
         return "Error: nothing to update (provide content/name/description/tags)"

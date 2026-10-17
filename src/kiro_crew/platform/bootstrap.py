@@ -263,10 +263,16 @@ def bootstrap_context(cfg: "KiroCrewConfig") -> PlatformContext:
             # so a value the policy just removed is still on this instance while
             # every later ``KiroCrewConfig.load()`` (which re-reads from disk) sees
             # the narrowed answer. Re-run the SAME single gate on that one field
-            # rather than adding a second one anywhere.
+            # rather than adding a second one anywhere. An undeclared field holds the
+            # load's resolved DEFAULT, not a user choice, so it goes back in as absent:
+            # passing it through would warn about a value nobody wrote.
             from kiro_crew.acp_backends import resolve_selected_backend
+            from kiro_crew.config.loader import acp_backend_declared
 
-            cfg.agent.acp_backend = resolve_selected_backend(cfg.agent.acp_backend)
+            declared = acp_backend_declared()
+            cfg.agent.acp_backend = resolve_selected_backend(
+                cfg.agent.acp_backend if declared else None
+            )
     except Exception:
         logger.warning("agent_backend policy narrowing failed; continuing", exc_info=True)
 
@@ -325,6 +331,11 @@ def apply_kas_cli_floor(cfg: "KiroCrewConfig") -> str | None:
 
     agent = cfg.agent
     if ACP_BACKEND_KAS not in (agent.acp_backend, agent.member_acp_backend):
+        return None
+    if agent.kas_bundle:
+        # The bundle route spawns Kiro Crew's own engine and never runs kiro-cli,
+        # so kiro-cli's engine support is not a fact about this host's KAS. Acting
+        # on it would silently move a bundle-route user back onto kiro-cli.
         return None
     if ACP_BACKEND_KAS not in selectable_backends():
         return None

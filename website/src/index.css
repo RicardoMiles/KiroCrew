@@ -661,6 +661,36 @@ html:lang(ko) {
    --shadow-lg alone reads flat over near-black chat; light mode keeps it. */
 :root{--shadow-float:0 0 0 1px rgba(0,0,0,.4),0 24px 64px -8px rgba(0,0,0,.7),0 8px 24px rgba(0,0,0,.45)}
 [data-mode="light"]{--shadow-float:var(--shadow-lg)}
+/* Warn-hued TEXT on a warn-tinted fill (`bg-warn-subtle`, `bg-warn/N`,
+   `glass-warn`): the `text-warn-text` utility and `.glass-warn-fg`. Dark
+   palettes keep the plain `--warn` hue. In light palettes `--warn` on its own
+   10-30% tint falls below the 4.5:1 text floor (1.9:1 in rosepine-light, 4.2:1
+   in `light`; issues #19920, #20071), so the text keeps half the hue and
+   darkens the rest toward black: still amber-brown, so the warning cue
+   survives. The share is set by the strongest tint paired in the source
+   (`bg-warn/30`): 50% clears it at 5.4:1 in the worst light palette
+   (rosepine-light), 60% would drop it to 4.15:1.
+   Internal, derived, outside the [data-theme] blocks so packs cannot set it;
+   glassWarnTextContrast.test.ts reads the share from this rule and measures
+   every tint the source pairs with it in every light palette. */
+:root{--warn-text:var(--warn);}
+[data-mode="light"]{--warn-text:color-mix(in srgb, var(--warn) 50%, #000);}
+/* Ok- and danger-hued TEXT on its own tint (`bg-ok-subtle`, `bg-ok/N`,
+   `bg-danger-subtle`, `bg-danger/N`): the `text-ok-text` and
+   `text-danger-text` utilities, the same shape as `--warn-text`. In light
+   palettes the plain hue on its 5-25% tint falls below 4.5:1 (ok 1.97:1 in
+   amoled-light, danger 2.37:1 in tokyonight-light), so the text keeps part of
+   the hue and darkens the rest toward black: still green and red. Each share
+   is the most hue that still clears the strongest tint the source pairs with
+   it, so the text stays as coloured as the floor allows. Danger keeps 55%
+   (`bg-danger/25` on hover: 4.82:1 in tokyonight-light; 60% would be
+   4.35:1). Ok keeps 60% (`bg-ok/20`: 4.56:1 in amoled-light; 61% would be
+   4.45:1). Info (`text-info-text` on `bg-info-subtle`, `bg-info/N`) reads
+   1.69:1 plain in amoled-light and keeps 58% (`bg-info/15`: 4.53:1 in
+   amoled-light; 59% would be 4.41:1). statusTextContrast.test.ts reads every
+   share from this rule and measures every paired tint in every light palette. */
+:root{--ok-text:var(--ok);--danger-text:var(--danger);--info-text:var(--info);}
+[data-mode="light"]{--ok-text:color-mix(in srgb, var(--ok) 60%, #000);--danger-text:color-mix(in srgb, var(--danger) 55%, #000);--info-text:color-mix(in srgb, var(--info) 58%, #000);}
 :root,[data-theme="dark"],[data-theme="amber-dark"]{
   --search-highlight:rgba(255,167,38,.45);--search-highlight-current:rgba(255,120,0,.85);--search-highlight-current-border:rgba(255,255,255,.9);
   --bg:#12141a;--bg-accent:#14161d;--bg-elevated:#1a1d25;--bg-hover:#262a35;
@@ -1471,6 +1501,68 @@ html:lang(ko) {
   color-scheme:light;
 }
 
+/* ── Nu Disco ── */
+/* Color palette from the Nu Disco VS Code theme by Danny Banks
+   (https://github.com/dbanksdesign/nu-disco-vscode-theme)
+   MIT License Copyright (c) 2019 Danny Banks
+   Upstream text and border tokens are white (dark) or #0C001F (light) at an
+   alpha; they are flattened here onto the upstream background they sit on,
+   because several consumers (xterm, contrast tests, color-mix ramps) need
+   opaque hex. */
+[data-theme="nu-disco-dark"]{
+  --bg:#0C001F;--bg-accent:#180D2A;--bg-elevated:#231934;--bg-hover:#322941;
+  --card:#180D2A;--card-fg:#EFEEF0;--card-hl:rgba(255,255,255,.05);
+  --panel:#0C001F;--panel-strong:#180D2A;
+  --chrome:rgba(12,0,31,.95);
+  --text:#EFEEF0;--text-strong:#FFFFFF;--muted:#9E99A5;--muted-fg:#000;--muted-strong:#6D6679;
+  --border:#2C223D;--border-strong:#4D445B;--border-hover:#6D6679;
+  --accent:#FF82B4;--accent-fg:#000;--accent-hover:#FF9DC4;--accent-subtle:rgba(255,130,180,.15);
+  --accent-glow:rgba(255,130,180,.25);--ring:#FF82B4;
+  --ok:#67E591;--ok-fg:#000;--ok-subtle:rgba(103,229,145,.12);
+  --warn:#FFB271;--warn-fg:#000;--warn-subtle:rgba(255,178,113,.12);
+  --danger:#FF7878;--danger-fg:#000;--danger-subtle:rgba(255,120,120,.12);
+  --info:#6BB5FF;--info-fg:#000;
+  --aim:#AD7DFF;--aim-fg:#000;--aim-subtle:rgba(173,125,255,.15);
+  --clarify:#FFF373;--clarify-subtle:rgba(255,243,115,.08);
+  --diff-add:rgba(103,229,145,.15);--diff-add-text:#67E591;
+  --diff-del:rgba(255,120,120,.15);--diff-del-text:#FF7878;
+  --diff-hunk:rgba(82,231,225,.15);--diff-hunk-text:#52E7E1;
+  --diff-meta-text:#EFEEF0;
+  --json-key:#52E7E1;--json-str:#67E591;--json-num:#FF82B4;--json-bool:#FF7878;
+  --term-magenta:#FF82B4;--term-cyan:#52E7E1;
+  --shadow-sm:0 1px 2px rgba(0,0,0,.3);
+  --shadow-md:0 4px 12px rgba(0,0,0,.35),0 0 0 1px rgba(255,255,255,.03);
+  --shadow-lg:0 12px 28px rgba(0,0,0,.45);
+  color-scheme:dark;
+}
+[data-theme="nu-disco-light"]{
+  --search-highlight:rgba(255,167,38,.35);--search-highlight-current:rgba(255,120,0,.7);--search-highlight-current-border:rgba(0,0,0,.8);
+  --bg:#F8F7F8;--bg-accent:#ECE9EC;--bg-elevated:#FFFFFF;--bg-hover:#E7E4E7;
+  --card:#FFFFFF;--card-fg:#0C001F;--card-hl:rgba(12,0,31,.03);
+  --panel:#F8F7F8;--panel-strong:#ECE9EC;
+  --chrome:rgba(248,247,248,.95);
+  --text:#231934;--text-strong:#0C001F;--muted:#6D6679;--muted-fg:#fff;--muted-strong:#4D445B;
+  --border:#E7E4E7;--border-strong:#CECCD2;--border-hover:#9E99A5;
+  --accent:#B6034B;--accent-fg:#fff;--accent-hover:#E62472;--accent-subtle:rgba(182,3,75,.10);
+  --accent-glow:rgba(182,3,75,.15);--ring:#B6034B;
+  --ok:#009E35;--ok-fg:#000;--ok-subtle:rgba(0,158,53,.1);
+  --warn:#D16100;--warn-fg:#000;--warn-subtle:rgba(209,97,0,.1);
+  --danger:#BD0000;--danger-fg:#fff;--danger-subtle:rgba(189,0,0,.1);
+  --info:#005C8A;--info-fg:#fff;
+  --aim:#4B1E97;--aim-fg:#fff;--aim-subtle:rgba(75,30,151,.1);
+  --clarify:#D16100;--clarify-subtle:rgba(209,97,0,.06);
+  --diff-add:rgba(0,158,53,.12);--diff-add-text:#007A29;
+  --diff-del:rgba(189,0,0,.12);--diff-del-text:#BD0000;
+  --diff-hunk:rgba(0,131,127,.12);--diff-hunk-text:#006B68;
+  --diff-meta-text:#0C001F;
+  --json-key:#00837F;--json-str:#007A29;--json-num:#B6034B;--json-bool:#BD0000;
+  --term-magenta:#B6034B;--term-cyan:#00837F;
+  --shadow-sm:0 1px 2px rgba(0,0,0,.06);
+  --shadow-md:0 4px 12px rgba(0,0,0,.08),0 0 0 1px rgba(0,0,0,.04);
+  --shadow-lg:0 12px 28px rgba(0,0,0,.12);
+  color-scheme:light;
+}
+
 /* ── AMOLED Midnight — pure-black dark + a true light variant ── */
 [data-theme="amoled-midnight-dark"]{
   --bg:#000000;--bg-accent:#09090b;--bg-elevated:#121214;--bg-hover:#1a1a1d;
@@ -1786,6 +1878,19 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
 @keyframes csb-a{0%,30%{opacity:1;transform:translateY(0) scale(1)}38%{opacity:0;transform:translateY(-3px) scale(.6)}45%,82%{opacity:0;transform:translateY(3px) scale(.6)}90%,100%{opacity:1;transform:translateY(0) scale(1)}}
 @keyframes csb-b{0%,30%{opacity:0;transform:translateY(3px) scale(.6)}38%{opacity:0;transform:translateY(3px) scale(.6)}45%{opacity:1;transform:translateY(-2px) scale(1)}55%{opacity:1;transform:translateY(0) scale(1)}82%{opacity:1;transform:translateY(0) scale(1)}90%{opacity:0;transform:translateY(-3px) scale(.6)}100%{opacity:0;transform:translateY(3px) scale(.6)}}
 
+/* ── Typing dots (components/chat/TypingDots) ──
+   The crewmate typing bubble's "a reply is being typed" glyph: three bouncing
+   dots in `currentColor`, so the host paints them with its text colour (the
+   bubble sets `text-muted`), sized to sit on one text line inside the bubble.
+   The resting style IS the reduced-motion style: the global reduced-motion rule
+   above ends every animation on its first frame, which leaves a dot at its base
+   opacity. */
+.typing-dots{display:inline-flex;align-items:center;gap:5px;padding:0 3px;line-height:0}
+.typing-dots>span{display:block;width:8px;height:8px;border-radius:9999px;background:currentColor;opacity:.6;animation:typing-dot 1.3s ease-in-out infinite both}
+.typing-dots>span:nth-child(2){animation-delay:.18s}
+.typing-dots>span:nth-child(3){animation-delay:.36s}
+@keyframes typing-dot{0%,60%,100%{transform:translateY(0);opacity:.6}30%{transform:translateY(-3px);opacity:1}}
+
 /* ── The ghost-pose loader icons ──
    These are the DEFAULT loader artwork for every theme (see ChatFooter's
    DEFAULT_ICONS); a theme replaces them through the themeBranding `loaderIcons`
@@ -1939,9 +2044,16 @@ html[data-font-family="custom"][data-custom-ligatures="off"] body{font-variant-l
    Kiro code rules (0,2,2); the chip rules are (0,3,2) but now say `color:var(--text)` /
    `var(--accent)`, which resolve to the redefined tokens anyway. The two Kiro-dark literals
    (`#b07fff` links / code, `#28242e` code bg) are the one thing tokens cannot reach, hence the
-   two code / link rules that stay. */
+   two code / link rules that stay.
+   CLI mode (`data-ui="cli"`) draws this bubble neutral, like every other user bubble.
+   cli-mode.css paints user bubbles with `var(--bg-elevated)` and `var(--text)` under
+   `!important`; read on this element, those are the redefined tokens below, a 15%-black patch
+   and accent-fg text (`#000` on `#222222` in gruvbox-dark). So every rule that
+   starts with the hook carries `:where(:root:not([data-ui="cli"]))`: `:where()` adds no
+   specificity, so chat mode's cascade is unchanged. The `--bubble-accent` snapshot needs no
+   guard, because nothing reads it in CLI mode. */
 :has(>.msg-content.user-bubble.user-bubble-accent){--bubble-accent:var(--accent)}
-.msg-content.user-bubble.user-bubble-accent{
+:where(:root:not([data-ui="cli"])) .msg-content.user-bubble.user-bubble-accent{
   --text:var(--accent-fg);--text-strong:var(--accent-fg);--card-fg:var(--accent-fg);
   /* Text and strokes are accent-fg mixes; SURFACES are translucent black. A lighter patch
      (accent-fg mixed in) would pull the fill toward the text colour and cost contrast where it
@@ -1957,16 +2069,16 @@ html[data-font-family="custom"][data-custom-ligatures="off"] body{font-variant-l
   --bg:rgba(0,0,0,.12);--bg-elevated:rgba(0,0,0,.15);--bg-hover:rgba(0,0,0,.18);--card:rgba(0,0,0,.12);
   background-color:var(--bubble-accent);color:var(--accent-fg);
 }
-.msg-content.user-bubble.user-bubble-accent :not(pre)>code{background:var(--bg-hover);color:var(--accent-fg)}
+:where(:root:not([data-ui="cli"])) .msg-content.user-bubble.user-bubble-accent :not(pre)>code{background:var(--bg-hover);color:var(--accent-fg)}
 /* A link keeps a link SIGNAL once its colour is the body colour: a solid underline (UX review on
    #17918: white-on-accent with the colour cue gone read as a label). The two link pills
    (`.mc-md-ref-chip` in MarkdownRenderer, `LinkChip` in LinkPreview: `bg-accent/10` +
    `border-border/60`, label `no-underline`) read the redefined tokens for their patch and
    outline and get their label's underline back here. */
-.msg-content.user-bubble.user-bubble-accent a{color:var(--accent-fg);text-decoration:underline;text-decoration-color:color-mix(in srgb,var(--accent-fg) 75%,transparent);text-underline-offset:2px}
-.msg-content.user-bubble.user-bubble-accent span.group:has(>a){background:var(--bg-hover);border-color:var(--border)}
-.msg-content.user-bubble.user-bubble-accent span.group>a.no-underline{text-decoration:underline}
-.msg-content.user-bubble.user-bubble-accent .text-accent{color:var(--accent-fg)}
+:where(:root:not([data-ui="cli"])) .msg-content.user-bubble.user-bubble-accent a{color:var(--accent-fg);text-decoration:underline;text-decoration-color:color-mix(in srgb,var(--accent-fg) 75%,transparent);text-underline-offset:2px}
+:where(:root:not([data-ui="cli"])) .msg-content.user-bubble.user-bubble-accent span.group:has(>a){background:var(--bg-hover);border-color:var(--border)}
+:where(:root:not([data-ui="cli"])) .msg-content.user-bubble.user-bubble-accent span.group>a.no-underline{text-decoration:underline}
+:where(:root:not([data-ui="cli"])) .msg-content.user-bubble.user-bubble-accent .text-accent{color:var(--accent-fg)}
 /* Kiro theme: lift unselected nav labels + section headers to Prey/300 (#c1bec6, ~9.8:1) per the
    Figma settings-panel guideline (was Prey/400 #938f9b ~5.7:1). Inactive icons inherit this color
    (they only carry opacity-70), lifting them from ~3.4:1 to ~5.6:1. Active items keep .nav-active. */
@@ -2099,7 +2211,7 @@ file-tree-container{
 .edit-grow>textarea{width:100%;min-width:0}
 
 /* Pinned-prompt stand-in. While a user prompt is pinned, its transcript row is
-   `visibility: hidden` (ChatPage's row wrapper, VirtualTranscript, ChatMessageList)
+   `visibility: hidden` (ChatTranscriptView's row wrapper, VirtualTranscript, ChatMessageList)
    and the PinnedPrompt card is drawn in its place — but the card copies only the
    BUBBLE, and the row also carries the message's action strip (copy, copy link,
    pin, edit, timestamp). Visibility is inherited, so a `visible` descendant of the
@@ -2218,7 +2330,7 @@ file-tree-container{
    The hit area can only reach as far as the nearest `overflow: hidden`
    ancestor: a clipped part of a box is not hit-testable. A host inside such
    a wrapper must lift the clip under the same media query (the sidebar's
-   split New button does, see ChatSidebar). */
+   split New button does, see chat-sidebar/SidebarHeader.tsx). */
 @layer components {
   @media (pointer: coarse) {
     .mc-touch-hit, .mc-touch-hit-y, .mc-touch-hit-end { position: relative; }
@@ -3082,14 +3194,14 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
    fade completes (REVEAL_FLASH_FADE_MS in ChatSidebar.tsx covers it). */
 .session-row.session-reveal-flash,.folder-row.session-reveal-flash,.folder-col.session-reveal-flash{outline:2px solid var(--accent);outline-offset:-2px}
 .session-row.session-reveal-flash-fade,.folder-row.session-reveal-flash-fade,.folder-col.session-reveal-flash-fade{outline-color:transparent}
-/* Pinned folder headers in the Sessions lane (ChatSidebar renderFolderHeader).
+/* Pinned folder headers in the Sessions lane (chat-sidebar/folderBlocks.tsx renderFolderHeader).
    A sticky row needs an opaque surface or the session rows scroll visibly
    through it; it takes the card's own surface so it reads as part of the
    panel. `:where()` keeps this at one class of specificity so the row's
    `hover:bg-bg-hover` still wins on hover. kiro-light steps the card back to
    --panel (.sidebar-inner above), so the pinned row follows it. A host that
    repaints the card sets --folder-row-sticky-bg to the same surface (the
-   /embed/sessions wrapper in ChatPage paints it --bg).
+   /embed/sessions wrapper in SessionsSidebarChrome paints it --bg).
    --folder-row-sticky-h is the header's height, which is what a nested header
    is offset by per depth, so the row is held to it: a default-agent badge or
    the rename input would otherwise grow the row 4-6px and the pinned header
@@ -3114,7 +3226,7 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
 .folder-rail:hover>span{left:3px;width:3px;background:color-mix(in srgb,var(--accent) 60%,transparent)}
 @media (prefers-reduced-motion:reduce){.folder-rail>span{transition:none}}
 /* Rows scrolled into view (arrow-key roving, focus, reveal) stop below the
-   pinned header stack of their folder block (ChatSidebar renderFolderBlock
+   pinned header stack of their folder block (chat-sidebar/folderBlocks.tsx renderFolderBlock
    sets --folder-pin-stack); unfiled rows have no stack and keep 0. Chromium's
    `block: 'nearest'` ignores this margin for a row already in view, so the
    arrow-key rove re-aligns such a row itself (chat/sessionRowNav.ts). */
@@ -3131,7 +3243,7 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
    surface (kiro-light's --panel, the /embed/sessions host's --bg). */
 :where(.sidebar) .list-dock-shelf{background:linear-gradient(to bottom,transparent,var(--folder-row-sticky-bg,var(--bg-elevated)) 8px)}
 :where([data-theme="kiro-light"] .sidebar-inner) .list-dock-shelf{background:linear-gradient(to bottom,transparent,var(--folder-row-sticky-bg,var(--panel)) 8px)}
-/* Stalled goal loop (ChatSidebar `goalLoopStalled`): the loop is armed but its
+/* Stalled goal loop (chat-sidebar/SessionRow.tsx `goalLoopStalled`): the loop is armed but its
    last turn died and nothing is executing — the whole card flashes danger-red
    until the user resumes. Two-class specificity outranks the Tailwind
    bg-accent-subtle an active row carries, so the alarm wins on the selected
@@ -3141,7 +3253,7 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
    would silence the alarm exactly for the users who asked for less motion. */
 .session-row.session-loop-stalled{background-color:var(--danger-subtle);animation:kc-loop-stalled-flash 1.6s ease-in-out infinite}
 @keyframes kc-loop-stalled-flash{0%,100%{background-color:var(--danger-subtle)}50%{background-color:transparent}}
-/* Live session dot (ChatSidebar `showLiveDot`): leads the session name while the
+/* Live session dot (chat-sidebar/SessionRow.tsx `showLiveDot`): leads the session name while the
    row's state resolver says the session is working. A filled accent disc, so it
    claims none of the row chrome other states own: the background (selection,
    stalled alarm) and the left edge (session colour bar, recency tint) stay
@@ -3293,15 +3405,22 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
 .mc-cmt-bubble.unread { background-color: var(--warn); color: var(--warn-fg, #1a1a1a); }
 .mc-cmt-bubble.active { background-color: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
 
-/* Artifact toolbar: every control (version select + buttons) the same height.
-   Icon-only buttons become squares; labeled buttons keep their padding-driven
-   width. ArtifactDetailPage already carries the `mc-art-toolbar` class. */
+/* Artifact toolbar: every button the same height. Icon-only buttons become
+   squares (the min-width matches the height); labeled buttons keep their
+   padding-driven width. The version select is a Radix trigger inside a
+   wrapper div, so this selector cannot reach it -- it takes the same 32px
+   through its own className (TOOLBAR_SELECT_CLASS in ArtifactDetailPage). A
+   button wrapped in HoverTip (`[data-hover-tip]`) is one level deeper and is
+   matched explicitly. */
 .mc-art-toolbar > button,
+.mc-art-toolbar > [data-hover-tip] > button,
 .mc-art-toolbar > select {
   height: 32px;
+  min-width: 32px;
   box-sizing: border-box;
 }
-.mc-art-toolbar > button {
+.mc-art-toolbar > button,
+.mc-art-toolbar > [data-hover-tip] > button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -3477,6 +3596,18 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
   --tile-teal: #32ade6;
 }
 
+/* Crewmate goal marks (CrewGoals `goalColor`): the numbered dot that ties a
+ * milestone to the goals it serves. A muted, dusty palette -- periwinkle,
+ * mauve, clay, sea glass, rose -- that reads as identity, not status, so it
+ * stays clear of the ok green and warn yellow. Dark mode lifts each hue;
+ * light mode deepens it so the dot holds against a white card. */
+:root {
+  --goal-1: #9aa8f5; --goal-2: #c6a3d9; --goal-3: #e3a283; --goal-4: #86c3c0; --goal-5: #e79fb4;
+}
+[data-mode="light"] {
+  --goal-1: #5867c9; --goal-2: #8e62a8; --goal-3: #b8674a; --goal-4: #3d8784; --goal-5: #b65a77;
+}
+
 /* Liquid Glass tint (components/ui/liquid-glass.tsx): the fill laid over the
  * blurred backdrop of the composer and the mobile settings search capsule. Read
  * from data-mode polarity like the pane shadow: light themes get a milky
@@ -3581,6 +3712,14 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
 .glass-danger { --glass-tint: color-mix(in srgb, var(--danger) 12%, var(--glass-tint-step)); --glass-band: color-mix(in srgb, var(--danger) 12%, var(--glass-band-plain)); }
 .glass-hover:hover { --glass-tint: color-mix(in srgb, var(--text) 8%, var(--glass-tint-step)); }
 
+/* Warn-hued text on a `glass-warn` pane (the queued-message card, the memory
+ * mode chip): the same `--warn-text` token the `text-warn-text` utility paints
+ * on `bg-warn-subtle` / `bg-warn/N` fills (see the token's note next to
+ * `--shadow-float`; issues #19920, #20071). glassWarnTextContrast.test.ts
+ * measures every light palette against it and refuses a `glass-warn` pane or a
+ * warn-tinted fill that still paints plain `text-warn`. */
+.glass-warn-fg { color: var(--warn-text); }
+
 /* The context shelf (agent, project, branch, model chips) sits BELOW the glass
  * pane, on the bare transcript, and the dock floats over content, so a chip
  * label read against whatever scrolled under it. The shelf stands on a scrim:
@@ -3591,7 +3730,7 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
  * faint line a few pixels below the pane -- read as a reflection of the pane's
  * own bottom edge. 6px covers the pane's hairline and the start of its shadow
  * (which paints OVER this layer, see below) and nothing else. It is a `::before` at `z-index: -1` in the dock's
- * input-area stacking context (ChatPage's `relative z-10 dock-inert` wrapper),
+ * input-area stacking context (ComposerDockView's `relative z-10 dock-inert` wrapper),
  * NOT in one of the shelf's own: that puts the fade BEHIND the pane and its
  * `.glass-shadow`, so the shadow falls onto the solid strip the way it fell
  * onto the page, instead of being whitened out part-way down and leaving a
@@ -3625,7 +3764,7 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
 /* A pending approval swaps the pane's shadow for the warm glow. */
 .glass-shadow.approval-glow { box-shadow: var(--approval-shadow); }
 
-/* The composer dock's two wrapper boxes (ChatPage.tsx) span the pane but hold
+/* The composer dock's two wrapper boxes (ComposerDockView.tsx) span the pane but hold
    nothing of their own: every child is its own content column. The wrappers
    pass input through and each child catches it, so the empty width beside the
    column, and the scrollbar gutter, reach the transcript underneath. One rule
@@ -3633,7 +3772,7 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
    The status stack is itself a scroll box (`max-h-[50svh] overflow-y-auto`):
    while it overflows, its own scrollbar has to be a hit target, and a
    scrollbar belongs to the box, not to a child, so the dock's measure marks
-   the overflowing stack (`data-overflowing`, ChatPage.tsx) and it catches input
+   the overflowing stack (`data-overflowing`, useChatPageTranscriptController.tsx) and it catches input
    as a whole for exactly that stretch. */
 .dock-inert{pointer-events:none}.dock-inert>*{pointer-events:auto}
 .dock-inert[data-overflowing="true"]{pointer-events:auto}

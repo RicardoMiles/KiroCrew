@@ -730,7 +730,8 @@ These are load-bearing. Changing any of them requires a security review.
 2. **Credentials are never read.** Known credential files are not opened;
    secret-shaped MCP `env`/`headers` keys and URL-embedded secrets are stripped
    and counted, never stored.
-3. **YAML aliases are rejected.** `_NoAliasSafeLoader` refuses anchors/aliases —
+3. **YAML aliases are rejected.** `_NoAliasSafeLoader`, a subclass of the shared
+   `NoAliasSafeLoader` in `src/kiro_crew/yaml_safe.py`, refuses aliases —
    `yaml.safe_load` alone still expands them, which is a billion-laughs vector
    on untrusted input.
 3a. **Content screens run on the value that will actually be written**, after any

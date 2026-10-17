@@ -58,8 +58,10 @@ COMPACT_OUTCOME_RECYCLED = "recycled"
 #: missing capability there would be false about a harness that has it and merely
 #: failed once.
 COMPACT_OUTCOME_RESTARTED_UNCOMPACTABLE = "restarted_uncompactable"
-#: A compaction failed and the restart is held: sub-agents still run on this session's
-#: process, and restarting it now would end them. Sent with ``success=False``.
+#: A context restart is held -- after a failed compaction, or on a backend that has
+#: none: sub-agents still run on this session's process, and restarting it now would
+#: end them. Sent with ``success=False``. Both arms send it, so a notice for it names
+#: neither cause.
 COMPACT_OUTCOME_WAITING_FOR_SUBAGENTS = "waiting_for_subagents"
 #: The in-flight compaction was ended by a user Stop, not by the harness. Sent with
 #: ``success=False``. A separate value because the failure arm's other destination is
@@ -285,7 +287,9 @@ class CompactionCoordinator:
         self._deps = deps
         self.state = state
 
-    def check_context_usage(self, key: str, provider: LLMProvider) -> float:
+    def check_context_usage(
+        self, key: str, provider: LLMProvider, *, defer_compaction: bool = False
+    ) -> float:
         """Record usage and fire background compaction at the configured threshold."""
         owner = self._owner
         key = owner._fold_key(key)
@@ -296,6 +300,19 @@ class CompactionCoordinator:
         if session:
             session.prompt_count += 1
             self._record_floor(key, session, provider, pct)
+
+        # Only the proactive threshold may yield to an admitted human answer.
+        # Keep the critical ceiling, unknown readings, pending verdicts and
+        # existing compactions on their ordinary path; native limits stay native.
+        if (
+            defer_compaction
+            and 0 < pct < self._deps.post_compact_reset_pct
+            and self.compaction_due_after_turn(key, provider)
+        ):
+            self._deps.logger.info(
+                "Session %s context at %.0f%% -- deferring compaction for human reply", key, pct
+            )
+            return pct
 
         # Go through the owner so patches on SessionManager._trigger_compaction
         # keep intercepting the call after this extraction.
@@ -990,7 +1007,7 @@ class CompactionCoordinator:
                 self._deps.logger.warning("Session %s: stopping sub-agents %s", key, ids)
                 for info in runs.running:
                     if info.id in ids and not info._stop_origin:
-                        info._stop_origin = "stopped at a failed compaction's restart"
+                        info._stop_origin = "stopped at a context restart"
                 task = asyncio.ensure_future(asyncio.gather(*(runs.cancel(i) for i in ids)))
                 self._owner._background_tasks.add(task)
                 task.add_done_callback(self._owner._background_tasks.discard)

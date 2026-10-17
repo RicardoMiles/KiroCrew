@@ -908,7 +908,13 @@ class _LoopHarness:
     """
 
     def __init__(
-        self, monkeypatch, call_tool_fn, loop_kwargs: dict | None = None, list_tools_fn=None
+        self,
+        monkeypatch,
+        call_tool_fn,
+        loop_kwargs: dict | None = None,
+        list_tools_fn=None,
+        *,
+        managed: bool = True,
     ):
         import os
         import sys
@@ -925,6 +931,12 @@ class _LoopHarness:
             "_resolve_tool_policy",
             lambda *a, **k: mcp_shared.ToolPolicy(frozenset(), ""),
         )
+        # The test's handlers stand in for a managed server's own code, so the
+        # tool policy applies to them as it does to Kiro Crew's servers.
+        # ``managed=False`` keeps the real classifier, for a handler the test
+        # deliberately places outside the package.
+        if managed:
+            monkeypatch.setattr(mcp_shared, "serves_managed_tools", lambda _fn: True)
         self.sel_mock = MagicMock()
         monkeypatch.setattr(mcp_shared, "sel", lambda: self.sel_mock)
         self._os = os

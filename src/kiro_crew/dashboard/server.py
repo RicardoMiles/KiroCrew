@@ -22,6 +22,7 @@ from urllib.parse import quote  # noqa: F401
 from aiohttp import web
 
 from kiro_crew import platform_compat, port_resolution, shutdown_event  # noqa: F401
+from kiro_crew._facade_compose import compose as _facade_compose
 from kiro_crew.apps.backend import (  # noqa: F401
     start_deferred_app_backends,
     start_enabled_app_backends,
@@ -61,9 +62,6 @@ from kiro_crew.dashboard import (  # noqa: F401
     channel_slots,
     chat,
     handlers,
-)
-from kiro_crew.dashboard import server_runtime as _server_runtime
-from kiro_crew.dashboard import (  # noqa: F401
     slot_retention,
     tailnet,
     tailnet_serve,
@@ -254,6 +252,7 @@ from kiro_crew.dashboard.server_runtime.listener_claims import (  # noqa: F401
 )
 from kiro_crew.dashboard.server_runtime.maintenance import (  # noqa: F401
     _kick_connections_warm_scavenge,
+    _kick_display_verdicts,
     _kick_knowledge_orphan_reclaim,
     _kick_local_decision_model,
     _kick_owner_only_sweep,
@@ -398,6 +397,7 @@ from kiro_crew.safety_override import (  # noqa: F401
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls  # noqa: F401
 from kiro_crew.security.argv_floor import warm_own_host_names  # noqa: F401
 from kiro_crew.sel import sel, sel_is_warm, warm_sel_singleton  # noqa: F401
+from kiro_crew.sel_request_provenance import bind_request_forwarded  # noqa: F401
 from kiro_crew.skill_usage import register_skill_read_observer
 from kiro_crew.skills import (  # noqa: F401
     SkillsLoader,
@@ -543,6 +543,13 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         "/api/browser/command",
         "/api/browser/command-drain",
         "/api/browser/command-result",
+        # External terminal grant redemption. Its only caller is the desktop
+        # shell's main process, over the same channel as the browser command
+        # drain above; the browser holds the grant but must never redeem it, so
+        # STRICT (not mixed). The handler re-asserts ``internal_auth`` and
+        # loopback because a ``local_only=False`` deployment reclassifies strict
+        # paths as mixed.
+        "/api/terminal/external-grant",
         # Computer use: the ``kirocrew-computer`` stdio shim's forwarding leg.
         # STRICT (not mixed): no browser calls it, and it is the entry point to
         # accessibility reads and input synthesis into the operator's real
@@ -734,6 +741,7 @@ _STRICT_INTERNAL_API_PATHS = frozenset(
         "/api/session-control/generate-title",
         "/api/session-control/close",
         "/api/session-control/revive",
+        "/api/session-control/history",
         "/api/session-control/send",
         "/api/session-control/broadcast",
         "/api/session-control/status",
@@ -761,14 +769,15 @@ _PRE_AUDIT_DENY_STATUSES = frozenset({401, 403})
 #: proxy rather than from the client itself. ``<name>_via_proxy`` means a
 #: forwarder presented it.
 #:
-#: The converse does NOT read across the whole SEL. A plain name means "made
-#: directly" only on the records :func:`audit_actor` reaches: the ok/error rows
-#: of both servers' ``sel_audit_middleware``, and the raised-refusal rows that
-#: go through :func:`_audit_denied`. ``token_auth`` writes its own returned
-#: 401/403 records with its own ``caller`` (``user_id``, ``app_name``,
-#: ``"unattributable"``, ``peer.login``, ...) and never calls this helper, so a
-#: forwarded request refused there is filed under a plain name. Routing those
-#: sites through here would edit a module this change does not touch.
+#: Read provenance from ``metadata["forwarded"]`` (``True`` / ``False``), not
+#: from this suffix. Every ``api_access`` row written while a request is being
+#: served records it: the auth and audit layers pass it explicitly, and a
+#: handler's own row takes the verdict the deny-audit boundary binds for the
+#: request (``kiro_crew.sel_request_provenance``). It means the same thing
+#: whichever of them wrote the row. A row with no ``forwarded`` key has no
+#: provenance recorded (one written outside any request, or by a background task
+#: after its request ended), which is never "made directly". The suffix is kept,
+#: unchanged, so existing readers and queries keyed on it keep matching.
 _VIA_PROXY_SUFFIX = "_via_proxy"
 
 
@@ -1739,6 +1748,11 @@ async def start_dashboard(
         assume_ready=assume_kiro_ready,
     )
     state.kiro_prerequisite_service = app["kiro_prerequisite_service"]
+    # A signed-out bundled kiro-cli-chat fails a prompt as a bare connection
+    # error; the ACP layer asks this service's whoami verdict to tell it apart.
+    from kiro_crew.kiro_prerequisite import register_turn_auth_service
+
+    register_turn_auth_service(state.kiro_prerequisite_service)
     # Seed the retirement baseline with the account on disk RIGHT NOW, before
     # anything can spawn a kiro-backed child. Every child postdates this read,
     # so the once-per-lifetime unset-baseline boot sweep -- which on a live
@@ -2177,6 +2191,7 @@ async def start_dashboard(
     # And for the data home's owner-only mode repair, whose walk grows with the
     # files the user has accumulated.
     _kick_owner_only_sweep(state)
+    _kick_display_verdicts(state)
     # Bind the crew-log push to this loop and register it with the session emitter,
     # once the listener is serving: installing it imports and builds the publisher,
     # which the crew log's default-on flag would otherwise put in front of the bind.
@@ -2506,6 +2521,11 @@ async def start_api_server(
         assume_ready=assume_kiro_ready,
     )
     state.kiro_prerequisite_service = app["kiro_prerequisite_service"]
+    # A signed-out bundled kiro-cli-chat fails a prompt as a bare connection
+    # error; the ACP layer asks this service's whoami verdict to tell it apart.
+    from kiro_crew.kiro_prerequisite import register_turn_auth_service
+
+    register_turn_auth_service(state.kiro_prerequisite_service)
     # Seed the retirement baseline with the account on disk RIGHT NOW, before
     # anything can spawn a kiro-backed child. Every child postdates this read,
     # so the once-per-lifetime unset-baseline boot sweep -- which on a live
@@ -2750,6 +2770,7 @@ async def start_api_server(
     _kick_config_watch(app, state)
     _kick_local_decision_model(state)
     _kick_owner_only_sweep(state)
+    _kick_display_verdicts(state)
 
     logger.info("API-only server listening on %s:%d", bind_addr, port)
 
@@ -2778,7 +2799,7 @@ async def start_api_server(
 # ``kiro_crew.dashboard.server.<name>`` reaches it wherever it lives; see
 # ``kiro_crew.dashboard.server_runtime``. Run once, after this body has bound every
 # name.
-_server_runtime.compose(
+_facade_compose(
     globals(),
     (
         _owner_app_platform,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re as _re
 from dataclasses import dataclass, field
 from typing import Any
@@ -30,6 +31,7 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKENDS_CONTEXT_RECYCLE,
     ACP_BACKENDS_EFFORT_FROM_ADVERTISED_OPTION,
     ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
+    ACP_BACKENDS_FORK_AT_MESSAGE,
     ACP_BACKENDS_HARNESS_MANAGED_COMPACTION,
     ACP_BACKENDS_HARNESS_OWNED_SESSIONS,
     ACP_BACKENDS_HOOKS_LIST,
@@ -59,6 +61,7 @@ from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing im
     ACP_BACKENDS_SESSION_SHARING,
     ACP_BACKENDS_SPEC_SERVERS_OFF_WIRE,
     ACP_BACKENDS_STEER,
+    ACP_BACKENDS_STEER_CONCURRENT_PROMPT,
     ACP_BACKENDS_STEERING_REQUEST,
     ACP_BACKENDS_STRUCTURED_REFUSAL,
     ACP_BACKENDS_TOOL_SEARCH_OVERLAY,
@@ -82,6 +85,8 @@ from kiro_crew.agent_sdk.host_auth import (  # noqa: E402,F401 - re-exported for
 from kiro_crew.recovery.ladder import (  # noqa: E402 - see the re-export note above
     SESSION_RECOVERY_MAX_ATTEMPTS,
 )
+
+logger = logging.getLogger(__name__)
 
 # ── ACP Event Kinds ──
 
@@ -134,8 +139,9 @@ METHOD_REQUEST_PERMISSION = "session/request_permission"
 METHOD_SESSION_UPDATE = "session/update"
 METHOD_METADATA = "_kiro.dev/metadata"
 METHOD_COMMANDS_EXECUTE = "_kiro.dev/commands/execute"
-# The ``_session/steering`` request a backend in ``ACP_BACKENDS_STEERING_REQUEST``
-# takes a user's mid-turn message on, and the outcomes that decide delivery.
+# The ``_session/steering`` request codex-acp and claude-agent-acp
+# (``ACP_BACKENDS_STEERING_REQUEST``) take a user's mid-turn message on, and the
+# outcomes that decide delivery.
 METHOD_SESSION_STEERING = "_session/steering"
 STEERING_INJECTED = "injected"
 STEERING_STARTED_NEW_TURN = "startedNewTurn"
@@ -170,6 +176,9 @@ METHOD_SESSION_LOAD = "session/load"
 #: which is why one membership set (``ACP_BACKENDS_RESUME_WITHOUT_LOAD``) decides
 #: which of the two a harness is sent rather than each having a restore path.
 METHOD_SESSION_RESUME = "session/resume"
+#: Copies a stored session into a new one and answers the new ``sessionId``; the
+#: source is left untouched. Advertised as ``sessionCapabilities.fork``.
+METHOD_SESSION_FORK = "session/fork"
 # kiro-cli extension: evict a session from the multiplexed process, freeing its
 # transcript/context + reaping its MCP children. Without this the shared
 # kiro-cli process retains every session's state for its whole lifetime, so RSS
@@ -919,6 +928,11 @@ class AcpEvent:
     #: (``AcpSessionHandle._run_turn``). Other harnesses leave the id off model
     #: text too, and nothing reads the flag for them.
     unattributed: bool = False
+    #: The backend's id for the model message a text chunk belongs to, from the
+    #: chunk's ``messageId``. claude-agent-acp stamps the provider's API message
+    #: id here, which is what its ``session/fork`` accepts as a fork point. Empty
+    #: when the frame carried none.
+    message_id: str = ""
     #: True when this event was SYNTHESIZED by the client rather than read off a
     #: backend frame. Only the claude compaction terminal sets it: an automatic
     #: compaction sends no terminal of its own, so one is manufactured once the
@@ -1013,6 +1027,22 @@ class AcpEvent:
     #: on a permission event, and only from that engine-written field, never from
     #: the title or the model's arguments. Empty when the frame carries none.
     harness_tool_id: str = ""
+    #: The kiro-cli read built-in (``fs_read``, ``web_fetch``, ...) a claude
+    #: permission request is for, mapped from the ``_meta.claudeCode.toolName``
+    #: claude-agent-acp stamped on the preceding ``tool_call`` frame. Set only on
+    #: a permission event and only from that cached stamp; empty on every other
+    #: backend and for every other tool.
+    harness_builtin_tool: str = ""
+    #: The DeepSeek Harness tool a permission request is for (``read``, ``bash``),
+    #: as the preceding ``tool_call`` frame stated it in ``title``. Set only on a
+    #: deepseek permission event, only from that cached name, and empty when a
+    #: second ``tool_call`` frame named the same id differently in the turn; empty
+    #: on every other backend.
+    deepseek_tool_name: str = ""
+    #: Why a DeepSeek Harness READ_ONLY turn refuses this request outright: its
+    #: launch did not prove stock dsh registers the read tools. Set only on a
+    #: deepseek permission event; empty once proved and on every other backend.
+    deepseek_read_only_issue: str = ""
     # Diff content block fields — authoritative before/after text from kiro-cli
     # for write tools. Used by chat_runner to derive the "before" snapshot
     # without a racy disk read (the write has already landed by the time the
@@ -1242,6 +1272,14 @@ class AcpPromptStats:
     # delta'd against. SESSION state: survives ``carry_over()`` like the
     # context fields, or every turn would re-bill the whole session's spend.
     cost_session_usd: float = 0.0
+    # The ACP session ``cost_session_usd`` was measured on. Lets a restore of
+    # that SAME session keep the baseline (see ``restore_cost_session``).
+    cost_baseline_sid: str = ""
+    # True while the adapter's counter holds spend Crew never saw: a restored
+    # session's ledger is brought back from the harness's own transcript, so
+    # its first reading includes everything billed before this process. The
+    # next reading is adopted as the baseline and bills nothing.
+    cost_baseline_unknown: bool = False
     # True while ``context_pct`` reads 0.0 only because a compaction dropped the
     # counts and no fresh telemetry has re-derived them. Distinguishes "the
     # transcript is empty" from "the transcript's size is unknown" — the two are
@@ -1272,6 +1310,8 @@ class AcpPromptStats:
             context_tokens_from_usage=self.context_tokens_from_usage,
             context_pct_unknown=self.context_pct_unknown,
             cost_session_usd=self.cost_session_usd,
+            cost_baseline_sid=self.cost_baseline_sid,
+            cost_baseline_unknown=self.cost_baseline_unknown,
         )
 
     def reset_context_state(self) -> None:
@@ -1305,6 +1345,7 @@ class AcpPromptStats:
         # under-count the first turns (any new reading below the stale baseline
         # only survives via the monotonic reset guard).
         self.cost_session_usd = 0.0
+        self.cost_baseline_unknown = False
 
     def note_pct_reported(self) -> None:
         """Mark ``context_pct`` as backed by real telemetry.
@@ -1332,20 +1373,71 @@ class AcpPromptStats:
             return STOP_REASON_REFUSAL, self.refusal
         return stop_reason, None
 
+    def begin_cost_session(self, session_id: str) -> None:
+        """Start the cost baseline for a session this process just created.
+
+        A ``session/new`` opens a fresh ledger in the adapter, so its counter
+        starts at zero and every later reading is spend Crew can see.
+        """
+        self.cost_session_usd = 0.0
+        self.cost_baseline_sid = session_id or ""
+        self.cost_baseline_unknown = False
+
+    def restore_cost_session(self, session_id: str) -> None:
+        """Set the cost baseline for a session restored by load or resume.
+
+        The claude harness restores a resumed session's cost ledger from its
+        own transcript, so the counter does NOT restart at zero: it carries the
+        session's whole lifetime spend. A baseline measured on this same session
+        (the adapter process restarted under a live client) still describes
+        that ledger and is kept. Any other baseline -- a fresh client after a
+        gateway restart, or one measured on a different session -- cannot, so
+        the next reading is adopted as the baseline instead of billed.
+        """
+        sid = session_id or ""
+        if sid and sid == self.cost_baseline_sid and not self.cost_baseline_unknown:
+            return
+        self.cost_session_usd = 0.0
+        self.cost_baseline_sid = sid
+        self.cost_baseline_unknown = True
+
     def apply_cost_cumulative(self, cumulative: float) -> None:
         """Fold a session-cumulative cost reading into the per-turn delta.
 
         The adapter reports cost as a running session total, so the per-turn
-        figure is the movement since the last reading. Monotonic guard: a
-        reading BELOW the stored baseline means the adapter's counter reset
-        (process restart) — the new total is then entirely spend since the
-        reset, so it is taken whole rather than producing a negative delta.
-        The caller validates the value (finite, non-negative) at the
+        figure is the movement since the last reading. Two readings carry spend
+        Crew cannot attribute, and both bill nothing and rebase:
+
+        - the first reading after ``restore_cost_session`` found no usable
+          baseline: it includes spend billed before this process;
+        - a reading BELOW the stored baseline: the ledger was restored to a
+          total Crew never saw, so taking it whole would re-bill the lifetime.
+
+        Under-counting one turn is bounded; re-billing a session's lifetime is
+        not. Each case logs a WARNING so a gap in the usage rows explains
+        itself. The caller validates the value (finite, non-negative) at the
         ``parse_usage_cost`` chokepoint.
         """
+        if self.cost_baseline_unknown:
+            logger.warning(
+                "cost baseline unknown for restored session %s: adopting "
+                "cumulative $%.6f as the baseline; this reading bills $0",
+                self.cost_baseline_sid or "(unknown)",
+                cumulative,
+            )
+            self.cost_baseline_unknown = False
+            self.cost_session_usd = cumulative
+            return
         delta = cumulative - self.cost_session_usd
         if delta < 0:
-            delta = cumulative
+            logger.warning(
+                "cost cumulative for session %s fell from $%.6f to $%.6f: "
+                "rebasing; this reading bills $0",
+                self.cost_baseline_sid or "(unknown)",
+                self.cost_session_usd,
+                cumulative,
+            )
+            delta = 0.0
         self.cost_usd += delta
         self.cost_session_usd = cumulative
 

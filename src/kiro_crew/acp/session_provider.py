@@ -18,7 +18,7 @@ import asyncio
 import functools
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import aclosing
 from pathlib import Path
 from typing import Any
@@ -46,6 +46,7 @@ from kiro_crew.acp.runtime import (
 )
 from kiro_crew.acp.session_handle import WatchdogSettings
 from kiro_crew.acp.types import (
+    ACP_BACKEND_KIRO,
     ACP_BACKENDS_COMPACT,
     ACP_BACKENDS_CONTEXT_RECYCLE,
 )
@@ -90,6 +91,8 @@ class AcpSessionProvider(LLMProvider):
     - For parent sessions (unified path): created by AcpProvider, shutdown()
       kills the runtime (entire session group dies together).
     """
+
+    approval_withdrawable = True
 
     def __init__(
         self,
@@ -618,12 +621,22 @@ class AcpSessionProvider(LLMProvider):
             send = functools.partial(send, allow_image=False)
         if timeout is not None:
             send = functools.partial(send, timeout=timeout)
+        emitted = False
         try:
             async with aclosing(
                 self.essential_delivery.stream(message, send, lambda: self.context_incarnation)
             ) as events:
                 async for event in events:
+                    emitted = True
                     yield event
+        except AcpAuthRequired:
+            raise
+        except AcpError as exc:
+            if not emitted and await self._connection_failure_is_signed_out(exc):
+                raise AcpAuthRequired(
+                    host_auth.signed_out_message(self.backend), backend=self.backend
+                ) from exc
+            raise
         except AcpRuntimeDead as exc:
             # Translate the shared-runtime death into the exception types
             # chat_runner handles (parity with AcpClient) — see _translate_dead.
@@ -703,6 +716,37 @@ class AcpSessionProvider(LLMProvider):
         finally:
             await self._end_shared_turn(claim)
 
+    async def _connection_failure_is_signed_out(self, exc: AcpError) -> bool:
+        """Whether a pre-output connection failure is really a missing sign-in.
+
+        A signed-out bundled ``kiro-cli-chat`` starts and opens sessions normally,
+        then fails every ``session/prompt`` with ``dispatch failure`` and writes
+        nothing to stderr, so ``saw_not_logged_in`` stays False and the frame is
+        classified as a retryable network drop. Only kiro-cli's own ``whoami``
+        can tell the two apart; the gateway's prerequisite service runs it and
+        answers True only on an explicit "not logged in".
+
+        Asked only for the kiro backend (KAS has its own sign-in owner) and only
+        for an error ``_raise_acp_error`` tagged ``connection_failure``, so every
+        other error keeps its ordinary path with no probe.
+        """
+        kiro_connection_failure = (
+            self.backend == ACP_BACKEND_KIRO and getattr(exc, "connection_failure", None) is True
+        )
+        if not kiro_connection_failure:
+            return False
+        # Local import: ``kiro_prerequisite`` pulls in the sandbox plane (see
+        # ``client.py``'s imports of it for the same reason).
+        from kiro_crew.kiro_prerequisite import kiro_signed_out_confirmed
+
+        if not await kiro_signed_out_confirmed():
+            return False
+        logger.warning(
+            "kiro-cli prompt failed as a connection error and whoami reports it is "
+            "not logged in; raising AcpAuthRequired instead of retrying"
+        )
+        return True
+
     def _translate_dead(
         self, exc: AcpRuntimeDead, *, own_write_only: bool = False
     ) -> AcpProcessDied | AcpAuthRequired:
@@ -769,16 +813,25 @@ class AcpSessionProvider(LLMProvider):
         *,
         always: bool = False,
         deadline: GrantDeadline | None = None,
+        withdraw_if: Callable[[], bool] | None = None,
     ) -> bool:
         """Approve a pending tool permission request. Accepts an explicit
         option_id (signature parity with AcpClient.approve_tool); falls back to
         allow_always/allow_once from `always`. A ``deadline`` is passed on to
-        the handle, which raises ``GrantEnded`` rather than send once it passes."""
+        the handle, which raises ``GrantEnded`` rather than send once it passes.
+        *withdraw_if* is the handle's (see AcpSessionHandle.approve_tool)."""
         resolved = option_id or ("allow_always" if always else "allow_once")
+        withdrawal: dict[str, Any] = {}
+        if withdraw_if is not None:
+            withdrawal["withdraw_if"] = withdraw_if
         if deadline is None:
-            return await self._guarded(self._handle.approve_tool(request_id, option_id=resolved))
+            return await self._guarded(
+                self._handle.approve_tool(request_id, option_id=resolved, **withdrawal)
+            )
         return await self._guarded(
-            self._handle.approve_tool(request_id, option_id=resolved, deadline=deadline)
+            self._handle.approve_tool(
+                request_id, option_id=resolved, deadline=deadline, **withdrawal
+            )
         )
 
     async def reject_tool(self, request_id: str | int) -> None:
@@ -873,7 +926,7 @@ class AcpSessionProvider(LLMProvider):
 
     @property
     def member_capabilities_supported(self) -> bool:
-        """Full saved member-spec loading is opt-in (harness-parity H6)."""
+        """Saved member-spec loading or projection is opt-in (harness-parity H6)."""
         return self._runtime.acp_backend in ACP_BACKENDS_MEMBER_CAPABILITIES
 
     @property
@@ -883,14 +936,19 @@ class AcpSessionProvider(LLMProvider):
 
     @property
     def loaded_capability_template(self) -> str:
-        if (
-            self.member_capabilities_supported
-            and self._owns_runtime
-            and self._runtime.is_alive()
-            and self._handle.active_agent == self._runtime._agent
-        ):
-            return self._handle.active_agent
-        return ""
+        if not (self._owns_runtime and self._runtime.is_alive()):
+            return ""
+        from kiro_crew.acp.types import ACP_BACKEND_KAS  # noqa: PLC0415
+
+        if self._runtime.acp_backend in (ACP_BACKEND_KIRO, ACP_BACKEND_KAS):
+            if self._handle.active_agent == self._runtime._agent:
+                return self._handle.active_agent
+            return ""
+        return self._handle.confirmed_projection_template
+
+    @property
+    def capability_projection_gaps(self) -> tuple[str, ...]:
+        return self._handle.capability_projection_gaps
 
     @property
     def exit_code(self) -> int | None:
@@ -923,9 +981,10 @@ class AcpSessionProvider(LLMProvider):
         watchdog: WatchdogSettings | None = None,
     ) -> None:
         """Re-key for a different session on warm-pool claim (parity with
-        AcpClient.rekey). session_allocation.py calls provider.client.rekey(...)
-        on claim; when the pooled provider is kiro-shared, provider.client is
-        THIS class, so a missing rekey() would AttributeError on claim. Stores
+        AcpClient.rekey). session_allocation_parts/get_or_create.py calls
+        provider.client.rekey(...) on claim; when the pooled provider is
+        kiro-shared, provider.client is THIS class, so a missing rekey() would
+        AttributeError on claim. Stores
         the correlation keys and refreshes runtime activity so the just-claimed
         process is not idle-reaped.
 

@@ -427,18 +427,12 @@ class TestLaunchersPassSafePath:
         constants (`_GATEWAYD_MODULE`, `OVERLAY_MODULE`, `_STUB_MODULE`) as well
         as the literal package."""
         pattern = re.compile(r'"-m",\s*(?:"kiro_crew|_GATEWAYD_MODULE|OVERLAY_MODULE|_STUB_MODULE)')
-        # The MCP stub argv is a PERSISTED, fingerprinted overlay format read by
-        # kiro-cli; adding a flag there re-shapes every written overlay and its
-        # cache key, so it is tracked as its own change rather than folded in here.
-        deferred = {"kiro_crew/mcp_gateway/rewriter.py"}
         offenders: list[str] = []
         for path in (_SRC / "kiro_crew").rglob("*.py"):
             posix = path.as_posix()
             if "/tests/" in posix or "/container_tests/" in posix or path.name.startswith("test_"):
                 continue
             rel = path.relative_to(_SRC).as_posix()
-            if rel in deferred:
-                continue
             text = path.read_text(encoding="utf-8")
             for m in pattern.finditer(text):
                 # Look back to the start of the same argv call (piper_runtime

@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from pathlib import PureWindowsPath
 from typing import Any, Iterable
 
+from kiro_crew import member_goals as _goals
+
 # The artifact tag rule lives with the store's other field grammar and is read
 # here so the tool gate and the store cannot disagree about a tag. Import-safe:
 # ``artifact_store.rules`` loads the record dataclasses and the slug hash
@@ -243,6 +245,23 @@ LESSON_LIST_LIMIT_MAX = 500
 # refuses past it. Far beyond any real population: past ``total`` every page is
 # empty anyway.
 LESSON_LIST_OFFSET_MAX = 100_000_000
+
+
+def clamp_query_offset(offset: int) -> int:
+    """``offset`` folded into ``[0, LESSON_LIST_OFFSET_MAX]``.
+
+    The one clamp every dashboard route applies before it hands a query
+    ``offset`` to a store that binds it as a SQLite parameter. The bind, not
+    the query, is what makes the ceiling necessary: ``sqlite3`` raises
+    ``OverflowError`` on an int past the signed 64-bit range, which a route
+    that only parsed ``int(...)`` surfaces as a 500 where the caller asked for
+    a page that is simply empty. A negative value is folded to ``0`` for the
+    same reason -- a list route would slice from the end, a bound one would
+    error. Routes that slice a Python list need no clamp: slicing already
+    treats an out-of-range index as the empty tail.
+    """
+    return max(0, min(offset, LESSON_LIST_OFFSET_MAX))
+
 
 # Allowed cron schedule kinds
 ALLOWED_SCHEDULE_KINDS = frozenset({"every", "cron", "at"})
@@ -2678,6 +2697,7 @@ ARTIFACT_UPDATE_SCHEMA = ToolSchema(
             item_max_len=ARTIFACT_TAG_MAX,
             max_items=16,
         ),
+        FieldSpec("clear_tags", bool),
         FieldSpec("webapp_metadata", dict),
     ],
 )
@@ -4030,6 +4050,12 @@ SESSION_CREATE_SCHEMA = ToolSchema(
             max_len=MAX_SHORT_STRING,
             pattern=_MODEL_NAME_RE,
         ),
+        # Reasoning effort the new session starts at, the same five levels
+        # ``session_set_model`` takes; the verb refuses anything else. No
+        # ``default``: an absent level means "inherit the dispatching
+        # crewmate's", which an empty string would also read as, so the
+        # schema leaves absence to the handler rather than spelling it.
+        FieldSpec("reasoning_effort", str, required=False, max_len=32),
     ],
 )
 
@@ -4140,6 +4166,16 @@ SESSION_REVIVE_SCHEMA = ToolSchema(
         # would leave the session revived and unfiled when the move refused.
         # Filing itself runs after the revive has committed and is best-effort.
         FieldSpec("folder", str, required=False, default="", max_len=_ARTIFACT_FOLDER_REF_MAX),
+    ],
+)
+
+SESSION_HISTORY_LIST_SCHEMA = ToolSchema(
+    tool_name="session_history_list",
+    fields=[
+        # A folder id or path, resolved read-only (never created): a filter
+        # naming a folder that does not exist is refused, not silently widened.
+        FieldSpec("folder", str, required=False, default="", max_len=_ARTIFACT_FOLDER_REF_MAX),
+        FieldSpec("limit", int, required=False, default=20, min_val=1, max_val=100),
     ],
 )
 
@@ -4314,6 +4350,24 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "issue_radar_crew_record": ISSUE_RADAR_CREW_RECORD_SCHEMA,
 }
 
+
+def _validate_cron_secret_request(cleaned: dict[str, Any]) -> None:
+    """``secrets`` is required unless the call withdraws the pending request.
+
+    ``withdraw: true`` spells the empty mapping for a client that drops ``{}`` before
+    it reaches the server, so it stands in for ``secrets`` and is refused beside a
+    mapping that names a grant. A call with neither gets the refusal any missing
+    required field gets.
+    """
+    withdraw = cleaned.get("withdraw") is True
+    if withdraw and cleaned.get("secrets"):
+        raise ValidationError(
+            "withdraw", "withdraws the pending request, so pass it without secrets"
+        )
+    if cleaned.get("secrets") is None and not withdraw:
+        raise ValidationError("secrets", "required")
+
+
 MCP_CRON_SCHEMAS: dict[str, ToolSchema] = {
     "cron_list": CRON_LIST_SCHEMA,
     "cron_add": CRON_ADD_SCHEMA,
@@ -4340,6 +4394,7 @@ MCP_CRON_SCHEMAS: dict[str, ToolSchema] = {
                 max_items=366,
                 item_pattern=re.compile(r"^\d{4}-\d{2}-\d{2}$"),
             ),
+            FieldSpec("clear_skip_dates", bool),
             FieldSpec("timezone", str, max_len=50, pattern=re.compile(r"^[A-Za-z0-9_/+-]+$")),
             FieldSpec("folder", str, max_len=MAX_SHORT_STRING),
             FieldSpec("persistent_session", bool),
@@ -4364,9 +4419,11 @@ MCP_CRON_SCHEMAS: dict[str, ToolSchema] = {
     # (cron_script.validate_secret_env_grant) — this schema bounds shape/size.
     "cron_secret_request": ToolSchema(
         tool_name="cron_secret_request",
+        custom_validator=_validate_cron_secret_request,
         fields=[
             FieldSpec("job_id", str, required=True, max_len=16, pattern=_JOB_ID_RE),
-            FieldSpec("secrets", dict, required=True),
+            FieldSpec("secrets", dict),
+            FieldSpec("withdraw", bool),
         ],
     ),
 }
@@ -4471,6 +4528,7 @@ MCP_DASHBOARD_SCHEMAS: dict[str, ToolSchema] = {
     "session_generate_title": SESSION_GENERATE_TITLE_SCHEMA,
     "session_close": SESSION_CLOSE_SCHEMA,
     "session_revive": SESSION_REVIVE_SCHEMA,
+    "session_history_list": SESSION_HISTORY_LIST_SCHEMA,
     "session_send": SESSION_SEND_SCHEMA,
     "session_broadcast": SESSION_BROADCAST_SCHEMA,
     "session_status": SESSION_STATUS_SCHEMA,
@@ -4843,11 +4901,85 @@ DASHBOARD_WRITE_SCHEMA = ToolSchema(
     ],
 )
 
+#: Why a ``dashboard_write`` call with nothing to write is refused at the MCP entry.
+#: It opens with the ``value: required`` text any missing required field gets, then
+#: names the remedy for the case that produces it most: an MCP client that drops an
+#: empty list, an empty object or a top-level null from the arguments before they
+#: reach this server, so ``value: []`` arrives as no value at all.
+DASHBOARD_WRITE_NO_VALUE = (
+    "required -- nothing reached this tool to write. An empty list, an empty object "
+    "or null can be dropped by the MCP client before it arrives; to empty an array or "
+    "object field, call dashboard_write with clear: true and no value"
+)
+
+
+def _validate_dashboard_write_tool(cleaned: dict[str, Any]) -> None:
+    """``value`` is required unless ``clear`` is true, and the two do not mix.
+
+    ``clear: true`` stands for the field's empty value, so a ``value`` beside it is
+    accepted only when it says the same thing (``[]`` or ``{}``); the server then
+    writes the empty value of the field's declared type. Any other value contradicts
+    it, and which of the two the caller meant is not this check's to guess.
+    """
+    value = cleaned.get("value")
+    if cleaned.get("clear") is True:
+        if value is not None and value != [] and value != {}:
+            # Reads as "clear: true writes ..." once the field name is put in front.
+            raise ValidationError(
+                "clear", "true writes the field's empty value, so pass it without a value"
+            )
+        return
+    if value is None:
+        raise ValidationError("value", DASHBOARD_WRITE_NO_VALUE)
+    if isinstance(value, str) and not value:
+        # The refusal a REQUIRED string spec gives a value that sanitizes to nothing,
+        # kept word for word: ``value`` is optional in this schema only so that
+        # ``clear`` can stand in for it.
+        raise ValidationError("value", "required (empty after sanitization)")
+
+
+#: ``dashboard_write`` as the MCP server accepts it. The gateway route validates its
+#: body with ``DASHBOARD_WRITE_SCHEMA``, where ``value`` is required: the server
+#: turns ``clear: true`` into the field's empty value before it posts, so the route
+#: sees an ordinary write. ``clear`` exists because a boolean survives the MCP clients
+#: that drop an empty container from a tool call's arguments, and array and object
+#: fields have no other way to be emptied through them.
+DASHBOARD_WRITE_TOOL_SCHEMA = ToolSchema(
+    tool_name="dashboard_write",
+    fields=[
+        FieldSpec("field", str, required=True, max_len=64),
+        FieldSpec("value", (bool, int, float, str, list, dict)),
+        FieldSpec("clear", bool),
+    ],
+    custom_validator=_validate_dashboard_write_tool,
+)
+
 #: Empty and registered, for ``PANEL_TEMPLATES_SCHEMA``'s reason. The catalog is the
 #: same for every caller except for the seq numbers, and those come from the calling
 #: session's own identity -- so there is no argument that could narrow or widen it, and
 #: an accepted one would be a filter the tool does not apply.
 DASHBOARD_TYPES_SCHEMA = ToolSchema(tool_name="dashboard_types")
+
+DASHBOARD_SAVE_SCHEMA = ToolSchema(
+    tool_name="dashboard_save",
+    fields=[
+        # The THREE declarations and nothing else. Every other key a package has --
+        # ``kind`` and ``bound_to`` -- is the gateway's to fill from the vetted
+        # caller, so a caller that sends one is refused HERE by the unknown-key
+        # rule every ToolSchema enforces. That refusal is the point: silently
+        # dropping a caller-sent ``bound_to`` would tell an agent its page was
+        # saved where it asked while the page went somewhere else.
+        #
+        # Typed only as objects, with no inner shape. The shape is
+        # ``artifact_store.dashboard_package``'s, which holds the closed catalog
+        # of data types and block types and is the one place that can name what
+        # was wrong; a second shape here would either contradict it or restate it,
+        # and a restatement goes stale the day the catalog grows.
+        FieldSpec("model", dict, required=True),
+        FieldSpec("view", dict, required=True),
+        FieldSpec("theme", dict, required=True),
+    ],
+)
 
 DASHBOARD_TEMPLATES_SCHEMA = ToolSchema(
     tool_name="dashboard_templates",
@@ -4871,18 +5003,22 @@ DASHBOARD_PREVIEW_SCHEMA = ToolSchema(
         # ``instance.AUTHORED_PAGE_REFUSAL`` -- and dropping these two specs would make
         # that refusal read "unknown field", which tells a caller to try a different
         # spelling rather than that the whole capability is a later change. The caps
-        # bound what reaches the refusal; ``html`` matches the store's own
-        # ``MAX_INSTANCE_HTML_BYTES`` ceiling spelled in characters.
+        # bound only what reaches the refusal: ``html`` is held to 64 KiB, far under the
+        # page ceiling ``MAX_INSTANCE_HTML_BYTES``, because a page sent here is refused
+        # whatever its size and so never needs the room a template page does.
         FieldSpec("manifest", dict),
         FieldSpec("html", str, max_len=64 * 1024),
     ],
 )
 
-#: Empty and registered, for ``PANEL_TEMPLATES_SCHEMA``'s reason -- and here the
-#: emptiness is also the safety property the tool advertises: apply installs the page
-#: that was STAGED, so an accepted argument would be a way to make the thing applied
-#: differ from the thing the person looked at.
-DASHBOARD_APPLY_SCHEMA = ToolSchema(tool_name="dashboard_apply")
+DASHBOARD_APPLY_SCHEMA = ToolSchema(
+    tool_name="dashboard_apply",
+    fields=[
+        # Optional. Present, the template is applied directly -- a preview is an
+        # optional look, not a gate. Absent, the staged preview is applied.
+        FieldSpec("template_id", str, max_len=64),
+    ],
+)
 
 DASHBOARD_ROLLBACK_SCHEMA = ToolSchema(
     tool_name="dashboard_rollback",
@@ -4900,7 +5036,8 @@ MCP_PANEL_SCHEMAS: dict[str, ToolSchema] = {
     "panel_templates": PANEL_TEMPLATES_SCHEMA,
     "dashboard_fields": DASHBOARD_FIELDS_SCHEMA,
     "dashboard_types": DASHBOARD_TYPES_SCHEMA,
-    "dashboard_write": DASHBOARD_WRITE_SCHEMA,
+    "dashboard_write": DASHBOARD_WRITE_TOOL_SCHEMA,
+    "dashboard_save": DASHBOARD_SAVE_SCHEMA,
     "dashboard_templates": DASHBOARD_TEMPLATES_SCHEMA,
     "dashboard_preview": DASHBOARD_PREVIEW_SCHEMA,
     "dashboard_apply": DASHBOARD_APPLY_SCHEMA,
@@ -5039,6 +5176,51 @@ MCP_MATE_SCHEMAS: dict[str, ToolSchema] = {
         fields=[
             FieldSpec("draft", dict, required=True),
             FieldSpec("reason", str, max_len=500),
+        ],
+    ),
+    "goal_read": ToolSchema(tool_name="goal_read", fields=[]),
+    "set_goal": ToolSchema(
+        tool_name="set_goal",
+        fields=[
+            FieldSpec("long_term", str, required=True, max_len=_goals.LONG_TERM_MAX_CHARS),
+            FieldSpec("goal_id", str, max_len=9),
+            FieldSpec("reason", str, max_len=500),
+        ],
+    ),
+    "set_key_results": ToolSchema(
+        tool_name="set_key_results",
+        fields=[
+            FieldSpec("items", list, required=True),
+            FieldSpec("reason", str, max_len=500),
+        ],
+    ),
+    "set_check_ins": ToolSchema(
+        tool_name="set_check_ins",
+        fields=[
+            FieldSpec("daily", bool),
+            FieldSpec("weekly", bool),
+            FieldSpec("monthly", bool),
+            FieldSpec("weekday", int),
+            FieldSpec("month_day", int),
+            FieldSpec("time", str, max_len=5),
+            FieldSpec("reason", str, max_len=500),
+        ],
+    ),
+    "key_result_progress": ToolSchema(
+        tool_name="key_result_progress",
+        fields=[
+            FieldSpec("id", str, required=True, max_len=16),
+            FieldSpec("current", str, required=True, max_len=_goals.KR_READING_MAX_CHARS),
+        ],
+    ),
+    "save_goal_report": ToolSchema(
+        tool_name="save_goal_report",
+        fields=[
+            FieldSpec(
+                "kind", str, required=True, max_len=8, allowed=frozenset({"weekly", "monthly"})
+            ),
+            FieldSpec("title", str, required=True, max_len=_goals.REPORT_TITLE_MAX_CHARS),
+            FieldSpec("markdown", str, required=True, max_len=_goals.REPORT_MAX_CHARS),
         ],
     ),
 }

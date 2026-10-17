@@ -203,7 +203,10 @@ ready-to-evaluate batch — runs the acceptance evaluator against the item's own
 condition, and records the answer with `work_ledger_record` as a `verdict`:
 
 - `pass` / `fail` — final for that cycle.
-- `pending` — the condition is not true yet; keep waiting.
+- `pending` — the condition is not true yet; keep waiting, for at most 24 hours on
+  end. Past that the item reads `pending_overdue`, and the conductor asks you, the
+  way it reports a `refused` one: keep waiting, which starts a fresh 24 hours, or
+  drop the item. A `human_approval` bar is never overdue: it waits for your answer.
 - `refused` — the evaluator will not answer the condition as written, and no
   amount of waiting changes that. A **draft** pull request whose checks have not
   finished lands here, because a draft is the author's own "not ready" and a

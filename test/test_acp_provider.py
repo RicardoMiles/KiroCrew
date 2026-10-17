@@ -19,6 +19,7 @@ from kiro_crew.acp.session_provider import AcpSessionProvider
 from kiro_crew.acp.types import ACP_BACKEND_CLAUDE, AcpEvent, TurnUsage
 from kiro_crew.agent_sdk import capture_prompt_timeout
 from kiro_crew.providers.acp import AcpProvider
+from kiro_crew.testing.wait import await_until
 
 
 def _build_provider(backend: str) -> AcpProvider:
@@ -1113,7 +1114,7 @@ class TestStartKiroRuntimeResume:
         ):
             start = asyncio.ensure_future(provider._start_kiro_runtime())
             try:
-                await asyncio.wait_for(settle_entered.wait(), timeout=5)
+                await await_until(settle_entered, what="the stderr settle starting")
                 await asyncio.sleep(0.1)
                 start.cancel()
                 await asyncio.wait({start}, timeout=5)

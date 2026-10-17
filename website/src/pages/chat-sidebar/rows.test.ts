@@ -73,7 +73,7 @@ const NO_BOOST = { idlePct: [], activePct: [], hoverPct: [], mutedColors: [] }
 /** One shell object, as the facade builds one per change of any of its members. */
 const SHELL: RowShell = {
   connected: true, mode: undefined, isMobile: false, colorMode: 'tint', defaultAgent: 'kirocrew',
-  installedAgents: [], tagById: {}, paletteColors: [], boost: NO_BOOST, boostFor: () => NO_BOOST, recentTintCount: 3,
+  installedAgents: [], memoryRows: [], tagById: {}, paletteColors: [], boost: NO_BOOST, boostFor: () => NO_BOOST, recentTintCount: 3,
   dragInFlight: false, activeDraggedKey: null, activeDraggedPinnedIndex: -1, guideOnRowControl: false,
 }
 

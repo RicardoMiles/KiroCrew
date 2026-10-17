@@ -68,6 +68,7 @@ from kiro_crew.sandbox import (
     wrap_argv_async,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls, redact_local_paths
+from kiro_crew.validation import clamp_query_offset
 from kiro_crew.workflow_memory import WorkflowMemoryError
 
 from ._shared import (
@@ -805,7 +806,8 @@ async def api_memory_semantic(request: web.Request) -> web.Response:
         )
     try:
         limit = min(int(request.query.get("limit", "1000")), 1000)
-        offset = int(request.query.get("offset", "0"))
+        # Clamped before the store binds it: see ``clamp_query_offset``.
+        offset = clamp_query_offset(int(request.query.get("offset", "0")))
     except (ValueError, TypeError):
         return web.json_response({"error": "limit/offset must be integers"}, status=400)
     entries = []
@@ -860,10 +862,9 @@ async def api_memory_semantic_write(request: web.Request) -> web.Response:
         # Imported here, not at module scope: ``vector_memory`` pulls
         # snowballstemmer plus the optional numpy/faiss imports (measured 175ms
         # and ~200 modules) and this enum is the module's ONLY use of it, on one
-        # error branch. The enum itself belongs in ``vector_memory_constants``
-        # (the dependency-free split-out this module's other constants already
-        # live in), but relocating it would edit ``vector_memory.py``; deferring
-        # the import keeps the cost off the import path without that change.
+        # error branch. The enum lives in ``vector_memory_runtime/write_outcomes.py``
+        # and its public path is ``vector_memory``; deferring the import keeps the
+        # cost off the import path.
         from kiro_crew.vector_memory import SemanticRejectCode
 
         sk = request.headers.get("X-Session-Key", "")
@@ -1007,6 +1008,8 @@ async def api_memory_carve(request: web.Request) -> web.Response:
     group_by = request.query.get("count_by", "")
     try:
         limit = int(request.query.get("limit", str(memory_schema.DEFAULT_FACET_PAGE)))
+        # Not clamped here: ``memory_schema.facet_page_query`` bounds both the
+        # page and the offset for this route and the CLI verb alike.
         offset = int(request.query.get("offset", "0"))
     except (ValueError, TypeError):
         return web.json_response(
@@ -1039,7 +1042,7 @@ async def api_memory_events(request: web.Request) -> web.Response:
         return denial
     try:
         limit = min(int(request.query.get("limit", "50")), 200)
-        offset = int(request.query.get("offset", "0"))
+        offset = clamp_query_offset(int(request.query.get("offset", "0")))
     except (ValueError, TypeError):
         return web.json_response({"error": "limit/offset must be integers"}, status=400)
     # Offload: serializes on _db_lock — see api_memory_semantic.
@@ -2053,7 +2056,7 @@ async def api_memory_episodic_list(request: web.Request) -> web.Response:
         )
     try:
         limit = min(int(request.query.get("limit", "50")), 100)
-        offset = int(request.query.get("offset", "0"))
+        offset = clamp_query_offset(int(request.query.get("offset", "0")))
     except (ValueError, TypeError):
         return web.json_response({"error": "limit/offset must be integers"}, status=400)
     tag_filter = [t.strip() for t in request.query.get("tags", "").split(",") if t.strip()] or None

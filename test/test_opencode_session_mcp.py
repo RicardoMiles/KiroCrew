@@ -54,7 +54,7 @@ _CRON = {"command": "/opt/kirocrew", "args": ["mcp-cron"]}
 def agents_dir(tmp_path, monkeypatch):
     """Point the agent-spec resolver at a temp agents directory.
 
-    Same seam as ``test_codex_session_mcp.py``: materialization would rebuild the
+    Same seam as ``codex_session_mcp_helpers.py``: materialization would rebuild the
     managed default from bundled defaults, and these tests supply the spec.
     """
     d = tmp_path / "agents"

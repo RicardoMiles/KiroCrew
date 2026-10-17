@@ -56,7 +56,7 @@ const DRIVES_FAILED_KEYS: Record<SearchErrorCause, string> = {
 }
 // Only two arms have copy of their own: the recents endpoint answers any read error
 // with 200 `{"dirs": []}` and never a coded body (`api_recent_projects` in
-// chat_handlers.py), so `denied` / `root_missing` cannot be produced for it -- a 403
+// chat_api/project_lists.py), so `denied` / `root_missing` cannot be produced for it -- a 403
 // carrying `authRequired` classifies as `failed` -- and both take the generic copy
 // rather than keys no request can reach.
 const RECENT_FAILED_KEYS: Record<SearchErrorCause, string> = {
@@ -171,7 +171,7 @@ interface Props {
   /**
    * Turn on the agent hand-off in the listing-failure notice. The hand-off
    * navigates to the chat and unmounts whatever this popover floats over, so
-   * only a mount with nothing unsaved beneath it may set this: ChatPage's
+   * only a mount with nothing unsaved beneath it may set this: ComposerDockView's
    * project chooser does (its composer draft is persisted per slot by
    * `chatDrafts`). Off by default — the safe direction — for FolderConfigModal
    * (folder form), RepoSettings (repo form) and ProjectScaffolderPage (wizard).
@@ -185,7 +185,7 @@ interface Props {
    */
   startPath?: string
   /** Rendered below the listing, inside the popover (so a click there does not dismiss it):
-   *  ChatPage's AWS profile row for the chat's current project. */
+   *  ComposerDockView's AWS profile row for the chat's current project. */
   footer?: ReactNode
 }
 
@@ -223,6 +223,7 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
   // object so the notice and its agent hand-off always describe one failure.
   const [listFailure, setListFailure] = useState<ListFailure | null>(null)
   const [recentFailure, setRecentFailure] = useState<RecentFailure | null>(null)
+  const [retryingRecent, setRetryingRecent] = useState(false)
   // A listing request (a directory or the drive list) is unsettled for the CURRENT ticket: set by
   // every `browse` / `browseDrives`, cleared only by the settlement that still holds the ticket.
   // It makes the notice's Retry an inert "Retrying…" for the re-ask, as WorkspacePicker's does.
@@ -363,6 +364,26 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
     if (listFailure.kind === 'drives') browseDrives()
     else browse(listFailure.path || undefined)
   }
+  // Takes a fresh recents ticket, so a reply that lands after a reopen cannot paint over the
+  // newer read. It deliberately never settles the landing tab: that was decided when the
+  // picker opened, and a recovery the user asked for must not move them off the pane they
+  // are standing on.
+  const retryRecents = () => {
+    if (retryingRecent || !recentFailure) return
+    const ticket = ++recentSeq.current
+    setRetryingRecent(true)
+    api.recentProjects().then(d => {
+      if (ticket !== recentSeq.current) return
+      setRecentDirs(d.dirs || [])
+      setRecentFailure(null)
+      setRetryingRecent(false)
+    }).catch((err: unknown) => {
+      if (ticket !== recentSeq.current) return
+      setRecentDirs([])
+      setRecentFailure({ cause: searchErrorCause(err), report: reportForError(err) })
+      setRetryingRecent(false)
+    })
+  }
 
   // "Back" has a target when the parent is a different directory, or when the
   // level above is the drive list. Every Back affordance (button, ArrowLeft at
@@ -418,6 +439,8 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
     const ticket = ++recentSeq.current
     const favTicket = ++favoriteSeq.current
     landing.current = { ticket }
+    // This open retires any retry still out, so its handlers return without clearing the flag.
+    setRetryingRecent(false)
     // The tab is chosen once BOTH reads have settled, by whichever settles second. Favourites
     // win when the user has any -- they are the list they curated -- then recents, and Browse
     // is where an install with neither starts. A read that REJECTED counts as settled with no
@@ -662,6 +685,16 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
     }
     : recentFailure
       ? { report: recentFailure.report, testId: 'pp-recent-error', message: i18nT(RECENT_FAILED_KEYS[recentFailure.cause]) }
+      : null
+
+  // The recents Retry lives only here, on Browse. The Recent pane's nav hook owns Enter and
+  // Tab at document capture whenever its list is empty, which is exactly when the recents
+  // read has failed, so a control on that pane would be mouse-only; its copy already sends
+  // the user to Browse. The notice above names exactly one read, and this re-asks that one.
+  const noticeRetry = listFailure
+    ? (canRetryListing ? { busy: listingInFlight, run: retryListing } : null)
+    : recentFailure
+      ? { busy: retryingRecent, run: retryRecents }
       : null
 
   // Keyboard isolation for the popover, matching the boundary `Modal` carries on
@@ -987,7 +1020,7 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
             </div>
           )}
           {browseNotice && (
-            <div className="px-3 py-2 border-b border-border flex items-center gap-2" aria-busy={(canRetryListing && listingInFlight) || undefined}>
+            <div className="px-3 py-2 border-b border-border flex items-center gap-2" aria-busy={noticeRetry?.busy || undefined}>
               {/* No hand-off unless the mount opts in (`errorHandoff`): three
                   of the four callers float this popover over an unsaved draft —
                   FolderConfigModal's folder form (name, colour, tags,
@@ -1004,16 +1037,16 @@ export default function ProjectPicker({ open, onOpenChange, anchorRef, anchorRec
                 message={browseNotice.message}
                 testId={browseNotice.testId}
               />
-              {canRetryListing && (
+              {noticeRetry && (
                 // Inert-but-focusable while its re-ask is out, like WorkspacePicker's Retry:
                 // `aria-disabled` plus the in-handler guard, NOT `disabled`, which blurs it.
                 <button
                   type="button"
-                  onClick={retryListing}
-                  aria-disabled={listingInFlight || undefined}
+                  onClick={noticeRetry.run}
+                  aria-disabled={noticeRetry.busy || undefined}
                   className="px-2 py-1 text-[11px] bg-accent/20 text-accent rounded hover:bg-accent/30 shrink-0 aria-disabled:opacity-50"
                 >
-                  {listingInFlight ? i18nT('components.projectPicker.retrying') : i18nT('components.projectPicker.retry')}
+                  {noticeRetry.busy ? i18nT('components.projectPicker.retrying') : i18nT('components.projectPicker.retry')}
                 </button>
               )}
             </div>

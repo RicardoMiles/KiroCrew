@@ -270,7 +270,7 @@ def test_an_evicted_owner_is_counted_not_silently_dropped():
     assert value["owners_omitted"] == 2
 
 
-def test_eviction_ranks_on_fold_order_not_on_a_stamp():
+def test_eviction_ranks_on_fold_order_not_on_a_stamp(monkeypatch):
     """A planted unreadable ``time`` must not decide whose panel is evicted.
 
     ``_panel_iso`` answers the empty string for a ``time`` no ``datetime`` can hold,
@@ -290,21 +290,9 @@ def test_eviction_ranks_on_fold_order_not_on_a_stamp():
         _publish(crew_key=key, title=f"crew-{i}", data={"cycle": i})
 
     # The first crew publishes again, so it is newest by fold order.
-    _publish(crew_key=keys[0], title="republished", data={"cycle": 99})
-
-    # Damage ONLY that last entry, so the empty stamp is the one it keeps.
-    def _damage_last(lines: list[str]) -> list[str]:
-        last = max(
-            i
-            for i, raw in enumerate(lines)
-            if raw.strip() and json.loads(raw).get("type") == PANEL_ENTRY_TYPE
-        )
-        entry = json.loads(lines[last])
-        entry["time"] = 10**19
-        lines[last] = json.dumps(entry)
-        return lines
-
-    _rewrite_log(UNIT, _damage_last)
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "now_ms", lambda: 10**19)
+        _publish(crew_key=keys[0], title="republished", data={"cycle": 99})
 
     # One more owner than the cap allows, which forces exactly one eviction.
     _publish(crew_key=keys[PANEL_OWNER_LIMIT], title="newcomer", data={"cycle": 7})
@@ -811,7 +799,8 @@ def test_no_panel_prose_claims_the_count_identifies_the_evicted_crew():
     that field lives on the owner's own record, so telling a reader its history was
     trimmed is something the fold can keep.
     """
-    source = Path(crew_log.__file__).read_text(encoding="utf-8")
+    folds = sorted(Path(crew_log.__file__).parent.glob("projection*.py"))
+    source = "".join(path.read_text(encoding="utf-8") for path in folds)
 
     assert "exactly like a crew that never published on this slot" not in source
     # The correction is present, so this pin cannot pass by the prose being deleted.

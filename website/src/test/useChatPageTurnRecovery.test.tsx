@@ -14,6 +14,7 @@ import { describe, it, expect, afterEach, vi } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { Provider } from 'react-redux'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import { api } from '../api/client'
 import { useTurnRecovery } from '../pages/chat/page/turnRecovery'
@@ -36,7 +37,10 @@ function harness() {
     modelPickerReturnsFocusRef: { current: true },
     showRefusedPress: vi.fn(),
   }
-  const wrapper = ({ children }: { children: ReactNode }) => <Provider store={store}>{children}</Provider>
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={queryClient}><Provider store={store}>{children}</Provider></QueryClientProvider>
+  )
   const hook = renderHook((p: Opts) => useTurnRecovery(p), { initialProps: opts, wrapper })
   return { opts, hook }
 }
@@ -138,8 +142,8 @@ describe('fresh session on a context overflow', () => {
 
   it('withholds the composer Resume while the newest row is an overflow', () => {
     const { opts, hook } = harness()
-    expect(hook.result.current.contextOverflowed).toBe(false)
+    expect(hook.result.current.cardOwnsRecovery).toBe(false)
     hook.rerender({ ...opts, messages: overflowRows })
-    expect(hook.result.current.contextOverflowed).toBe(true)
+    expect(hook.result.current.cardOwnsRecovery).toBe(true)
   })
 })

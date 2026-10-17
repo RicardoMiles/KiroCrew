@@ -905,7 +905,7 @@ def spawn_run(name: str, args: dict[str, Any]) -> str | DeferredTool:
     errors: list[str] = []
     transport_errors: list[str] = []
     # Forward this session's own approval_mode (set as an env var at
-    # process spawn -- see gateway.py cron dispatch, mirroring
+    # process spawn -- see _cron_extra_env in slack/gateway_runtime/cron_fire.py, mirroring
     # KIROCREW_SESSION_KEY/KIROCREW_CHANNEL_ID) so a cron running with
     # approval_mode="auto" deterministically auto-approves its own
     # spawn_run subagent launches. Without this, SubagentManager.spawn's
@@ -1035,7 +1035,8 @@ def spawn_run(name: str, args: dict[str, Any]) -> str | DeferredTool:
         if d.get("status") == "queued":
             # Accepted but DEFERRED by the gate (memory floor, critical posture,
             # adaptive cap at 0): keyed and counted like a started member, but
-            # not running, and re-checked only every admit wait. Reported apart
+            # not running, and re-checked on the next eligible pump pass (after
+            # the admit wait, once a slot is free and startup is not full). Reported apart
             # below so the caller does not wait for a completion event as if
             # it had started. An older gateway sends no ``status``; a row
             # waiting merely for a slot or the stagger tick sends ``spawned``.

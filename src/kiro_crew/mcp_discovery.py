@@ -37,6 +37,7 @@ from kiro_crew.env import (
     denied_spec_env_keys,
     describe_search_path,
     emit_env,
+    expand_spec_args,
     mcp_search_path,
     resolved_command_casing,
     sanitize_spec_env,
@@ -2640,8 +2641,12 @@ async def probe_server(
 
                     await asyncio.to_thread(sweep_backend_tmp, probe_tmp)
                     probe_tmp = None
+        # Expanded the way the emitted agent spec is (see expand_spec_args), so
+        # a ``${HOME}/...`` launch path the session can start is not probed
+        # literally, failed and quarantined.
+        _spawn_args = expand_spec_args(server.args or [], server=server.name)
         wrapped_argv, env, sandbox_cleanup = await sandboxed_spawn_argv_async(
-            [resolved, *(server.args or [])],
+            [resolved, *_spawn_args],
             mode="standard",
             env=env,
             strip_python_env=True,
@@ -3537,11 +3542,14 @@ def discover_servers_to_sync() -> list[McpServerInfo]:
         if name not in agent_names:
             out.append(info)
         else:
-            # Args divergence is intentionally excluded because
-            # ``_SOURCE_OWNED_MCP_KEYS`` omits ``args``: it depends on
-            # ``command``, which the merge will not reconcile without a scope
-            # that declares one. Firing on an args-only difference would offer
-            # the operator a sync that reconciles nothing.
+            # Args divergence is intentionally excluded. The merge now adopts a
+            # source's ``args`` together with its ``env`` onto an entry running
+            # the same program (``mcp_sources._merge_command_unit``), but the
+            # emitted args are ``${VAR}``-expanded (``expand_spec_args``) while
+            # the source holds the raw form, so a raw comparison would re-offer
+            # a sync on every poll for a server whose args name a variable. An
+            # args-only edit lands on the next rebuild instead; the ``env``
+            # comparison below is the one the merge converges on.
             existing = agent_mcp[name]
             if not isinstance(existing, dict):
                 continue

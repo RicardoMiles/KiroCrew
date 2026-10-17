@@ -801,13 +801,13 @@ def test_vault_delete_during_held_lock_cannot_strand_plaintext(tmp_path: Path, m
         events.append("atomic_write")
         real_atomic(path, content, **kwargs)
 
-    import kiro_crew.atomic_write as _atomic_mod
+    import kiro_crew.hidden_leaf_staging as _staging_mod
     import kiro_crew.secrets.migrate as _migrate_mod
 
-    real_atomic = _atomic_mod.atomic_write
+    real_atomic = _staging_mod.publish_env
     monkeypatch.setattr(SecretVault, "hold_cross_process_lock", _tracking_hold)
     monkeypatch.setattr(SecretVault, "get", _tracking_get)
-    monkeypatch.setattr(_migrate_mod, "atomic_write", _tracking_atomic_write)
+    monkeypatch.setattr(_migrate_mod, "publish_env", _tracking_atomic_write)
 
     _migrate(config_dir, ep, dry_run=False)
 
@@ -871,7 +871,7 @@ def test_atomic_write_failure_rolls_back_vault_entries(tmp_path: Path, monkeypat
     def _boom(path, data, **kw):
         raise OSError("disk full")
 
-    monkeypatch.setattr("kiro_crew.secrets.migrate.atomic_write", _boom)
+    monkeypatch.setattr("kiro_crew.secrets.migrate.publish_env", _boom)
 
     with pytest.raises(OSError):
         _migrate(config_dir, ep, dry_run=False)
@@ -947,7 +947,7 @@ def test_rollback_does_not_delete_concurrently_overwritten_vault_entry(
     def _boom(path, data, **kw):
         raise OSError("disk full")
 
-    monkeypatch.setattr("kiro_crew.secrets.migrate.atomic_write", _boom)
+    monkeypatch.setattr("kiro_crew.secrets.migrate.publish_env", _boom)
 
     # Patch _compare_and_delete_sync to return False (simulating concurrent
     # overwrite detected: stored entry dict differs from expected_entry) and
@@ -1052,7 +1052,7 @@ def test_rollback_deletes_unchanged_vault_entry(
     def _boom(path, data, **kw):
         raise OSError("disk full")
 
-    monkeypatch.setattr("kiro_crew.secrets.migrate.atomic_write", _boom)
+    monkeypatch.setattr("kiro_crew.secrets.migrate.publish_env", _boom)
 
     with pytest.raises(OSError):
         _migrate(config_dir_path, ep, dry_run=False)
@@ -1084,7 +1084,7 @@ def test_rollback_no_deadlock_under_concurrent_flock(
     def _boom(path, data, **kw):
         raise OSError("disk full")
 
-    monkeypatch.setattr("kiro_crew.secrets.migrate.atomic_write", _boom)
+    monkeypatch.setattr("kiro_crew.secrets.migrate.publish_env", _boom)
 
     # Call the rollback path directly (no background worker): the fixed
     # _compare_and_delete_sync acquires the cross-process flock exactly once
@@ -1113,11 +1113,11 @@ def test_rollback_delete_failure_records_orphaned_key_and_propagates_error(
     ep = tmp_path / ".env"
     ep.write_text("JIRA_API_TOKEN=secret-val\n")
 
-    # Make atomic_write fail so the rollback path is exercised.
+    # Make the .env publish fail so the rollback path is exercised.
     def _boom(path, data, **kw):
         raise OSError("disk full")
 
-    monkeypatch.setattr("kiro_crew.secrets.migrate.atomic_write", _boom)
+    monkeypatch.setattr("kiro_crew.secrets.migrate.publish_env", _boom)
 
     # Make _compare_and_delete_sync raise to simulate ENOSPC / I/O error.
     def _raise_enospc(self, name, expected):

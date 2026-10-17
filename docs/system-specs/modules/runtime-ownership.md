@@ -86,8 +86,8 @@ On the **chat** registration path a lease means the same thing as registry
 membership, which is why it is taken there rather than at provider start:
 `session_allocation.SessionAllocationService._get_or_create_impl` calls
 `acquire_session_lease` immediately after the session enters `self._sessions`.
-Before that line no tenant exists, which is why every earlier cleanup path in that
-file may kill unconditionally.
+Before that line no tenant exists, which is why every earlier cleanup path in
+`session_allocation.py` and its `session_allocation_parts/` owners may kill unconditionally.
 
 That equivalence holds for chat and nowhere else, and the difference matters to
 anyone reading a lease count as a tenancy count. `acquire_session_lease` is reached
@@ -207,7 +207,7 @@ than blurred:
 |---|---|
 | `session_pid._sync_kill_provider` — the funnel the session layer's hard-kill sites reach | `test_kill_chokepoint_ratchet.py`'s `ATTRIBUTED_KILL_PATHS`: must call the gate, must pass `reason` and `caller`, must act on the verdict |
 | `acp.runtime.AcpRuntime.kill` | same |
-| `cron._sigkill_session` | convention |
+| `cron_service.service.run_kill._sigkill_session` (bound as `CronService._sigkill_session`; it passes `caller="cron._sigkill_session"`) | convention |
 | `session_cleanup._kill_authorized` | convention |
 | `session_scope_reap._stop_and_signal_members` | convention |
 | `subagent_manager.monitoring._reconcile_orphans_impl` | convention |

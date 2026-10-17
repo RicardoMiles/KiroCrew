@@ -549,7 +549,9 @@ def test_no_new_dependency_on_a_running_gateway() -> None:
     """The diagnosis is pure inspection of this process's own state: it must not
     reach the gateway, because it runs on the failure path of a tool that could
     not even identify its session."""
-    src = Path(mcp_core.__file__).read_text(encoding="utf-8")
+    src = (Path(mcp_core.__file__).parent / "mcp_core_parts" / "identity.py").read_text(
+        encoding="utf-8"
+    )
     body = src.split("def strict_identity_diagnosis(")[1].split("\ndef ")[0]
     for forbidden in ("_api_urlopen", "_get(", "_post(", "urlopen", "requests."):
         assert forbidden not in body, f"diagnosis must not call {forbidden}"

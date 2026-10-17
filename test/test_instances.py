@@ -31,6 +31,7 @@ from pathlib import Path
 import pytest
 
 from kiro_crew import platform_compat
+from kiro_crew.testing.wait import async_wait_until, await_until
 
 # ── config flag + constants ────────────────────────────────────────────────
 
@@ -2016,6 +2017,55 @@ class TestSshTunnelArgvCompression:
         reg.add(name="CD2", ssh_host="cd-2-alias", instance_id="cd-2")
         assert (await mgr_on.connect("cd-2")).state == TunnelState.CONNECTED
         assert captured["compression"] is True
+
+
+class TestTunnelStatusCarriesTheDialIdentity:
+    """The status surfaces the identity the tunnel was ACTUALLY dialled with.
+
+    A credential path binds to this (not to the agent-writable registry row), so
+    the fields have to name the node and account the open port reaches and must
+    not change for the life of the tunnel.
+    """
+
+    def test_an_ssm_tunnel_surfaces_its_node_and_account(self):
+        from kiro_crew.instances.ssh_tunnel_manager import _SshTunnel
+
+        tun = _SshTunnel(
+            "ssm-1",
+            "",
+            53410,
+            7879,
+            transport="ssm",
+            ssm_target="mi-0a1b2c3d4e5f67890",
+            aws_profile="prof",
+            aws_region="us-east-1",
+        )
+        d = tun.status.to_dict()
+        assert d["transport"] == "ssm"
+        assert d["ssm_target"] == "mi-0a1b2c3d4e5f67890"
+        assert d["aws_profile"] == "prof"
+        assert d["aws_region"] == "us-east-1"
+
+    def test_an_ssh_tunnel_carries_no_ssm_coordinates(self):
+        from kiro_crew.instances.ssh_tunnel_manager import _SshTunnel
+
+        # Even if an SSH forward is handed SSM-shaped values, the status reports
+        # none, so a record requiring an SSM node can never match an SSH tunnel.
+        tun = _SshTunnel(
+            "ssh-1",
+            "host.example",
+            53411,
+            7879,
+            transport="ssh",
+            ssm_target="mi-should-be-ignored",
+            aws_profile="prof",
+            aws_region="us-east-1",
+        )
+        d = tun.status.to_dict()
+        assert d["transport"] == "ssh"
+        assert d["ssm_target"] == ""
+        assert d["aws_profile"] == ""
+        assert d["aws_region"] == ""
 
 
 class TestSshTunnelWindowsRefusal:
@@ -4904,6 +4954,34 @@ class TestTokenMintGeneric:
         assert proc.communicate_calls == 2
         assert proc.wait_calls == 0
 
+    @pytest.mark.parametrize("budget, names_setting", [(30.0, True), (120.0, False)])
+    def test_mint_timeout_names_the_mint_budget_setting(self, monkeypatch, budget, names_setting):
+        """An SSH mint timeout names ``instances.mint_timeout_secs`` as the next step.
+
+        At the ceiling the setting cannot go higher, so the message points at the
+        host's reachability instead of telling the user to raise it.
+        """
+        from kiro_crew.instances import token_mint as tm
+
+        proc = self._HangProc()
+
+        async def fake_exec(*a, **k):
+            return proc
+
+        async def _tree(pid, sig):
+            return True
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(platform_compat, "kill_process_tree_async", _tree)
+        with pytest.raises(tm.TokenMintError) as excinfo:
+            asyncio.run(tm.mint_remote_token("cd-1", ttl="20h", timeout_secs=budget))
+        msg = str(excinfo.value)
+        assert msg.startswith(f"timed out minting token on cd-1 after {budget}s")
+        assert "jump host or proxy" in msg
+        assert ("instances.mint_timeout_secs" in msg) is names_setting
+        assert ("applies to SSH and SSM mints alike" in msg) is names_setting
+        assert ("already at its maximum" in msg) is not names_setting
+
     def test_run_remote_kirocrew_timeout_reaps_child_via_communicate_not_wait(self, monkeypatch):
         from kiro_crew.instances import token_mint as tm
 
@@ -5162,7 +5240,7 @@ class TestTunnelStatus:
         t.status.local_port = 7778
 
         task = aio.create_task(t.stop())
-        await aio.wait_for(entered.wait(), timeout=5)
+        await await_until(entered, what="the teardown entering")
 
         # Mid-teardown, with the port not yet released and the caller still holding a
         # reference to this object.
@@ -5173,7 +5251,7 @@ class TestTunnelStatus:
         assert t.status.state is TunnelState.STOPPED
 
         release.set()
-        await aio.wait_for(task, timeout=5)
+        await await_until(task, what="stop() finishing")
         assert t.status.state is TunnelState.STOPPED
 
     @pytest.mark.asyncio
@@ -5317,7 +5395,9 @@ class TestSelfHealRefreshRestart:
 
             stm._PROBE_INTERVAL = 0.01
             try:
-                await _aio.wait_for(t._probe_loop(), timeout=2)
+                await await_until(
+                    _aio.ensure_future(t._probe_loop()), what="the probe loop exiting"
+                )
             finally:
                 stm._PROBE_INTERVAL = stm_interval
 
@@ -5345,11 +5425,11 @@ class TestSelfHealRefreshRestart:
 
         async def main():
             task = asyncio.create_task(mgr._recover("cd-1"))
-            await asyncio.wait_for(started.wait(), timeout=2)
+            await await_until(started, what="the slow rebuild starting")
             # Slow rebuild is in flight — the manager lock must NOT be held (the fix).
             assert not mgr._lock.locked()
             release.set()
-            await asyncio.wait_for(task, timeout=2)
+            await await_until(task, what="_recover finishing")
             assert mgr.status("cd-1").state == TunnelState.CONNECTED
             # The rebuild only re-binds locally, so the counter stands at the
             # value this recovery raised it to (1), not reset by the rebuild.
@@ -5693,7 +5773,7 @@ class TestSelfHealRefreshRestart:
         # A refresh begins against the CURRENT tunnel and blocks inside its mint.
         arm.set()
         refresh = asyncio.create_task(mgr._refresh_token_once("cd-1"))
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await await_until(started, what="the rebuild starting")
         # Meanwhile the tunnel is replaced (an edit + reconnect, or a self-heal).
         await mgr.disconnect("cd-1")
         await mgr.connect("cd-1")
@@ -5762,7 +5842,7 @@ class TestSelfHealRefreshRestart:
         fail_next["n"] = 1
         arm.set()
         recovery = asyncio.create_task(mgr._recover("cd-1"))
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await await_until(started, what="the rebuild starting")
 
         # The ordinary operator reaction: reconnect. connect() replaces the
         # (ERROR) tunnel left by the failed tier-1 rebuild and bumps the epoch.
@@ -5775,7 +5855,7 @@ class TestSelfHealRefreshRestart:
         good_epoch = mgr._tunnel_epoch["cd-1"]
 
         release.set()
-        await asyncio.wait_for(recovery, timeout=5)
+        await await_until(recovery, what="the recovery task finishing")
         # The stale mint was refused whole: token, mint bookkeeping, the live
         # tunnel (no stale rebuild) and the refresh schedule are all untouched.
         assert mgr._tokens["cd-1"] == good != "TOK-STALE"
@@ -5877,14 +5957,14 @@ class TestSelfHealRefreshRestart:
         mgr._tunnels["cd-1"].status.state = TunnelState.ERROR
         arm.set()
         recovery = asyncio.create_task(mgr._recover("cd-1"))
-        await asyncio.wait_for(parked.wait(), timeout=5)
+        await await_until(parked, what="the rebuild parking")
 
         # The user turns the instance off while the rebuild is parked.
         assert await mgr.disconnect("cd-1") is True
         assert reg.get("cd-1").was_connected is False
 
         release.set()
-        await asyncio.wait_for(recovery, timeout=5)
+        await await_until(recovery, what="the recovery task finishing")
 
         # The recovery stood down: nothing tracked, nothing recorded.
         assert "cd-1" not in mgr._tunnels
@@ -5922,7 +6002,7 @@ class TestSelfHealRefreshRestart:
         mgr._tunnels["cd-1"].status.state = TunnelState.ERROR
         arm.set()
         recovery = asyncio.create_task(mgr._recover("cd-1"))
-        await asyncio.wait_for(parked.wait(), timeout=5)
+        await await_until(parked, what="the rebuild parking")
 
         # The user reconnects while the rebuild is parked.
         await mgr.connect("cd-1")
@@ -5931,7 +6011,7 @@ class TestSelfHealRefreshRestart:
         fresh_epoch = mgr._tunnel_epoch["cd-1"]
 
         release.set()
-        await asyncio.wait_for(recovery, timeout=5)
+        await await_until(recovery, what="the recovery task finishing")
 
         # connect's live tunnel was not overwritten, orphaned, or dropped.
         assert mgr._tunnels["cd-1"] is fresh_tunnel
@@ -5972,14 +6052,14 @@ class TestSelfHealRefreshRestart:
         mgr._tunnels["cd-1"].status.state = TunnelState.ERROR
         arm.set()
         recovery = asyncio.create_task(mgr._recover("cd-1"))
-        await asyncio.wait_for(parked.wait(), timeout=5)
+        await await_until(parked, what="the rebuild parking")
         rebuilt = mgr._tunnels["cd-1"]
 
         # The user turns the instance off while the start is parked.
         assert await mgr.disconnect("cd-1") is True
 
         release.set()
-        await asyncio.wait_for(recovery, timeout=5)
+        await await_until(recovery, what="the recovery task finishing")
 
         # The rebuild reaped its own tunnel: nothing tracked, nothing running,
         # and the disconnect's record stands.
@@ -6029,13 +6109,15 @@ class TestSelfHealRefreshRestart:
         arm.set()
         recovery = asyncio.create_task(mgr._recover("cd-1"))
         mgr._track_recovery("cd-1", recovery)
-        await asyncio.wait_for(parked.wait(), timeout=5)
+        await await_until(parked, what="the rebuild parking")
 
         await mgr.shutdown()
         release.set()
         # The recovery survived its cancellation (swallowed in stop()) but its
         # expected epoch is stale: the gated install refuses.
-        await asyncio.wait_for(asyncio.gather(recovery, return_exceptions=True), timeout=5)
+        await await_until(
+            asyncio.gather(recovery, return_exceptions=True), what="the recovery settling"
+        )
 
         assert "cd-1" not in mgr._tunnels
 
@@ -6058,11 +6140,17 @@ class TestSelfHealRefreshRestart:
         arm.set()
         recovery = asyncio.create_task(mgr._recover("cd-1"))
         mgr._track_recovery("cd-1", recovery)  # as _on_tunnel_exit would
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await await_until(started, what="the rebuild starting")
 
-        assert await asyncio.wait_for(mgr.disconnect("cd-1"), timeout=5) is True
+        assert (
+            await await_until(
+                asyncio.ensure_future(mgr.disconnect("cd-1")),
+                what="the disconnect finishing",
+            )
+            is True
+        )
         release.set()
-        await asyncio.wait_for(recovery, timeout=5)
+        await await_until(recovery, what="the recovery task finishing")
 
         assert "cd-1" not in mgr._tokens
         assert "cd-1" not in mgr._tunnels
@@ -6206,7 +6294,7 @@ class TestSelfHealRefreshRestart:
                 return False
 
             t._forward_alive = _unreachable
-            await asyncio.wait_for(t._probe_loop(), timeout=2)
+            await await_until(asyncio.ensure_future(t._probe_loop()), what="the probe loop exiting")
             await asyncio.sleep(0.05)
             assert t._probe_failed is True
             assert "health probe failed" in t._exit_error(-15)
@@ -6964,7 +7052,18 @@ class TestStartupRevive:
         startup_handler = list(app.on_startup)[-1]
 
         # Must return promptly even though revive never completes.
-        await asyncio.wait_for(startup_handler(app), timeout=2.0)
+        # `_instances_startup` has no await points by design -- it schedules the
+        # revive as a tracked background task and returns. Drive it one step with no
+        # loop turn: a coroutine that completes raises StopIteration, so the
+        # background task gets no turn (the `armed == []` ordering below needs that).
+        # A regression that awaits the sequencer inline instead yields a value here
+        # and fails by name at once rather than hanging the xdist worker (D8).
+        startup_coro = startup_handler(app)
+        try:
+            with pytest.raises(StopIteration):
+                startup_coro.send(None)
+        finally:
+            startup_coro.close()
 
         # NOT on the boot path. `on_startup` runs inside `runner.setup()`, before the
         # HTTP port is bound, and re-taking the holds costs a registry read plus one
@@ -6974,7 +7073,7 @@ class TestStartupRevive:
 
         # Revive was scheduled as a tracked background task, not awaited.
         assert len(state._background_tasks) == 1
-        await asyncio.wait_for(started.wait(), timeout=2.0)  # it did start in the bg
+        await await_until(started, what="the background revive starting")  # it did start in the bg
 
         # ...but it ran BEFORE the revive, which is the ordering that matters: revive
         # reconnects instances that allocate ports, and a lease whose hold is not yet
@@ -6984,7 +7083,7 @@ class TestStartupRevive:
         # Cleanup: release the hung revive and drain the task.
         release.set()
         for t in list(state._background_tasks):
-            await asyncio.wait_for(t, timeout=2.0)
+            await await_until(t, what="the background task finishing")
 
 
 # ── SSM connection method ──────────────────────────────────────────────────
@@ -8256,6 +8355,31 @@ class TestSsmMintOutputRedaction:
             text
         ), f"{vector_name}: SSM tail is weaker than the SSH tail it mirrors"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("budget, names_setting", [(90.0, True), (120.0, False)])
+    async def test_ssm_mint_timeout_names_the_mint_budget_setting(
+        self, monkeypatch, budget, names_setting
+    ):
+        """An SSM mint timeout names ``instances.mint_timeout_secs`` and the SSM agent.
+
+        At the ceiling the setting cannot go higher, so the message points at the
+        target's reachability instead of telling the user to raise it.
+        """
+        from kiro_crew.instances import ssm_token_mint as sm
+
+        async def _times_out(*a, **k):
+            raise asyncio.TimeoutError
+
+        monkeypatch.setattr(sm, "_send_over_ssm", _times_out)
+        with pytest.raises(sm.TokenMintError) as excinfo:
+            await sm.mint_remote_token_ssm("i-0123456789abcdef0", ttl="20h", timeout_secs=budget)
+        msg = str(excinfo.value)
+        assert msg.startswith("timed out minting token on i-0123456789abcdef0 over SSM")
+        assert f"polling budget {budget}s" in msg
+        assert "SSM agent is online" in msg
+        assert ("instances.mint_timeout_secs" in msg) is names_setting
+        assert ("already at its maximum" in msg) is not names_setting
+
 
 class TestSsmDiagnostics:
     """The SSM diagnosis ladder reports the first broken link, SSM-worded."""
@@ -8898,9 +9022,11 @@ class TestOrphanForwarderReclaim:
             # (a) the old forwarder process is not alive…
             assert proc.wait(timeout=10) is not None
             # …and its port is released.
-            deadline = time.monotonic() + 5.0
-            while not _is_port_free(port) and time.monotonic() < deadline:
-                time.sleep(0.05)
+            await async_wait_until(
+                lambda: _is_port_free(port),
+                off_loop=True,
+                describe=lambda: f"port {port} is still bound",
+            )
             assert _is_port_free(port), "reclaimed forwarder's port was not released"
             # The connect succeeds regardless of which loopback port it lands on.
             # It asserts only that a valid port was recorded, not a DIFFERENT one:
@@ -9629,10 +9755,13 @@ class TestOrphanForwarderReclaim:
         self, tmp_path, monkeypatch, orphan_test, mismatch
     ):
         """With the orphan gate OPEN on either platform's test, a forged MAC, a
-        start-time mismatch or a foreign argv still signals nothing."""
+        start-time mismatch or a foreign argv still signals nothing.
+
+        Reclaim needs the recorded listener, not a replacement tunnel: allocating
+        a replacement adds a probe-to-bind race unrelated to identity refusal.
+        """
         import kiro_crew.instances.ssh_tunnel_manager as stm
         from kiro_crew import platform_compat as pc
-        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
 
         proc, port, argv = self._spawn_port_holder()
         try:
@@ -9653,9 +9782,10 @@ class TestOrphanForwarderReclaim:
             reg, mgr = self._mgr(tmp_path)
             self._record(reg, port=port, pid=proc.pid, start=recorded, sig=sig)
 
-            st = await mgr.connect("cd-1")
+            params = stm._TransportParams(method="ssh", ssh_host="cd-1-alias")
+            async with mgr._lock:
+                await mgr._reclaim_orphan_forwarder(reg.get("cd-1"), params)
 
-            assert st.state == TunnelState.CONNECTED
             assert proc.poll() is None, f"a {mismatch}-mismatched forwarder was signalled"
         finally:
             self._cleanup(proc)

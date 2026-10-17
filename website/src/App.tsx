@@ -3,13 +3,13 @@ import { createPortal } from 'react-dom'
 import { isLookPreviewFrame } from './utils/lookPreview'
 import { Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
-import { useAppSelector, useAppDispatch } from './store'
+import { useAppSelector, useAppDispatch, useAppStore } from './store'
 import { fetchSlots, sseStatus, setUpdateProgress, setEnabledAppIds } from './store/dashboardSlice'
 // Side-effect: registers every built-in surface in the registry, ahead of every
 // module below that reads it (`shell/nav/navItems.ts` computes `NAV_ITEMS`).
 import './surfaces/builtins'
 import { getBuiltinSurface, selectSurfaceBadgeCount, selectSurfaceActivityCount, selectAllSurfacesAttention, surfaceLabel } from './surfaces/registry'
-import { setAgentSwitchNotice, switchSlot, selectActiveSlotProject } from './store/chatSlice'
+import { setAgentSwitchNotice, switchSlot, selectActiveSlotProject, stageToMainComposer } from './store/chatSlice'
 import { setNavIntentHandler as setArtifactNavIntentHandler } from './utils/artifactPopout'
 import { applyNavIntentInMain, chatDeepLinkSlot } from './utils/navIntent'
 import { installSoftNavigate } from './utils/errorReport'
@@ -68,6 +68,7 @@ import { useTopbarCollapse } from './lib/useTopbarCollapse'
 import { setNativeBadgeCount, subscribeNativeNavigate, useMacFullscreen } from './shell/platform/electronBridge'
 import { DndContext, closestCenter, DragOverlay } from '@dnd-kit/core'
 import { SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable'
+import { SELECTION_INERT_ATTR } from './pages/chat/useSelectionInertOverlays'
 import ChatPage from './pages/ChatPage'
 import PopoutFrame from './pages/PopoutFrame'
 import ArtifactPopoutFrame from './pages/ArtifactPopoutFrame'
@@ -383,7 +384,7 @@ export function UpdateOverlay({ onCancel }: { onCancel: () => void }) {
         ) : isStuck ? (
           <div className="flex flex-col gap-3 items-center">
             <div className="text-sm text-warn">{i18nT('app.this_step_seems_to_be_taking_longer_than_expecte')}</div>
-            <button className="px-4 py-1.5 rounded-lg text-[13px] font-medium cursor-pointer bg-danger/10 border border-danger/30 text-danger hover:bg-danger/20 transition-colors" onClick={handleCancel}>
+            <button className="px-4 py-1.5 rounded-lg text-[13px] font-medium cursor-pointer bg-danger/10 border border-danger/30 text-danger-text hover:bg-danger/20 transition-colors" onClick={handleCancel}>
               {i18nT('app.cancel_update')}
             </button>
           </div>
@@ -670,7 +671,11 @@ export const NavItem = forwardRef(function NavItem({ path, label, icon, active, 
       // the glyph span), which on the phone rail's flat 40x40 tiles measured
       // 3.4:1 against a light surface. The tile keeps the muted colour at full
       // opacity instead (>= 4.5:1); active tiles are unchanged.
-      className={`nav-item group/nav relative flex items-center min-w-0 cursor-pointer text-sm font-medium whitespace-nowrap gap-2.5 transition-colors duration-200 ${touch ? 'w-16 h-14 px-0.5 flex-col justify-center gap-0.5 rounded-xl shrink-0 [&_.app-icon-nav]:w-5 [&_.app-icon-nav]:h-5 [&_.app-icon-nav>svg]:w-5 [&_.app-icon-nav>svg]:h-5 [&_.app-icon-nav]:opacity-100' : 'rounded-md py-2 pl-3 pr-3'} ${collapsed ? '' : 'overflow-hidden'} ${active ? 'nav-active text-text-strong bg-accent-subtle hover:brightness-110' : 'text-muted hover:text-text hover:bg-bg-hover/60'}`}
+      // The glyph is sized through `>*` with `!`, not `>svg`: the brand marks
+      // (Crewmates, Customize) and an app's own icon (Task Runner) are spans
+      // with an inline 16px `width`/`height` that a plain class cannot beat,
+      // which would leave them smaller than the 20px Lucide tiles beside them.
+      className={`nav-item group/nav relative flex items-center min-w-0 cursor-pointer text-sm font-medium whitespace-nowrap gap-2.5 transition-colors duration-200 ${touch ? 'w-16 h-14 px-0.5 flex-col justify-center gap-0.5 rounded-xl shrink-0 [&_.app-icon-nav]:w-5 [&_.app-icon-nav]:h-5 [&_.app-icon-nav>*]:!w-5 [&_.app-icon-nav>*]:!h-5 [&_.app-icon-nav]:opacity-100' : 'rounded-md py-2 pl-3 pr-3'} ${collapsed ? '' : 'overflow-hidden'} ${active ? 'nav-active text-text-strong bg-accent-subtle hover:brightness-110' : 'text-muted hover:text-text hover:bg-bg-hover/60'}`}
       onClick={activate}
       onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); activate() } }}
       {...tipPointerProps}
@@ -911,22 +916,40 @@ export default function App() {
   const activeSlotProject = useAppSelector(selectActiveSlotProject)
   const terminalPosition = useTerminalPosition()
   const navigate = useNavigate()
-  const mayLeaveForErrorHandoff = useMayLeaveForNavigation()
+  const mayLeaveForNavigation = useMayLeaveForNavigation()
+  const appStore = useAppStore()
+  const pathnameRef = useRef(location.pathname)
+  pathnameRef.current = location.pathname
 
   // Main-dashboard role for the artifact popout nav-intent handshake: perform
   // navigation intents forwarded from popout windows (activity-timeline
   // session links, "Ask agent to address", …). Popout and embed windows never
   // register — only handler-registered windows answer nav-requests, which is
   // what keeps a second popout from claiming another popout's navigation.
+  // A forwarded intent replaces the page on screen HERE, so that page's leave
+  // check runs first — the popout cannot see this window's unsaved work.
+  //
+  // A hand-off to the session /chat already shows is staged on
+  // `mainComposerAppend`, whose consumers (ChatPage, or the split-view grid
+  // pane for that slot) merge it into the live draft. Read through the store at
+  // call time so the handler is not re-registered on every slot switch.
   useEffect(() => {
     if (isPopout || isEmbed) return
     return setArtifactNavIntentHandler((intent) =>
       applyNavIntentInMain(intent, {
         navigate,
         switchSlot: (slotKey) => { dispatch(switchSlot({ key: slotKey, announceOnMissing: true })) },
+        mayLeave: mayLeaveForNavigation,
+        appendToOpenComposer: (slotKey, text) => {
+          const path = pathnameRef.current
+          const onChat = path === '/chat' || path.startsWith('/chat/')
+          if (!onChat || appStore.getState().chat.activeSlot !== slotKey) return false
+          dispatch(stageToMainComposer({ slot: slotKey, text }))
+          return true
+        },
       }),
     )
-  }, [isPopout, isEmbed, navigate, dispatch])
+  }, [isPopout, isEmbed, navigate, dispatch, mayLeaveForNavigation, appStore])
 
   // Publish the router navigator and the current page's leave answer for the
   // error → agent hand-off. AskAgentButton is deliberately hook-free (its
@@ -941,9 +964,9 @@ export default function App() {
   // banners of its own). They fall through to the hard-nav path instead.
   useEffect(() => {
     if (isPopout || isEmbed) return
-    installSoftNavigate(navigate, mayLeaveForErrorHandoff)
+    installSoftNavigate(navigate, mayLeaveForNavigation)
     return () => installSoftNavigate(null)
-  }, [isPopout, isEmbed, navigate, mayLeaveForErrorHandoff])
+  }, [isPopout, isEmbed, navigate, mayLeaveForNavigation])
 
   const {
     colorTheme,
@@ -1357,13 +1380,20 @@ export default function App() {
           // NavIntent carries no query string, and ChatPage writes `?sid=` back
           // into the URL itself once the session is active.
           { path: '/chat', slotKey },
-          { navigate, switchSlot: (key) => { dispatch(switchSlot({ key, announceOnMissing: true })) } },
+          {
+            navigate,
+            switchSlot: (key) => { dispatch(switchSlot({ key, announceOnMissing: true })) },
+            mayLeave: mayLeaveForNavigation,
+          },
         )
         return
       }
+      // Same leave check as every other in-app exit: a native menu entry
+      // replaces the page on screen just like a sidebar click does.
+      if (!mayLeaveForNavigation()) return
       navigate(path)
     })
-  }, [navigate, dispatch])
+  }, [navigate, dispatch, mayLeaveForNavigation])
 
   useEffect(() => {
     dispatch(fetchSlots()).then(action => {
@@ -1615,7 +1645,7 @@ export default function App() {
               // leave guard first, as every rail row does, so a draft held
               // there (a Profile schedule form) is not dropped silently.
               onClick={() => {
-                if (!isChat) { if (mayLeaveForErrorHandoff()) navigate('/chat', { replace: true }); return }
+                if (!isChat) { if (mayLeaveForNavigation()) navigate('/chat', { replace: true }); return }
                 onActivate()
                 if (!(activePath === '/chat' || activePath === '/')) navigate('/chat', { replace: true })
               }}
@@ -1837,7 +1867,7 @@ export default function App() {
         style={{ zIndex: OVERLAY_Z_MAX }}
       />
 
-      {/* Full-height activity bar slot: ChatPage portals its
+      {/* Full-height activity bar slot: ChatSidePanels portals its
           Activity panel here on desktop so it spans the window top-to-bottom
           instead of sitting below the header row. Empty (0 width) when the
           panel is closed or on non-chat routes. */}
@@ -1896,6 +1926,10 @@ export default function App() {
         // (useTopbarCollapse above). Desktop only, on purpose: below 768px the
         // phone header's icon-only search and container rungs already fit.
         className={`topbar topbar-glass relative pl-2 pr-3${mobileSingle ? ' topbar-single' : ''}${isMobile ? '' : ' tb-measured'}`}
+        // On a phone the chat title is portaled into this bar, above the
+        // transcript: inert while a transcript selection is held, so a dragged
+        // handle cannot land on the title (useSelectionInertOverlays).
+        {...{ [SELECTION_INERT_ATTR]: '' }}
         // Both z-indexes come from lib/themeDecorLayer.ts, which derives the
         // theme-overlay ceiling from them — the header must outrank pack
         // decoration in both layouts (#7377), and a literal here could drift.
@@ -2356,7 +2390,7 @@ export default function App() {
             // `pointer-events-none`: the strip hangs over the top 24px of
             // whatever <main> paints; a readout must not swallow the taps and
             // scroll starts that land there while the socket is down.
-            className="absolute left-0 right-0 top-full z-[1] pointer-events-none flex items-center justify-center gap-1.5 h-6 text-[12px] font-medium text-danger bg-danger-subtle border-b border-danger/30"
+            className="absolute left-0 right-0 top-full z-[1] pointer-events-none flex items-center justify-center gap-1.5 h-6 text-[12px] font-medium text-danger-text bg-danger-subtle border-b border-danger/30"
           >
             <span aria-hidden="true" className="w-1.5 h-1.5 rounded-full bg-danger animate-pulse [animation-iteration-count:3]! motion-reduce:animate-none" />
             {i18nT('app.gateway_offline_reconnecting')}

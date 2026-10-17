@@ -6,8 +6,10 @@ import { PanelSectionHeader } from './ui'
 import CrewAvatar from './CrewAvatar'
 import { crewDisplayName } from './AgentSelector'
 import { Star, Check, Users } from 'lucide-react'
+import { isCrewmateChat, rowMemoryTag, type MemorySource } from '../lib/agentMemorySource'
 
 import { i18nT } from '../i18n/t'
+import { withMemorySource } from '../utils/agentLabel'
 
 export type AgentItemKind = 'member' | 'template'
 
@@ -26,6 +28,9 @@ export interface AgentItem {
   /** A member row's label, when its owner set one; the row shows it in place
    *  of the name. */
   display_name?: string
+  /** A member row's store id, read only for whether it is the shared default
+   *  (see `rowMemoryTag`); never rendered. */
+  memory_store?: string
 }
 
 /** Row identity for React keys and the active match: JSON so no separator a
@@ -33,10 +38,13 @@ export interface AgentItem {
 const itemKey = (a: AgentItem) => JSON.stringify([a.selection_kind ?? '', a.name])
 
 // ── Single agent row ──
-function AgentButton({ a, active, isDefault, showSource, activeRef, onSelect, filter }: {
+function AgentButton({ a, active, isDefault, memoryTag, showSource, activeRef, onSelect, filter }: {
   a: AgentItem
   active: boolean
   isDefault: boolean
+  /** Set only when the list holds a crewmate AND a custom agent of this name:
+   *  the row's second line then says which memory the pick runs on. */
+  memoryTag: MemorySource | null
   /** The flat (name-only) list tells rows apart by origin; the grouped list
    *  already says what a row IS in its header, so the badge is noise there. */
   showSource: boolean
@@ -76,7 +84,7 @@ function AgentButton({ a, active, isDefault, showSource, activeRef, onSelect, fi
           {highlight(label)}
         </span>
         {isDefault ? (
-          <span className="shrink-0 inline-flex items-center gap-1 px-1.5 py-[1px] rounded-full text-[11px] font-semibold bg-warn-subtle text-warn" title={i18nT('components.agentDropdownList.new_sessions_start_with_this_agent')}>
+          <span className="shrink-0 inline-flex items-center gap-1 px-1.5 py-[1px] rounded-full text-[11px] font-semibold bg-warn-subtle text-warn-text" title={i18nT('components.agentDropdownList.new_sessions_start_with_this_agent')}>
             <Star className="lucide-inline" />{i18nT('components.agentDropdownList.default')}
           </span>
         ) : showSource ? (
@@ -88,6 +96,15 @@ function AgentButton({ a, active, isDefault, showSource, activeRef, onSelect, fi
           </span>
         )}
       </div>
+      {memoryTag && (
+        // The row's second line, ahead of the author's description: the two rows
+        // of a same-name pair read the same name, and this is what they differ in.
+        <span data-testid="agent-row-memory-tag" className="text-[11px] font-medium text-muted leading-tight">
+          {memoryTag === 'own'
+            ? i18nT('components.agentDropdownList.own_memory')
+            : i18nT('components.agentDropdownList.shared_memory')}
+        </span>
+      )}
       {a.description && (
         <span className="text-[12px] text-muted leading-tight line-clamp-2" title={a.description}>
           {a.description}
@@ -97,23 +114,9 @@ function AgentButton({ a, active, isDefault, showSource, activeRef, onSelect, fi
   )
 }
 
-/**
- * Whether a chat is a CREWMATE's, for the picker's "default for new sessions"
- * row and the kind it writes. A slot stamped `member` is one. A slot with no
- * kind (saved before kinds existed, or created through the API without one)
- * is one when the name-folded roster lists its agent as a crewmate -- the row
- * must not offer to make a crewmate the default custom agent, and a kind-less
- * write of that name would land on whichever default the server resolves.
- */
-export function isCrewmateChat(
-  slotKind: string | undefined,
-  agentName: string,
-  agents: readonly { name: string; selection_kind?: string }[],
-): boolean {
-  if (slotKind === 'member') return true
-  if (slotKind === 'template') return false
-  return agents.some(a => a.name === agentName && a.selection_kind === 'member')
-}
+// `isCrewmateChat` lives with the other kind rules in `lib/agentMemorySource`;
+// re-exported here so its existing importers keep this path.
+export { isCrewmateChat }
 
 /**
  * The namespace the ★ row writes in: `template` only when the slot says so.
@@ -137,11 +140,15 @@ export function defaultWriteKind(slotKind: string | undefined): 'template' | und
  * accident, and there is nothing to undo here. Clearing lives on the Agent Templates
  * page, where the control is labelled and the outcome is visible in a summary card.
  */
-export function DefaultAgentRow({ agentName, isDefault, onSetDefault }: {
+export function DefaultAgentRow({ agentName, isDefault, onSetDefault, memoryTag = null }: {
   agentName: string
   isDefault: boolean
   onSetDefault: () => void
+  /** Set when a crewmate and a custom agent share `agentName` (#19472): the
+   *  label then says which one it names, matching the row the badge marks. */
+  memoryTag?: MemorySource | null
 }) {
+  const shownName = withMemorySource(agentName, memoryTag)
   // Wraps rather than truncates. The label's whole job is to name WHICH agent the
   // write targets, and that identifier sits mid-string — an ellipsis eats exactly
   // the part that carries the meaning. The pop-up caps at 340px and agent names
@@ -159,7 +166,7 @@ export function DefaultAgentRow({ agentName, isDefault, onSetDefault }: {
         <span className={labelCls}>
           <Trans
             i18nKey="components.agentDropdownList.agent_is_the_default_for_new_sessions"
-            components={{ agent: <span className="font-mono">{agentName}</span> }}
+            components={{ agent: <span className="font-mono">{shownName}</span> }}
           />
         </span>
         <Check size={13} className="text-accent" aria-hidden="true" />
@@ -183,7 +190,7 @@ export function DefaultAgentRow({ agentName, isDefault, onSetDefault }: {
       <span className={labelCls}>
         <Trans
           i18nKey="components.agentDropdownList.set_default_agent"
-          components={{ agent: <span className="font-mono">{agentName}</span> }}
+          components={{ agent: <span className="font-mono">{shownName}</span> }}
         />
       </span>
       <Star size={13} />
@@ -305,12 +312,12 @@ export default function AgentDropdownList({ agents, activeAgent, activeKind, def
   const row = (a: AgentItem) => (
     // The badge marks the default for NEW SESSIONS: the template a session
     // created without a crewmate runs. A crewmate row is never that default.
-    <AgentButton key={itemKey(a)} a={a} active={isActive(a)} isDefault={a.name === defaultAgent && (a.selection_kind ?? 'template') === 'template'} showSource={!grouped} activeRef={activeRef} onSelect={onSelect} filter={filter} />
+    <AgentButton key={itemKey(a)} a={a} active={isActive(a)} isDefault={a.name === defaultAgent && (a.selection_kind ?? 'template') === 'template'} memoryTag={rowMemoryTag(a, agents)} showSource={!grouped} activeRef={activeRef} onSelect={onSelect} filter={filter} />
   )
 
   return (
     // Plain flex column: scrolling is owned by the host's listbox wrapper
-    // (ChatPage / ChatPane render this inside `overflow-y-auto max-h-[280px]`).
+    // (ComposerDockView / ChatPane render this inside `overflow-y-auto max-h-[280px]`).
     // A second overflow container here nests two scrollbars (#6375), and
     // `scrollIntoView` on the active row scrolls the nearest scrollable
     // ancestor, so the host-owned scroller keeps that behavior intact.
@@ -319,7 +326,9 @@ export default function AgentDropdownList({ agents, activeAgent, activeKind, def
     <div role="presentation" className="flex flex-col">
       {!grouped
         ? agents.map(row)
-        : (['member', 'template'] as const).map(kind => {
+        // Templates lead: a session created without a crewmate runs the default
+        // template, so the group that holds the way back is the one read first.
+        : (['template', 'member'] as const).map(kind => {
           const rows = agents.filter(a => (a.selection_kind ?? 'member') === kind)
           if (!rows.length) return null
           const label = kind === 'member'
@@ -331,11 +340,10 @@ export default function AgentDropdownList({ agents, activeAgent, activeKind, def
                 <PanelSectionHeader label={label} count={rows.length} className="px-2.5 pt-2 pb-1" />
               )}
               {showGroupChrome && kind === 'template' && (
-                // What a template pick IS, said where the pick happens: it runs the
-                // shared template in the default workspace with shared memory and
-                // enrols nothing.
+                // What a template IS, said where the pick happens, in one sentence:
+                // a reusable agent setup. Where it runs is the row's own business.
                 <p className="px-2.5 pb-1 text-[11px] leading-snug text-muted">
-                  {i18nT('components.agentDropdownList.group_templates_hint_default_workspace')}
+                  {i18nT('components.agentDropdownList.group_templates_hint')}
                 </p>
               )}
               {rows.map(row)}

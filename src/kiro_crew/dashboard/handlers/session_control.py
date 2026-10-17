@@ -16,6 +16,7 @@ import logging
 
 from aiohttp import web
 
+from kiro_crew import conductor_patrol, session_ledger
 from kiro_crew.dashboard import session_control as sc
 from kiro_crew.dashboard.handlers._shared import (
     _read_session_key,
@@ -257,6 +258,13 @@ async def api_session_control_create(request: web.Request) -> web.Response:
         agent_kind = body.get("agent_kind", "")
         if not isinstance(agent_kind, str):
             raise sc.SessionControlError("agent_kind must be a string", code="invalid_field_type")
+        # Absent means "inherit the dispatching crewmate's"; present must be a
+        # string, and the verb judges its value against the five levels.
+        effort = body.get("reasoning_effort")
+        if effort is not None and not isinstance(effort, str):
+            raise sc.SessionControlError(
+                "reasoning_effort must be a string", code="invalid_field_type"
+            )
         # Warmed AFTER the body read, which suspends: a config edit landing in that
         # window would change the fingerprint and leave `create_session`'s own
         # synchronous gate re-reading the file on the loop. Nothing suspends between
@@ -270,6 +278,7 @@ async def api_session_control_create(request: web.Request) -> web.Response:
             agent_kind=agent_kind,
             folder_id=str(body.get("folder_id") or ""),
             model=str(body.get("model") or ""),
+            reasoning_effort=effort,
             dry_run=dry_run,
             # The fence verdict this request's admission already settled, for the
             # same reason every other route forwards it as
@@ -281,6 +290,22 @@ async def api_session_control_create(request: web.Request) -> web.Response:
         )
     except sc.SessionControlError as exc:
         return _refusal(exc)
+    if not dry_run and isinstance(result, dict):
+        # A create is a dispatch, and a dispatch needs a patrol reading what
+        # comes back: the same default patrol a ledger bind arms, through the
+        # same outside-arm authorizer (``conductor_patrol.ensure_patrol``).
+        # Never raises, and the create already committed.
+        from kiro_crew.dashboard.handlers.work_ledger import holds_ledger
+
+        caller = session_ledger.ledger_key(_read_session_key(request))
+        ledger = await holds_ledger(caller)
+        patrol, reason = await conductor_patrol.ensure_patrol(
+            state, caller, has_ledger=ledger, source="session-create"
+        )
+        result = {**result, "patrol": patrol, "patrol_reason": reason}
+        note = conductor_patrol.patrol_note(state, caller, reason, has_ledger=ledger)
+        if note:
+            result["patrol_note"] = note
     return web.json_response(result)
 
 
@@ -533,6 +558,32 @@ async def api_session_control_revive(request: web.Request) -> web.Response:
             caller_session_key=_read_session_key(request),
             target=_target(body),
             folder_id=str(body.get("folder_id") or ""),
+            caller_fenced=_carried_fence(request),
+        )
+    except sc.SessionControlError as exc:
+        return _refusal(exc)
+    return web.json_response(result)
+
+
+async def api_session_control_history(request: web.Request) -> web.Response:
+    """GET /api/session-control/history — archived sessions this caller could revive."""
+    refused = await _require_internal(request)
+    if refused is not None:
+        return refused
+    # No prewarm here: `list_archived_sessions` warms the SEL logger and the
+    # config itself, the same ordering `revive_session` uses.
+    state: DashboardState = request.app["state"]
+    try:
+        limit_raw = request.query.get("limit")
+        try:
+            limit = int(limit_raw) if limit_raw else sc.DEFAULT_HISTORY_LIST_ROWS
+        except ValueError:
+            raise sc.SessionControlError("limit must be an integer", code="invalid_pagination")
+        result = await sc.list_archived_sessions(
+            state,
+            caller_session_key=_read_session_key(request),
+            folder_id=(request.query.get("folder_id") or "").strip(),
+            limit=limit,
             caller_fenced=_carried_fence(request),
         )
     except sc.SessionControlError as exc:

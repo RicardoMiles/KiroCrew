@@ -266,8 +266,14 @@ async def _apply_claim(
             # misattribution moving without stopping it. So the identity is
             # CLEARED, which is the same fail-closed state the register path gives
             # a token it cannot resolve: the stub's calls carry no caller, strict
-            # tools refuse with a diagnosis, and a claim carrying ITS token repairs
-            # it through the branch above.
+            # tools refuse with a diagnosis.
+            #
+            # Two real recovery paths. First: a TOKENLESS claim retargets every
+            # connection under the pid unconditionally, so it can name this
+            # connection when it next arrives. Second: once every co-tenant's
+            # token-carrying connections have disconnected, ``_pid_live_tenants``
+            # returns empty and ``live_tenants`` holds only the claiming session;
+            # ``shared_pid`` is False and this branch is not taken.
             skipped += 1
             old_unattributable = conn.caller.session_key if conn.caller is not None else ""
             conn.caller = None
@@ -287,8 +293,8 @@ async def _apply_claim(
                 f"pid {pid} serves {len(live_tenants)} live sessions "
                 f"and stub {conn.stub_uuid} carries no session token — refusing to "
                 f"attribute it on PID alone (claim named "
-                f"{updated_caller.session_key}); its identity is cleared until a "
-                f"claim carrying its own token names it"
+                f"{updated_caller.session_key}); its identity is cleared until "
+                f"a tokenless claim retargets it or every co-tenant disconnects"
             )
             logger.warning("claim cleared a stub it cannot attribute: %s", reason)
             _audit_caller_claimed(
@@ -327,6 +333,11 @@ async def _apply_claim(
         # A subscribe arriving during an await must likewise already be
         # authorized as the NEW caller on every connection.
         conn.caller = updated_caller
+        # A re-attribution supersedes any prior clearing verdict: the flag stops
+        # a stub from naming itself through the recaller, but once a claim has
+        # given this connection a new identity the recaller can fill key-less
+        # state again without mis-attributing it.
+        conn.identity_refused = False
         retargeted.append((conn, old_key))
     # Pass 2: all connections now carry the new owner; run the evictions.
     #

@@ -3,7 +3,7 @@
 ``kiro_crew.hooks`` is the hook subsystem's import path and its patch surface: over a
 hundred production modules import it and the tests rebind its names. Most of what it defined
 now lives in the modules of ``kiro_crew.hook_runtime``, one responsibility each, and
-``hook_runtime.compose`` runs every function they define on the facade's globals.
+``_facade_compose.compose`` runs every function they define on the facade's globals.
 
 These tests pin:
 
@@ -45,6 +45,7 @@ from source_corpus import repo_root
 
 from kiro_crew import hook_runtime
 from kiro_crew import hooks as hooks_mod
+from kiro_crew._facade_compose import compose as facade_compose
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 _FACADE = hooks_mod.__name__
@@ -168,6 +169,13 @@ _BASE_OWNERS: dict[str, tuple[str, ...]] = {
         set_global_hook_store get_global_hook_store persisted_hook_store
         fire_tool_hooks pre_tool_match_names permission_pre_tool_block
         """.split()),
+    "hook_types": tuple("""
+        HookResult ToolHookResult ContextRule AutoReplyHook TransformHook
+        UserDeniedPattern HooksConfig
+        """.split()),
+    "script_hooks": tuple("""
+        _hook_subprocess_env ScriptHookResult run_script_hook ScriptHookStore
+        """.split()),
 }
 
 _MOVED = frozenset(name for names in _BASE_OWNERS.values() for name in names)
@@ -194,34 +202,23 @@ _NEW_OWNER_DEFS: dict[str, tuple[str, ...]] = {
 #: Re-pinned once since: ``_governance_denial`` gained ``alias_groups`` and
 #: ``deny_aliases`` (the KAS tool-id spellings ``gate_decision`` reads as one
 #: identity), both keyword defaults, so every pre-split caller still fits.
-_BASE_SHAPE_DIGEST = "929fdbd29a36ecad562006ef00c3e12aa5e75886bc79d2c874e6d5ab50a3758a"
+_BASE_SHAPE_DIGEST = "869ba96660ec8f4ea710d6c3dcbbbec3cfcd25827358d3bac7a597102d6860bb"
 
 #: Definitions that stay in the facade file, each because a guard, a contract or the
 #: ``compose`` ordering reads it there. The reason per entry is in
 #: ``docs/system-specs/modules/memory-skills-hooks.md``'s "Hook runtime owners".
 _FACADE_DEFS = (
-    "HookResult",
     "uncounted_gate",
-    "ToolHookResult",
     "_fail_closed_on_gate_crash",
     "GateRule",
     "GateTier",
-    "ContextRule",
-    "AutoReplyHook",
-    "TransformHook",
-    "UserDeniedPattern",
-    "HooksConfig",
     "HookManager",
     "_cu_read_only_auto_approve",
     "_unc_data_home_root",
     "_unc_agents_root",
     "_screen_windows_links",
     "FileTooLargeError",
-    "_hook_subprocess_env",
     "ScriptHook",
-    "ScriptHookResult",
-    "run_script_hook",
-    "ScriptHookStore",
 )
 
 #: Collaborators the facade re-offers that belong to another module. Their identity is
@@ -428,12 +425,12 @@ def test_every_moved_name_is_one_object_in_its_owner() -> None:
     ]
     assert strays == []
     names = [name for group in _BASE_OWNERS.values() for name in group]
-    assert len(names) == len(set(names)) == 71
+    assert len(names) == len(set(names)) == 82
 
 
 def test_the_moved_names_keep_their_base_shapes() -> None:
     lines = sorted(f"{name} {_shape(getattr(hooks_mod, name))}" for name in _MOVED)
-    assert len(lines) == 71
+    assert len(lines) == 82
     digest = hashlib.sha256("\n".join(lines).encode()).hexdigest()
     assert digest == _BASE_SHAPE_DIGEST, "\n".join(lines)
 
@@ -607,21 +604,34 @@ def test_a_moved_function_reads_its_source_from_its_owner() -> None:
     )
 
 
-def test_the_compose_copy_matches_its_siblings() -> None:
-    """Five compositions share one technique; each package keeps its own copy so no
-    package imports another's, and the copies stay identical."""
+def test_the_facade_composes_through_the_shared_helper() -> None:
+    """The facade composes its owners with the one shared helper,
+    ``kiro_crew._facade_compose.compose``, calling it exactly once, and the owner
+    package keeps no copy of its own: its ``__init__`` defines no function."""
+    assert hooks_mod._facade_compose is facade_compose
+    source = Path(hooks_mod.__file__).read_text(encoding="utf-8")
+    assert source.count("\n_facade_compose(\n") == 1
+    package = ast.parse(Path(hook_runtime.__file__).read_text(encoding="utf-8"))
+    defined = [
+        node.name
+        for node in package.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    ]
+    assert defined == []
 
-    def body(rel: str) -> str:
-        text = (_SRC / "kiro_crew" / rel / "__init__.py").read_text(encoding="utf-8")
-        return text[text.index("def compose(") :]
 
-    assert (
-        body("hook_runtime")
-        == body("dashboard/agent_admin")
-        == body("dashboard/chat_api")
-        == body("dashboard/file_api")
-        == body("dashboard/messaging_api")
-    )
+def test_the_store_mutation_guard_is_rebound_through_the_shared_helper() -> None:
+    """The one function ``compose`` cannot reach, the generator under
+    ``ScriptHookStore._atomic_mutation``, is rebound with the shared helper's public
+    ``rebind`` onto the facade's globals, and the facade names no owner package's
+    private rebind."""
+    from kiro_crew import _facade_compose
+
+    assert hooks_mod._facade_rebind is _facade_compose.rebind
+    generator = vars(hooks_mod.ScriptHookStore)["_atomic_mutation"].__wrapped__
+    assert generator.__globals__ is vars(hooks_mod)
+    source = Path(hooks_mod.__file__).read_text(encoding="utf-8")
+    assert "_hook_runtime" not in source
 
 
 def _write_module(tmp_path: Path, name: str, source: str) -> types.ModuleType:
@@ -684,7 +694,7 @@ def test_compose_rebinds_functions_and_class_members(tmp_path: Path) -> None:
     untouched = {name: vars(owner.Tally)[name] for name in ("LIMIT", "joined", "size")}
     namespace = {"__name__": "hook_runtime_compose_host_probe", "VALUE": "host"}
     namespace["helper"] = owner.helper
-    hook_runtime.compose(namespace, (owner,))
+    facade_compose(namespace, (owner,))
 
     assert namespace["helper"]() == "host" and owner.helper is namespace["helper"]
     assert owner.outer()() == "host"
@@ -704,7 +714,7 @@ def test_compose_rebinds_functions_and_class_members(tmp_path: Path) -> None:
     assert owner.Tally.static() == "patched" and owner.Tally().value == "patched"
 
     fresh = {"__name__": "hook_runtime_compose_host_probe", "VALUE": "fresh"}
-    hook_runtime.compose(fresh, (owner,))
+    facade_compose(fresh, (owner,))
     assert owner.helper() == "fresh"
     assert owner.Tally.klass() == "fresh" and owner.Tally().value == "fresh"
 
@@ -880,14 +890,16 @@ def test_the_unc_root_memos_are_primed_on_the_facade(tmp_path: Path) -> None:
 
 
 def test_the_gate_still_carries_what_the_source_guards_read() -> None:
-    """Two guards read this file's own text rather than a symbol, so they constrain
-    WHERE that construct lives: ``test_business_counters`` greps the file for the
-    approval counter (its emit is ``ToolHookResult._count``), and
-    ``test/link_screen_sites.py`` keys ``_screen_windows_links`` by this path. The gate
-    table's kinds are a closed vocabulary that ``GateTierKind`` spells for the type
-    checker and ``_GATE_TIER_KINDS`` orders for the soundness check."""
+    """Two guards read a file's own text rather than a symbol, so they constrain
+    WHERE that construct lives: ``test_business_counters`` greps
+    ``hook_runtime/hook_types.py`` for the approval counter (its emit is
+    ``ToolHookResult._count``), and ``test/link_screen_sites.py`` keys
+    ``_screen_windows_links`` by this path. The gate table's kinds are a closed
+    vocabulary that ``GateTierKind`` spells for the type checker and ``_GATE_TIER_KINDS``
+    orders for the soundness check."""
     source = _FACADE_PATH.read_text(encoding="utf-8")
-    assert "APPROVAL_DECISIONS" in source and "emit_counter" in source
+    counted = source + (_OWNER_DIR / "hook_types.py").read_text(encoding="utf-8")
+    assert "APPROVAL_DECISIONS" in counted and "emit_counter" in counted
     assert "_screen_windows_links" in source
     module_level = {
         node.name

@@ -642,7 +642,7 @@ sensitive-path check and the governance ceiling — would never be reached.
 
   **`GET /style` goes through the same helper.** A style is easy to misfile as inert
   user upload, because a user CAN import one by hand (`POST /styles/import`) — but
-  the `sdpm-style` agent's entire purpose is to WRITE one, and it holds `web_fetch` /
+  the `pptx-maker-style` agent's entire purpose is to WRITE one, and it holds `web_fetch` /
   `web_search`, so the boundary has to assume the untrusted author. It reuses
   `_redact_artifact` rather than a bare `redact()` for the raster reason above: a
   style embeds the same inline art, so an unguarded pass would blank the preview.

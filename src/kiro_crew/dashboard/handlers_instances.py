@@ -77,6 +77,7 @@ from kiro_crew.instances.registry import (
     validate_ttl,
 )
 from kiro_crew.instances.ssh_tunnel_manager import ProxyRequestError, TunnelState
+from kiro_crew.instances.validation import UnsupportedConnectionMethodError
 from kiro_crew.instances.warm_set import resolve_warm_set_cap
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.security import redact
@@ -684,9 +685,11 @@ async def api_instances_update(request: web.Request) -> web.Response:
     # Disabling is a teardown too, and it takes the same locked path: the
     # tunnel closes and the flag lands in one critical section, so a connect
     # racing it is either torn down here or reads the flag and is refused.
-    transport_changed = any(
+    # Every disable takes it, even one `current` reads as off: that read precedes
+    # the lock, so an enable and a connect can land after it.
+    transport_changed = changes.get("disabled") is True or any(
         k in transport_keys and v != getattr(current, k) for k, v in changes.items()
-    ) or (changes.get("disabled") is True and not current.disabled)
+    )
     # Validate the PROPOSED record before touching the tunnel. The registry
     # validates too, but that happens after the teardown — so a rejected edit
     # would answer 400 having already disconnected a healthy crew, punishing the
@@ -987,13 +990,25 @@ async def api_instances_connect(request: web.Request) -> web.Response:
     except KeyError:
         _audit("connect", "denied", request_id=instance_id, error="not found")
         return web.json_response({"error": "not found", "code": "instance_not_found"}, status=404)
-    except InstanceDisabledError:
+    except UnsupportedConnectionMethodError as e:
+        _audit("connect", "denied", request_id=instance_id, error="unsupported connection method")
+        return web.json_response(
+            {
+                "instance_id": instance_id,
+                "state": "disconnected",
+                "error": str(e),
+                "code": UnsupportedConnectionMethodError.code,
+            },
+            status=409,
+        )
+    except InstanceDisabledError as e:
         _audit("connect", "denied", request_id=instance_id, error="disabled")
         return web.json_response(
             {
                 "instance_id": instance_id,
                 "state": "disconnected",
-                "error": "this crew is disabled; enable it to connect",
+                # The crew that is off, by id: for a chained crew, the one it rides.
+                "error": f"{e}; enable it to connect",
                 "code": "instance_disabled",
             },
             status=409,
@@ -1654,15 +1669,15 @@ async def api_instances_send_session(request: web.Request) -> web.Response:
         # request leaves. Blocking; the send runs it off the loop.
         try:
             _revalidate_for_publication()
-        except TranscriptWithheld:
-            return {
-                "error": "cannot transfer a non-persistent session",
-                "code": "transfer_slot_not_persistent",
-            }
         except TranscriptBusy:
             return {
                 "error": "the session could not be copied consistently right now; please retry",
                 "code": "transfer_snapshot_unstable",
+            }
+        except TranscriptWithheld:
+            return {
+                "error": "cannot transfer a non-persistent session",
+                "code": "transfer_slot_not_persistent",
             }
         return None
 
@@ -2233,11 +2248,11 @@ _PEER_SLOT_STR_FIELDS: dict[str, int] = {
 }
 
 #: The booleans the sidebar reads, coerced with ``is True`` rather than
-#: truth-tested: a peer answering ``"running": "no"`` must not raise a spinner or
-#: an approval badge it never claimed. The hook normalizes these too — doing it
-#: here as well is what makes the WIRE honest, so this route answers the same way
-#: for any reader, not only the one frontend that happens to re-check.
-_PEER_SLOT_BOOL_FIELDS = ("running", "pending_approval")
+#: truth-tested: a peer answering ``"running": "no"`` must not raise a spinner, an
+#: approval badge or a question it never claimed. The hook normalizes these too —
+#: doing it here as well is what makes the WIRE honest, so this route answers the
+#: same way for any reader, not only the one frontend that happens to re-check.
+_PEER_SLOT_BOOL_FIELDS = ("running", "pending_approval", "needs_input")
 
 #: The two keys ALLOWLISTED from a peer row's ``parent`` citation (``{slot, key}``,
 #: the shape ``lineage_parents`` puts on every local row), each clamped like

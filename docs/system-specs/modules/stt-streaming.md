@@ -111,6 +111,23 @@ filesystem-permission claim, and a payload satisfying neither is refused.
 compressed member of the bundle contains a Mach-O, so this class of defect
 surfaces at sign time rather than as an opaque notarization `Invalid`.
 
+The batch path's import path is `kiro_crew.transcribe`: availability, the config
+read, the two provider-independent guards, `transcribe_audio`'s dispatch, the
+duration probe and the over-cap segmentation, plus the decoder's discovery and
+reporting surface (`ensure_ffmpeg_in_path`, `_find_ffmpeg`, `ffmpeg_source` and its
+codes, `find_brew`). It is a mirror facade
+(`kiro_crew._facade_mirror`) over three owners, so every name they define still
+reads and patches as `transcribe.<name>`, and they log as `kiro_crew.transcribe`. An
+exception class an owner defines (`VocabularyListError`) reports `kiro_crew.transcribe`
+as its module, so a traceback names the import path callers use.
+New work goes to the owner of its responsibility:
+
+| Owner | Owns |
+|---|---|
+| `transcribe_ffmpeg` | the decoder's execution path: resolving the executable to run (bundled image, fixed system directories, store), the authenticated private snapshot it runs from, the spawn, the exit description, the reap and the temporary-output cleanup |
+| `transcribe_aws` | the `transcribe` provider: its client-library availability, the profile credential resolver, the streaming transcription and the custom-vocabulary listing |
+| `transcribe_local` | the on-device providers: the `local` recogniser's WAV read, transcode and language, and the `apple` lane |
+
 Legacy provider values and the loader behavior for persisted values are in
 [Legacy provider values](#legacy-provider-values).
 
@@ -164,6 +181,13 @@ Every actual capture end, including a fatal server frame, synchronously fires
 the composer's once-only capture-stop protection before deferred socket-close
 transcript delivery; explicit cancel and unmount remain discard-only and do not fire it.
 
+Audio start-up has two failure messages, one per step. A rejected
+`audioWorklet.addModule` load of `/pcm-worklet.js` reports that dictation could
+not finish loading and points at the connection; a rejected
+`AudioContext.resume()`, which happens after the module loaded, reports that the
+browser could not start audio and offers dictating again or reloading the page.
+Either one releases the microphone and ends the start.
+
 | Component | File | Role |
 |---|---|---|
 | WS endpoint | `src/kiro_crew/dashboard/stt_stream.py` | One provider session per connection, plus the caps and the SEL audit pair |
@@ -173,11 +197,11 @@ transcript delivery; explicit cancel and unmount remain discard-only and do not 
 | Endpointing VAD | `src/kiro_crew/stt/vad.py` | Adaptive-RMS speech detection and end-of-utterance |
 | Model catalog | `src/kiro_crew/stt/models.py` | The offered models, their sizes, and the sha256-pinned download |
 | Apple helper | `src/kiro_crew/apple_speech/` | Swift `AppleTranscribe.swift` plus its Python driver |
-| Config fields | `src/kiro_crew/config/sections.py` | `SttConfig`, and the degradation rules for a stored provider or model |
+| Config fields | `src/kiro_crew/config/sections_stt.py` | `SttConfig`, and the degradation rules for a stored provider or model |
 | Worklet | `website/public/pcm-worklet.js` | Float32-to-16 kHz mono Int16 PCM downsampler |
 | Streaming hook | `website/src/hooks/useStreamingStt.ts` | Opens the WS, wires the worklet, emits partial and final |
 | Voice hook | `website/src/hooks/useVoiceInput.ts` | Owns mic and device selection, and picks streaming or batch for the NEXT utterance. `stop`, `cancel` and `recording` route on the transport of the utterance in flight (`ownTransportRef ?? startupTransport`), never on the preference, so flipping the mode mid-utterance cannot send a commit or discard down the other transport. While a streaming session drains after the mode was switched off, `drainCancellable` exposes the "Discard dictation" control, which cancels the session and rolls the dictated region out of the composer (`cancelVoiceRollback.test.tsx`) |
-| Composer wiring | `website/src/chat-core/composer/useComposerVoice.ts` | The `Composer` root's Voice atom: splices the live region into the input box, owns the one-mic mutex and the frozen-prefix snapshot; `ChatPage.tsx` and `ChatPane.tsx` mount the root and supply only host options |
+| Composer wiring | `website/src/chat-core/composer/useComposerVoice.ts` | The `Composer` root's Voice atom: splices the live region into the input box, owns the one-mic mutex and the frozen-prefix snapshot; `ComposerDockView.tsx` and `ChatPane.tsx` mount the root and supply only host options |
 | Recording UI | `website/src/components/VoiceDictationPanel.tsx`, `VoiceStatusBar.tsx` | The animated panel, and the thin bar it falls back to |
 | Composer dictation | `website/src/components/chat-input/voice.ts` | The composer's side of the Voice atom: the caret a transcript splices in at, the dictation-panel gate, Escape to discard, and on touch the hold-to-talk mode and the labels its controls carry |
 | Composer voice controls | `website/src/components/chat-input/VoiceControls.tsx` | Renders that state: the hold gesture's cancel cue, the dictation panel or status bar, the hold target, and the mic |
@@ -187,7 +211,7 @@ transcript delivery; explicit cancel and unmount remain discard-only and do not 
 
 Client to server:
 
-- Binary frames: raw 16 kHz mono, little-endian Int16 PCM; `test/test_stt_stream.py` pins the transport format and frame limits.
+- Binary frames: raw 16 kHz mono, little-endian Int16 PCM; `test/test_stt_stream.py` and `test/test_stt_stream_local_session.py` pin the transport format and frame limits.
 - Text frame `{"type":"stop"}`: the user released the mic. The server finishes
   the utterance and closes, so trailing finals still arrive.
 
@@ -297,13 +321,15 @@ After the three gates, each provider has its own precondition and failure frame:
   credentials that may not stream. Their `AccessDeniedException` arrives as
   `_CODE_AWS_ACCESS_DENIED`, because every retry is refused the same way. A
   refused custom vocabulary has its own code too
-  ([Custom vocabulary](#custom-vocabulary-transcribe-only)); any other start
-  failure is `_CODE_SESSION_FAILED`. A stream on a named `stt.transcribe_profile`
-  keeps the credentials it opened with: `_ProfileCredentialResolver` resolves once,
-  because the SDK asks again for every audio event and each event's signature
-  chains from the opening request's, so a key the profile refreshed mid-stream
-  would be refused. With no profile set, the SDK's own default-chain resolver
-  signs the stream.
+  ([Custom vocabulary](#custom-vocabulary-transcribe-only)), and so does
+  mixed-language detection on an SDK too old for it
+  ([Mixed-language detection](#mixed-language-detection-transcribe-only)); any
+  other start failure is `_CODE_SESSION_FAILED`. A stream on a named
+  `stt.transcribe_profile` keeps the credentials it opened with:
+  `_ProfileCredentialResolver` resolves once, because the SDK asks again for every
+  audio event and each event's signature chains from the opening request's, so a
+  key the profile refreshed mid-stream would be refused. With no profile set, the
+  SDK's own default-chain resolver signs the stream.
 
 ### The AWS consent gate is an authorization, not a preference
 
@@ -345,8 +371,9 @@ vocabulary.
 - **The panel warns before the first dictation.** The Voice panel compares the
   chosen vocabulary against the list read from AWS and its language against
   `effective_language_code`, and says that dictation will fail when the vocabulary
-  is not ready or is for another language. `VocabularyName` is also not valid with
-  language identification, which would need `VocabularyNames` instead.
+  is not ready or is for another language. With mixed-language detection on it
+  judges each path: the vocabulary's language must be among the candidates (the
+  live stream) and must be `effective_language_code` (a voice message).
 - **`GET /api/stt/vocabularies` lists what the picker offers.** Read from live
   config, refused to an app token, and gated twice before any AWS call: `transcribe`
   must be the provider and `aws_consent.refuse_and_log` must grant, otherwise it
@@ -364,6 +391,55 @@ vocabulary.
   vocabularies plus the stored name when the list lacks it, is disabled and says it
   is loading while the list is still being read with the stored value still shown,
   and warns when the stored name is not ready in the configured region.
+
+### Mixed-language detection (`transcribe` only)
+
+`stt.transcribe_languages` lists the languages speakers switch between in one
+recording (empty: off). With `TRANSCRIBE_LANGUAGES_MIN` (two) or more,
+`SttConfig.transcribe_language_identification` returns them and the live socket
+opens the stream with `IdentifyMultipleLanguages` and `LanguageOptions`, so
+Amazon Transcribe transcribes each part in the language it identifies. With
+fewer, the stream is opened exactly like the single-language one, on
+`effective_language_code`.
+
+- **No `LanguageCode` beside identification.** Amazon Transcribe fails a stream
+  that names both, so `stt_stream._transcribe_language_kwargs` passes
+  `language_code=None` (the SDK then sends no header). A configured vocabulary
+  travels as `VocabularyNames`, the parameter identification accepts, instead of
+  `VocabularyName`. Its refusals speak of "vocabularies", so
+  `_vocabulary_rejected` matches the stem and the vocabulary-refusal code still
+  applies.
+- **One rule for both writers.** `config.sections.transcribe_language_options`
+  accepts a list of at most `TRANSCRIBE_LANGUAGES_MAX` (five, the most AWS
+  recommends) locale codes with no language twice, because a stream carries one
+  dialect per language. `PUT /api/config/stt` stores only a list it accepts, and
+  the loader degrades anything else to empty with a one-time warning. A
+  one-language list is valid: it is a selection in progress, and the stream keeps
+  the single-language path until a second language joins it.
+- **The live socket only.** Amazon Transcribe identifies several languages only in
+  a PCM stream, so `transcribe._transcribe_aws` (an Ogg/Opus voice memo, and
+  dictation with streaming off) keeps `effective_language_code`.
+- **An outdated SDK is named, not guessed at.** The parameters exist from
+  `amazon-transcribe` 0.6.3, which the `voice-aws` extra pins as its floor. An
+  older install would raise `TypeError` at stream start, so the socket reads the
+  client method's signature first (`_client_identifies_languages`) and, when it
+  lacks them, refuses before any audio is read with
+  `stt_transcribe_sdk_outdated` and logs the install command.
+- **The panel offers the picker beside Language.** Its candidates are the
+  served `language_codes` (which include `vi-VN`, and any stored code the
+  common list lacks, so a value set in config.json stays selectable), each named
+  in the app language beside its code, as the Language picker's options are; the
+  closed box lists the names, and with one picked it says one more is needed.
+  Ticked ones are sorted first when the
+  list opens and then stay in place, so no row moves while it is being ticked;
+  every row is locked while a save is in flight, so a second tick cannot be
+  built from the list before the first one landed.
+  Ticking a second dialect of a picked language swaps it in; at the maximum the
+  other languages are locked and one line at the top of the list says why; with
+  one picked the row says the language above is still in force, and with two or
+  more a line under Language says it now applies only to voice messages and to
+  dictation with Streaming off. `GET /api/config/stt` serves `transcribe_languages_min` and
+  `transcribe_languages_max` from the constants the validator uses.
 
 ## The local provider's pipeline
 
@@ -1180,6 +1256,16 @@ air-gapped install without weakening the pin, and `SKIP_DOWNLOAD_ENV` is the sam
 switch the embedding downloader honours, so one setting means "this process must
 not pull model weights".
 
+### A model outside the catalog
+
+The catalog is not the whole set. `stt.model` also accepts `custom`, which runs a file the user has already put in the models directory: `stt.custom_model_path` names it and `stt.custom_model_sha256` pins it. Nothing is downloaded for it.
+
+- The path must resolve, symlinks followed, to a regular file strictly inside `models_dir()`. Any `..` component, an absolute path elsewhere, a symlink out of the directory, a catalog file name (the catalog download deletes or overwrites a file there) and a `.part` staging file are refused by `models.custom_model_file`, which returns the real path the engine then loads, and which runs when `PUT /api/config/stt` saves the field and again on every load.
+- The file is hashed on every load and refused on a mismatch, like a catalog file. A refused custom file is left in place, because it is the user's own file.
+- The catalog's seal checks apply too, and refuse the load with a `failed` status flagged `refused`: `models` and the whisper folder must be real directories (`sandbox.require_real_model_path`), so the resolved file sits under the read-only seal, and the hash is the same one-descriptor check (`_sha256_verified_file`), so a second hard link, a symlinked leaf or a change during the read refuses it. A link below the folder is followed and must stay inside it.
+- A half-configured pair degrades to the default model with a warning. A complete pair whose file is missing does NOT degrade: it fails at load with the reason in `ModelStore.status`, so a different model is never run in its place without a word.
+- Both fields are owner-only on `GET`/`PUT /api/config/stt`. `config.json` is mounted read-only in the agent sandbox, so the pin cannot be rewritten to match a file an agent placed in the models directory.
+
 ## Caps and limits
 
 Every limit is a named constant in the module that owns it. The values are not
@@ -1220,9 +1306,10 @@ cancelling it would release the model store's transfer lock while its worker thr
 is still writing the staging file, and the next session would start a second write
 to the same path. Only the socket gives up; the bytes land for the next attempt.
 
-`test/test_stt_stream.py` pins the transport caps, `test/test_stt_session.py` the
-session ones, `test/test_stt_vad.py` the detector's thresholds and
-`test/test_stt_engine.py` the thread derivation and the availability codes.
+`test/test_stt_stream.py` and `test/test_stt_stream_local_session.py` pin the transport
+caps, `test/test_stt_session.py` the session ones, `test/test_stt_vad.py` the
+detector's thresholds and `test/test_stt_engine.py` the thread derivation and the
+availability codes.
 
 ## SEL audit pairing: emit before closing
 
@@ -1254,7 +1341,7 @@ either one is a race.
 
 ## Frozen-prefix behaviour
 
-`useComposerVoice.ts` (the `Composer` root's Voice atom, mounted by `ChatPage.tsx`
+`useComposerVoice.ts` (the `Composer` root's Voice atom, mounted by `ComposerDockView.tsx`
 and `ChatPane.tsx`) snapshots the composer's contents and the caret on the first
 `partial` of an utterance. Later partials replace only the live region after that
 snapshot, so anything the user typed before speaking survives, and the caret does
@@ -1263,7 +1350,7 @@ newly committed text.
 
 ## Legacy provider values
 
-`_validated_stt_provider` in `config/sections.py` accepts `local`, `apple`, `transcribe`, and `off`. Two classes of stored value fall outside that set and degrade differently, each logging the replacement once per process rather than preventing the gateway from loading a voice setting:
+`_validated_stt_provider` in `config/sections_stt.py` accepts `local`, `apple`, `transcribe`, and `off`. Two classes of stored value fall outside that set and degrade differently, each logging the replacement once per process rather than preventing the gateway from loading a voice setting:
 
 - Persisted `whisper`, `mlx`, `parakeet`, or `faster` (the retired names) degrade to `local`: each was a local recogniser the user had working, and the resident engine recognises the same speech.
 - Any other value degrades to `off`. An unknown value used to degrade to `local`, which put a typo or a guessed value onto the one provider that links a native library into the gateway; a user told to set `stt.provider off` while that library was crashing on model load got the crashing engine back, and learned it only from a WARNING line (kirodotdev/KiroCrew#13179). Failing closed is the one reading that cannot make things worse. `kirocrew config set stt.provider <value>` refuses a value outside the enum at the write, so a stored unknown value can only arrive from a hand edit or an older writer.

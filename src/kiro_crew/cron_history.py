@@ -559,14 +559,14 @@ class CronHistoryStore:
     async def append(self, record: CronRunRecord) -> None:
         """Write record to job file and index."""
         # Cap fields
-        # The ONE truncation site for a summary: cron.py's run, timeout and
+        # The ONE truncation site for a summary: the cron service's run, timeout and
         # cancel recorders all hand the whole text over uncut, so the
         # configured cap and the keep-the-facts rule apply once, here. A
         # caller that pre-slices defeats both.
         #
         # One boundary this does not reach: a command cron's failure path caps
         # the JOB FIELD it writes (``job.last_error = err_str[:200]`` in
-        # slack/gateway.py), which is a registry-size decision about crons.json,
+        # slack/gateway_runtime/cron_exec.py), which is a registry-size decision about crons.json,
         # not a decision about this record. The recorder still passes that field
         # over whole, so such a summary is simply as long as the field it came
         # from. Lifting that cap belongs to whoever owns the registry's size.

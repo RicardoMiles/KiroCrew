@@ -32,6 +32,13 @@ KIROCREW_SPAWN_INSTANCE_ENV = "KIROCREW_SPAWN_INSTANCE"
 # this is what tells this install's runtime from a sibling install's on the same
 # uid. Read only to WITHHOLD a kill: absent or different means not ours.
 KIROCREW_SPAWN_HOME_ENV = "KIROCREW_SPAWN_HOME"
+# The authored agent an ``AcpRuntime`` child is spawned for, set beside the
+# instance and inherited the same way. A host that takes its agent on the command
+# line shows it in argv; a host that binds the agent over the wire (the KAS relay)
+# shows nothing there, so this is the one carrier that names the agent for every
+# runtime regardless of host. Read back out of ``/proc/<pid>/environ`` by the
+# process-leak gate to tell the gateway's own background runtime from a session's.
+KIROCREW_RUNTIME_AGENT_ENV = "KIROCREW_RUNTIME_AGENT"
 # Set on every tree spawned through ``sandbox.sandboxed_spawn_argv`` -- a build, an
 # ``npx`` install, a ``git``/``gh`` read, a provisioning run -- and inherited by that
 # whole tree exactly as KIROCREW_SPAWNED is. It says what KIROCREW_SPAWNED does not:
@@ -52,6 +59,14 @@ KIROCREW_SPAWN_HOME_ENV = "KIROCREW_SPAWN_HOME"
 # weaken the ownership test to express itself.
 KIROCREW_SANDBOX_TOOL_ENV = "KIROCREW_SANDBOX_TOOL"
 KIROCREW_SANDBOX_TOOL_VALUE = "1"
+
+#: The desktop app's staged KAS engine root, exported by the Electron shell when
+#: the build staged the pinned engine for this architecture
+#: (``website/electron/gateway-env.js``, ``bundledKasEnvironment``). Lives here
+#: rather than in ``acp.kas_bundle`` because ``sandbox`` seals the directory it
+#: names (:func:`sandbox_tiers._resolved_install_root_targets`) and must not import the
+#: ACP tree to learn the env name.
+BUNDLED_KAS_DIR_ENV = "KIROCREW_BUNDLED_KAS_DIR"
 
 # Canonical truthy set for boolean environment variables (KIROCREW_NO_JAIL,
 # KIROCREW_DEV_MODE, …).  Use ``env_flag_enabled`` rather than ``bool(os.environ
@@ -273,13 +288,13 @@ def crew_log_enabled() -> bool:
 # Outer wall-clock cap on a single ``_run_chat`` invocation (any dispatch site:
 # primary user turn, queue-drain, cron injection, subagent injection, Slack first
 # turn). Sized to match the inner ACP ``_DEFAULT_PROMPT_TIMEOUT`` (14400s) in
-# ``acp/client.py`` so the dashboard layer doesn't bound below the transport.
+# ``acp/client_timeouts.py`` so the dashboard layer doesn't bound below the transport.
 # Four hours is the longest single turn the shipped budgets can legitimately
 # produce (the task runner's 90-minute test command plus a fix and a re-run, or a
 # blocking subagent wave at its 2h wait cap plus synthesis); work that outlives
 # it belongs to the loop mechanisms, which end the turn between cycles.
 # Wedged-session detection is handled by ``_STALE_TURN_TIMEOUT`` (90s, also in
-# ``acp/client.py``); this cap is the upper safety ceiling for genuinely runaway
+# ``acp/client_timeouts.py``); this cap is the upper safety ceiling for genuinely runaway
 # work, not a "this turn took too long" guard.
 CHAT_TURN_TIMEOUT = 14400.0
 
@@ -338,7 +353,7 @@ DEFAULT_SPAWN_MIN_MEMORY_GB = 2.0
 
 # Default of ``agent.subagent_queue_max_wait_secs``: how long a spawn the memory
 # floor keeps deferring (durable or in memory) may wait before it ends with the
-# delivered terminal ``never started: waiting for memory``. Finite by owner
+# delivered terminal ``QUEUED_WAIT_EXPIRED_TEXT``. Finite by owner
 # decision (a memory wait is never unbounded); one number for the config default,
 # the loader fallback and the manager's boot value.
 DEFAULT_SUBAGENT_QUEUE_MAX_WAIT_SECS = 1800

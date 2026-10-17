@@ -117,7 +117,7 @@ No lock guards any of this. What makes the pair decidable against the index the 
 - A reply that carries a redaction placeholder is followed by the shared `messaging.renderer.redaction_notice`, counted with `count_redaction_tags` over the posted reply, so a reader learns a pasted command or link will not work as-is. The notice is a `system` message in the reply's thread, posted with `notify_members=False`, and is best-effort: a failed post is logged and the reply stands. `test/test_channel_redaction_notice.py` pins it.
 - `CHANNEL_AGENT_BLOCKED_TOOLS` and `_blocked_tool_named` contain direct-to-user messaging, session-control, and work-ledger operations so a channel agent cannot move channel content into a private dashboard session, take control of one, or write into another dispatch's decision record.
 - `api_channel_approve_agent` validates the decision allowlist. Per-command trust requires a pattern matching the server-bound pending command, records grants as opaque literals, audits both grants and refusals, and resolves the current request as a one-time approval. `_stream_task` repeats the result allowlist check before acting on the approval future.
-- `_json_object` rejects invalid JSON and non-object request bodies before channel handlers read fields.
+- `_json_object` reads through `handlers/_shared.read_bounded_json`: a body not declared JSON is refused 415 `unsupported_media_type` before it is read, and invalid JSON or a non-object body is refused 400 before channel handlers read fields. It is uncapped below `client_max_size`, because a channel message carries user prose.
 - Channel approval and trust decisions are logged through `sel().log_tool_invocation`; context-clear requests are logged through `sel().log_api_access`.
 
 ## Frontend

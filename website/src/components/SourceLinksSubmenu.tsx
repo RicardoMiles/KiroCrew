@@ -221,10 +221,13 @@ export default function SourceLinksSubmenu({ slotKey, variant }: {
   const error = unlinkError ?? allLinks.error
   const rawError = error instanceof Error ? error.message : String(error ?? '')
   // A walk that stopped on a failure says how far it got inside the same
-  // alert, so the count reaches the notice's report and the hand-off.
+  // alert, so the count reaches the notice's report and the hand-off. The
+  // retry line names where to retry instead of the generic "Could not hide.
+  // Try again.", which read as contradicting the count before it. It names
+  // this menu rather than "Hide all", because one chip left hides that entry.
   const message = unlinkError
     ? walkStopped
-      ? `${i18nT('pages.chatSidebar.hide_all_source_links_stopped', { done: walkStopped.done, n: walkStopped.total })} ${i18nT('pages.chatSidebar.unlink_source_link_failed')}`
+      ? `${i18nT('pages.chatSidebar.hide_all_source_links_stopped', { done: walkStopped.done, n: walkStopped.total })} ${i18nT('pages.chatSidebar.hide_all_source_links_retry')}`
       : i18nT('pages.chatSidebar.unlink_source_link_failed')
     : allLinks.error ? i18nT('pages.chatSidebar.source_links_expand_failed') : null
   const shown = allLinks.data ?? links

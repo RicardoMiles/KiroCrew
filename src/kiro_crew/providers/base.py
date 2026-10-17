@@ -111,6 +111,13 @@ class LLMProvider(ABC):
     #: caller that acts on a False answer must check this first.
     reports_effort_support: bool = False
 
+    #: True only on a provider whose ``approve_tool`` takes ``withdraw_if``, a
+    #: predicate its transport reads again after the security floor and under
+    #: the write lock right before the approval is written; once it holds,
+    #: nothing is written and ``permission_floor.ApprovalWithdrawn`` is raised.
+    #: Read from the provider's TYPE, so a loose mock cannot opt in by accident.
+    approval_withdrawable: bool = False
+
     @cached_property
     def essential_delivery(self) -> EssentialDelivery:
         """Private prompt receipts belong to this provider, never the builder."""
@@ -395,7 +402,8 @@ class LLMProvider(ABC):
 
     @property
     def member_capabilities_supported(self) -> bool:
-        """Whether a dedicated startup can load a complete member agent spec."""
+        """Whether a dedicated startup can verify native loading or a saved projection."""
+
         return False
 
     @property
@@ -405,8 +413,13 @@ class LLMProvider(ABC):
 
     @property
     def loaded_capability_template(self) -> str:
-        """Confirmed active full-spec template; empty means no loading evidence."""
+        """Confirmed saved template; projection gaps are reported separately."""
         return ""
+
+    @property
+    def capability_projection_gaps(self) -> tuple[str, ...]:
+        """Saved fields this runtime cannot demonstrate applying."""
+        return ()
 
     @property
     def exit_code(self) -> int | None:

@@ -4,6 +4,7 @@ import type { ComposerHandle } from '../../../chat-core/composer/Composer'
 import type { ComposerDraftStore } from '../../../chat-core/composer/draftStore'
 import type { MessageQuote } from '../../../chat-core/composer/messageQuote'
 import { buildOutgoingTurn, isEmptyTurn } from '../../../chat-core/composer/outgoingTurn'
+import { mintSendId } from '../../../chat-core/transport/sendTurn'
 import type { UseMessageQuote } from '../../../chat-core/composer/useMessageQuote'
 import { isNonInteractiveQueued, isSystemDelivery } from '../../../components/QueueStack'
 import { useQueuedMessageActions } from '../../../hooks/useQueuedMessageActions'
@@ -16,7 +17,6 @@ import { expandAll as expandPasteTokens } from '../../../utils/pasteTokens'
 import { handleStopPress, isEscalationState } from '../../../utils/stopDebounce'
 import { answerRejectedMessage } from '../../../utils/questionAnswers'
 import { interceptSlashCommand, isInterceptedSlashCommand } from '../ChatInput'
-import { mintSendId } from '../ChatPageMessageContent'
 import type { ComposerDraftStores } from './composerDrafts'
 import type { ComposerStaging } from './composerStaging'
 
@@ -29,7 +29,7 @@ interface BusyTurnControlsOptions {
   messages: ChatMessage[]
   /** The page's send, for the busy-but-not-running case and nothing else. */
   send: (optionText?: string, targetSlot?: string, steerNow?: boolean, isolated?: boolean) => Promise<boolean>
-  /** The receipt-aware steer POST (ChatPage's `applySteerReceipt` adapter). */
+  /** The receipt-aware steer POST (turnActions.ts's `applySteerReceipt` adapter). */
   steerMutation: { mutate: (vars: { text: string; sendId?: string; slot: string; auto?: boolean; quote?: MessageQuote | null; askId?: string | null }) => void }
   /** The whole-message quote stage (`useMessageQuote`): a steer consumes it
    *  like a send does, and a cancelled queued send hands its quote back here. */
@@ -118,7 +118,7 @@ export function useBusyTurnControls({
   // text-only channel, so unlike a queued send the image travels as its
   // absolute path for the agent to open with a tool, not as an inline
   // content block. Paste tokens are expanded for the LLM the same way
-  // send() does. The POST goes through ChatPage's steerMutation; fire-and-forget
+  // send() does. The POST goes through turnActions.ts's steerMutation; fire-and-forget
   // — the backend falls back to the queue if steer is unavailable, and echoes
   // the text inline via the 'steer_push' WS event. Composer, pending files,
   // paste blocks, and the per-slot drafts are all cleared HERE (not in
@@ -187,7 +187,9 @@ export function useBusyTurnControls({
         const onScreen = originSlot === activeSlotRef.current && composerSlotRef.current === originSlot
         if (onScreen) {
           setInput(mergeIntoDraft(inputRef.current, cmdTxt))
-          onSlashRefused?.(res)
+          // UNCONFIRMED is not a refusal: the text comes back, and the side
+          // panel's own standing notice is the report.
+          if (!res.unconfirmed) onSlashRefused?.(res)
         } else {
           const merged = mergeIntoDraft(drafts.current[originSlot], cmdTxt)
           setDraft(drafts.current, originSlot, merged)
@@ -240,7 +242,7 @@ export function useBusyTurnControls({
     // Leaving them staged is lossless and predictable: the chip stays in the
     // composer and rides the next real send, which does have a full restore path.
     // Drops only this slot's own token sub-map -- see the same-shaped
-    // comment at send()'s send-clear site in ChatPage.
+    // comment at send()'s send-clear site in composerSend.ts.
     setInput(''); setPendingFiles([]); delete pickedFileTokens.current[activeSlot]; setPasteBlocks([])
     delete drafts.current[activeSlot]; delete fileDrafts.current[activeSlot]; delete pasteDrafts.current[activeSlot]
     saveDrafts()

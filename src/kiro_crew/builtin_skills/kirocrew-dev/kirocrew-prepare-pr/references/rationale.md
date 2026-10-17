@@ -48,9 +48,34 @@ tier, because the tier is the record of how big the work was judged to be and a
 reached full green and was then parked by a one-line product hold — every round of
 that work was discarded.
 
-The file-overlap gate's `--limit 500` is load-bearing because `gh pr list` returns
+The file-overlap gate's `--limit` is load-bearing because `gh pr list` returns
 30 rows by default. With 175+ open PRs the default silently checks about a sixth of
 them and the gate reads as passing.
+
+Raising the cap is not enough on its own, because the cap is a number someone has
+to keep ahead of the repo. The repo passed 500 open PRs (723 on 2026-10-12), so
+`--limit 500` began truncating silently in exactly the way the default does — a
+truncated scan is indistinguishable from a clean one. So the gate stops trusting a
+cap: it pages with cursors to the end and asserts the last page's `hasNextPage` is
+`false` (the command is in `references/ci.md`).
+
+Truncation has two axes, and the second one survives any cap. The PR list caps how
+many PRs you see; each PR's `files` connection separately caps how many of *its*
+files you see (`files(first: 100)`), and 12 open PRs exceed 100 files. A gate that
+only widened the outer cap would still miss an overlap hidden past file 100 of a
+large PR, so each PR's `files.pageInfo.hasNextPage` is checked too and a truncated
+one is re-read in full. At this repo's size the single-request form also 504s, which
+is why the gate pages with cursors instead of asking for one large page.
+
+The scripts need Python 3.12 or newer, and SKILL.md says so where the scripts are
+introduced. They carry PEP-604 annotations (`str | None`) that an older interpreter
+evaluates at class-definition time, so on a host whose `python3` is 3.9 the first
+script run dies with `unsupported operand type(s) for |: 'type' and 'NoneType'`
+before doing any work. The floor used to be asserted only inside the kirocrew
+profile's gate-check command, which runs well after Phase 0's first script call,
+so the reader met the crash before the requirement and read it as a broken script
+rather than a wrong interpreter. If `python3 -V` is below 3.12, use `python3.12`
+on PATH or the repo's `.venv/bin/python3.12` for every call in the skill.
 
 ## Why a red main gets its own PR, and the original PR waits
 
@@ -372,12 +397,9 @@ be named exempt with a reason, and every gate must name a target that exists. CI
 gaining a blocking scan therefore fails that test instead of surfacing as a review
 round on a later PR.
 
-Narrowing **within** a surface needs a real import graph, not a text scan, so
-`run_scoped_tests.py` deliberately does not attempt it. It only replaces the *other*
-surface's full suite with the cross-surface set `ci.yml` runs for a single-surface
-diff — measured at 350 backend files or 146 frontend specs, against 62k collected
-backend tests and ~1.4k frontend specs that are not worth re-running serially on ten
-inner-loop iterations for a signal CI produces on the merge ref anyway.
+Which tests the two test gates run, and why the full suites stay CI's job, is
+explained once, in `references/gate-floor.md` under "A test gate runs the RELATED
+set; the full suite is CI's".
 
 ## Why the extraction fallback must announce itself
 
@@ -584,8 +606,9 @@ nothing. A cron has no owning slot, so its tool calls hit a deny-by-default appr
 path and time out after 180s without a global auto-approve grant — and a denied tool
 inside a completed turn still records `last_status: ok`. A real PR watcher logged 101
 runs over 25 hours with 23 approval blocks, zero pushes, and a healthy-looking
-registry. Heartbeat runs under a strict name allowlist (`HEARTBEAT_SAFE_TOOLS`) with
-no shell and no `git push`, so it cannot amend a commit at all.
+registry. Heartbeat runs under a strict identity allowlist (`_heartbeat_approval`)
+with no write tool, and its read-only shell excludes every git subcommand, so it can
+read files but never amend or publish a commit.
 
 `monitor_watch` is exempted only for a pure-watch stretch because it never interprets
 comment bodies: it digests them only to notice a change, so it cannot tell whether a

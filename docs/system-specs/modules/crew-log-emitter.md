@@ -212,7 +212,7 @@ unset here -- see "Reconnect is not resume" below for what it is for.
 | `message/queued` | `chat_delivery.queue_for_next_turn` | source, bytes, queue id -- no turn |
 | `approval/requested` | `_run_chat`, one statement before the try whose `finally` records the decision | turn, request id, tool name and the redacted title the human is shown, each omitted when the frame named neither |
 | `approval/decided` | the same prompt's `finally`, where every exit converges | turn, request id, decision, `by: host` and the host's `cause` for an auto-decline |
-| `approval/requested` / `approval/decided` (subagent spawn gate) | `subagent_manager/admission/gate.py`, when a spawn needs approval; decided in a `finally`, including a host-attributed cancel | in the PARENT's log under the turn that asked (`dispatch_origin`): approval id `spawn:<agent_id>`, tool `spawn_run` |
+| `approval/requested` / `approval/decided` (subagent spawn gate) | `_spawn_with_approval_impl` in `subagent_manager/admission/pump.py`, when a spawn needs approval, through the writer in `subagent_manager/admission/gate_reporting.py`; decided in a `finally`, including a host-attributed cancel | in the PARENT's log under the turn that asked (`dispatch_origin`): approval id `spawn:<agent_id>`, tool `spawn_run` |
 | `approval/requested` / `approval/decided` (a running child's tool prompt) | `subagent_manager/run.py`, when a child asks for a tool | in the PARENT's log under the turn that asked (`child_origin`): approval id `<child_id>:<request_id>` |
 | `plan/updated` | `EVENT_TODO_UPDATE`, inside `slot.set_todo`'s own change gate | turn, the whole task list as `{id, text, state}` |
 | `background/completed` | `run_bg_oneliner` and `background_turn`, at the point they record usage, against an owner pinned BEFORE the call | kind, served model, provider, the billed token dimensions, credits, ms -- no turn |
@@ -260,8 +260,9 @@ computes the flag and the emitter records what it was told.
 pin this account cannot run is withheld at spawn and the session runs on the backend
 default, while the pin is deliberately KEPT -- the composer chip still shows it, and
 clearing it would delete an explicit user setting on the evidence of one session's
-advertised list. An unpinned slot is the mirror case: its pin is backfilled from the
-provider only after the handle exists.
+advertised list. An unpinned slot is the mirror case: it names no model of its own,
+and the model it runs on is known only after the handle exists (when every tier
+defers to the backend, its pin is backfilled from the provider then).
 
 So `session/opened` and `request/configured` read `served_model`, the session fact,
 through one helper. It is empty when the backend serves its own default, and the entry
@@ -1142,7 +1143,7 @@ the finding: an unnamed site records `user`.
 | `slack/gateway` sub-agent injection | a sub-agent completion | `subagent` |
 | `slack/gateway._retrigger_recovery` | re-injected sub-agent completions | `subagent` |
 | `chat_runner` synthesis dispatch | the sub-agent synthesis prompt | `subagent` |
-| `issue_radar.crew_runtime` | a crew-composed prompt | `crew` |
+| `issue_radar.crew_runtime_session` | a crew-composed prompt | `crew` |
 | `handlers/taskrunner` (plan, result) | a task-runner summary | `gateway` |
 
 One shared helper passes no actor on purpose: `spec_builder.runtime.enqueue_or_run_prompt`

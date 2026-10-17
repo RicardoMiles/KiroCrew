@@ -22,7 +22,7 @@ const FEEDBACK_ELIGIBLE_URL = '/api/feedback/eligible'
 //
 // The discriminator is the slot's `origin`, stamped server-side by the only
 // layer that knows how a session was created (`SlotOrigin` in
-// dashboard/state.py) and serialized to the browser on the slot. Only "user"
+// dashboard/state_parts/slot_directory.py) and serialized to the browser on the slot. Only "user"
 // origin — a dashboard person creating a chat with no app token — qualifies.
 // A caller-supplied slot key cannot spoof this: origin is set by the trusted
 // request layer, not derived from the key shape.
@@ -126,7 +126,7 @@ export default function SessionPulseSurveyCard({
   const { t } = useTranslation()
   // Per-instance ids for the two labelled fields. A literal id would be unique
   // only for as long as at most one card is mounted, which today holds because
-  // ChatPage gates the card on `!embedded && !popout`; the moment a second
+  // ChatTranscriptView gates the card on `!embedded && !popout`; the moment a second
   // surface may render one, duplicate ids would make each `htmlFor` /
   // `aria-labelledby` point at whichever copy mounted first. useId makes that
   // uniqueness structural instead of a property of the gate.

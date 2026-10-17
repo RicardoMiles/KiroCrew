@@ -26,8 +26,10 @@ import { useStore } from 'react-redux'
 import type { RootState } from '../../store'
 
 /** New chat inside a folder, with its inline failure line. */
-export function useFolderChatCreate({ folders, mode, dispatch, dropSlotMutation, onOpenSlotInNewTab, updateFolderMutation, clearBoardCollapse }: {
+export function useFolderChatCreate({ folders, mode, dispatch, dropSlotMutation, onOpenSlotInNewTab, updateFolderMutation, clearBoardCollapse, connected, setFolderOfflineNotice }: {
   folders: ChatFolder[]
+  connected: boolean
+  setFolderOfflineNotice: Dispatch<SetStateAction<string>>
   mode: string | undefined
   dispatch: AppDispatch
   dropSlotMutation: BoardColumnMutations['dropSlotMutation']
@@ -132,7 +134,21 @@ export function useFolderChatCreate({ folders, mode, dispatch, dropSlotMutation,
       setFolderCreateError({ folderId, columnId, message, title, report, offerSettings: isStaleProjectDir })
     },
   })
+  /** The offline create refusal, in one place: the folder-row `+` buttons reach
+   *  it through `createChatInFolder`, and the header split button's primary
+   *  segment calls it directly (its create does not route through that sink). */
+  const refuseCreateOffline = useCallback(() => {
+    setFolderOfflineNotice(i18nT('utils.offline.gateway_offline_reconnect', { action: i18nT('utils.offline.create_sessions') }))
+  }, [setFolderOfflineNotice])
   const createChatInFolder = useCallback((folderId: string, opts?: { columnId?: string; focus?: boolean; memoryMode?: 'incognito' | 'temporary'; inNewTab?: boolean }) => {
+    // Refused at the SINK: the menu rows that reach here are gated one by one,
+    // but the folder-row quick-create `+` buttons call it too. Gating here covers
+    // every caller at once, including the ancestor-expanding PATCH loop below,
+    // which would otherwise fire a doomed `collapsed: false` write per ancestor.
+    if (!connected) {
+      refuseCreateOffline()
+      return
+    }
     // A nested folder selected from the create menu may be hidden behind one
     // or more collapsed ancestors. Expand the complete path optimistically so
     // the destination and its new session are visible as creation begins.
@@ -150,8 +166,8 @@ export function useFolderChatCreate({ folders, mode, dispatch, dropSlotMutation,
       currentId = folder.parent_id || undefined
     }
     createChatInFolderMutation.mutate({ folderId, columnId: opts?.columnId, focus: opts?.focus, attempt: ++folderCreateAttemptRef.current, memoryMode: opts?.memoryMode, inNewTab: opts?.inNewTab })
-  }, [createChatInFolderMutation, folders, updateFolderMutation, clearBoardCollapse])
-  return { folderCreateError, setFolderCreateError, createChatInFolder }
+  }, [createChatInFolderMutation, folders, updateFolderMutation, clearBoardCollapse, connected, refuseCreateOffline])
+  return { folderCreateError, setFolderCreateError, createChatInFolder, refuseCreateOffline }
 }
 
 /** The New chat variants and the Crew Members door. */

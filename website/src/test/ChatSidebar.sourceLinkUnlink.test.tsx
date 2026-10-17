@@ -419,9 +419,11 @@ describe('source-link removal through the existing session menu', () => {
     expect(hideAllEntry()).toHaveAttribute('data-disabled')
     expect(removal(701)).toHaveAttribute('data-disabled')
     await act(async () => { reject(new Error('store unavailable')) })
-    expect(await screen.findByTestId('session-source-unlink-error')).toHaveTextContent('Could not hide. Try again.')
     // The stop says how far the walk got inside the same alert, and the entry is back to idle.
-    expect(screen.getByTestId('session-source-unlink-error')).toHaveTextContent('Stopped after hiding 0 of 2 chips.')
+    expect(await screen.findByTestId('session-source-unlink-error')).toHaveTextContent('Stopped after hiding 0 of 2 chips.')
+    // The retry line says where to retry; the generic single-chip "Try again" would contradict the count.
+    expect(screen.getByTestId('session-source-unlink-error')).toHaveTextContent('To try again, hide the rest from this menu.')
+    expect(screen.getByTestId('session-source-unlink-error')).not.toHaveTextContent('Could not hide. Try again.')
     expect(hideAll()).not.toHaveAttribute('data-disabled')
     expect(unlinkMock).toHaveBeenCalledTimes(1)
     expect(chip()).toBeInTheDocument(); expect(chip(701)).toBeInTheDocument()
@@ -434,6 +436,7 @@ describe('source-link removal through the existing session menu', () => {
     renderSidebar(); await openMenu()
     fireEvent.click(hideAll()); fireEvent.click(confirmHideAll())
     expect(await screen.findByTestId('session-source-unlink-error')).toHaveTextContent('Stopped after hiding 1 of 2 chips.')
+    expect(screen.getByTestId('session-source-unlink-error')).toHaveTextContent('To try again, hide the rest from this menu.')
     expect(unlinkMock).toHaveBeenCalledTimes(2)
     await waitFor(() => expect(chip()).toBeNull())
     expect(chip(701)).toBeInTheDocument()
@@ -442,6 +445,7 @@ describe('source-link removal through the existing session menu', () => {
     await waitFor(() => expect(unlinkMock).toHaveBeenCalledTimes(3))
     await waitFor(() => expect(screen.getByTestId('session-source-unlink-error')).not.toHaveTextContent('Stopped after'))
     expect(screen.getByTestId('session-source-unlink-error')).toHaveTextContent('Could not hide. Try again.')
+    expect(screen.getByTestId('session-source-unlink-error')).not.toHaveTextContent('hide the rest')
   })
   it('waits for the full list before "hide all" and then hides the off-preview chips too', async () => {
     const list = rows(); list[0].source_links = list[0].source_links!.slice(0, 1)

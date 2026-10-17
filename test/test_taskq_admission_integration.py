@@ -27,6 +27,8 @@ from kiro_crew.subagent_manager.admission import (
 )
 from kiro_crew.taskq import model
 from kiro_crew.taskq.store import TaskStore, TaskStoreUnavailable
+from kiro_crew.testing.wait import async_wait_until, await_until
+from kiro_crew.testing.wait import finished as _finished
 
 pytestmark = pytest.mark.usefixtures("healthy_host_memory")
 
@@ -1115,35 +1117,35 @@ async def test_stop_all_between_claim_and_start_keeps_the_row_stopped(
             patch.object(SubagentManager, "_run", new=_park_run),
         ):
             dispatch = asyncio.create_task(mgr._admission._dispatch_async_impl(params))
-            await asyncio.wait_for(at_claim.wait(), 10)
+            await await_until(at_claim, what="the dispatch reaching its claim")
             if stop_lands == "read_before_claim":
                 stop = asyncio.create_task(mgr.cancel_for_parent(_STOP_PARENT))
-                await asyncio.wait_for(listed.wait(), 10)
+                await await_until(listed, what="the stop listing the parent's rows")
                 assert store.state_of(agent_id) == model.QUEUED
                 release_claim.set()
-                await asyncio.wait_for(claimed.wait(), 10)
+                await await_until(claimed, what="the claim landing")
                 assert store.state_of(agent_id) == model.ADMITTED
                 release_stop.set()
-                stopped = await asyncio.wait_for(stop, 10)
+                stopped = await await_until(stop, what="the stop finishing")
                 resume_after_claim.set()
                 resume_after_reread.set()
             elif stop_lands == "after_claim":
                 release_claim.set()
-                await asyncio.wait_for(claimed.wait(), 10)
+                await await_until(claimed, what="the claim landing")
                 assert store.state_of(agent_id) == model.ADMITTED
                 release_stop.set()
-                stopped = await asyncio.wait_for(mgr.cancel_for_parent(_STOP_PARENT), 10)
+                stopped = await _finished(mgr.cancel_for_parent(_STOP_PARENT), "the stop")
                 resume_after_claim.set()
                 resume_after_reread.set()
             else:
                 release_claim.set()
                 resume_after_claim.set()
-                await asyncio.wait_for(reread.wait(), 10)
+                await await_until(reread, what="the claim's re-read landing")
                 assert store.state_of(agent_id) == model.ADMITTED
                 release_stop.set()
-                stopped = await asyncio.wait_for(mgr.cancel_for_parent(_STOP_PARENT), 10)
+                stopped = await _finished(mgr.cancel_for_parent(_STOP_PARENT), "the stop")
                 resume_after_reread.set()
-            result = await asyncio.wait_for(dispatch, 10)
+            result = await await_until(dispatch, what="the dispatch finishing")
         await settle_store_writes(store, rounds=4)
         await settle_depth_emits(mgr)
 
@@ -1213,7 +1215,9 @@ async def test_a_row_registered_during_stop_alls_read_is_reaped_not_replaced(
     async def _land_held_marks() -> None:
         for fn, args, kwargs, future in held_marks:
             if not future.done():
-                future.set_result(await asyncio.wait_for(real_post(fn, *args, **kwargs), 10))
+                future.set_result(
+                    await _finished(real_post(fn, *args, **kwargs), "the held mark landing")
+                )
 
     try:
         with (
@@ -1222,13 +1226,13 @@ async def test_a_row_registered_during_stop_alls_read_is_reaped_not_replaced(
             patch.object(SubagentManager, "_run", new=_park_run),
         ):
             stop = asyncio.create_task(mgr.cancel_for_parent(_STOP_PARENT))
-            await asyncio.wait_for(listed.wait(), 10)
-            started = await asyncio.wait_for(mgr._admission._dispatch_async_impl(params), 10)
+            await await_until(listed, what="the stop listing the parent's rows")
+            started = await _finished(mgr._admission._dispatch_async_impl(params), "the dispatch")
             assert started is not None and mgr._agents[agent_id] is started
             assert agent_id in mgr._tasks and held_marks
             assert store.state_of(agent_id) == model.ADMITTED
             release_stop.set()
-            stopped = await asyncio.wait_for(stop, 10)
+            stopped = await await_until(stop, what="the stop finishing")
             await _land_held_marks()
         await settle_store_writes(store, rounds=4)
 
@@ -1320,18 +1324,18 @@ async def test_a_claim_resumed_between_stop_alls_post_and_answer_refuses_the_sta
             patch.object(SubagentManager, "_run", new=_park_run),
         ):
             dispatch = asyncio.create_task(mgr._admission._dispatch_async_impl(params))
-            await asyncio.wait_for(reread.wait(), 10)
+            await await_until(reread, what="the claim's re-read landing")
             assert store.state_of(agent_id) == model.ADMITTED
             stop = asyncio.create_task(mgr.cancel_for_parent(_STOP_PARENT))
-            await asyncio.wait_for(posted.wait(), 10)
+            await await_until(posted, what="the batch's cancel being posted")
             assert agent_id in batched
-            watch = asyncio.ensure_future(looked.wait())
-            await asyncio.wait({dispatch, watch}, timeout=10, return_when=asyncio.FIRST_COMPLETED)
-            watch.cancel()
-            assert dispatch.done() or looked.is_set()
+            await async_wait_until(
+                lambda: dispatch.done() or looked.is_set(),
+                describe=lambda: f"dispatch done={dispatch.done()} looked={looked.is_set()}",
+            )
             release_answer.set()
-            stopped = await asyncio.wait_for(stop, 10)
-            result = await asyncio.wait_for(dispatch, 10)
+            stopped = await await_until(stop, what="the stop finishing")
+            result = await await_until(dispatch, what="the dispatch finishing")
         await settle_store_writes(store, rounds=4)
 
         assert store.state_of(agent_id) == model.CANCELLED
@@ -1384,12 +1388,12 @@ async def test_a_store_only_cancel_between_claim_and_start_refuses_the_start(
             patch.object(SubagentManager, "_run", new=_park_run),
         ):
             dispatch = asyncio.create_task(mgr._admission._dispatch_async_impl(params))
-            await asyncio.wait_for(claimed.wait(), 10)
+            await await_until(claimed, what="the claim landing")
             assert store.state_of(agent_id) == model.ADMITTED
             assert store.cancel(agent_id, reason="store_only_cancel") == model.ADMITTED
             assert agent_id not in mgr._agents
             resume_after_claim.set()
-            await asyncio.wait_for(dispatch, 10)
+            await await_until(dispatch, what="the dispatch finishing")
         await settle_store_writes(store, rounds=4)
 
         assert agent_id not in mgr._tasks, "a row cancelled in the store never starts"
@@ -1428,7 +1432,7 @@ async def test_a_claim_of_a_row_the_store_never_saw_still_starts(
             patch.object(store, "run", side_effect=_spy),
             patch.object(SubagentManager, "_run", new=_park_run),
         ):
-            started = await asyncio.wait_for(mgr._admission._dispatch_async_impl(params), 10)
+            started = await _finished(mgr._admission._dispatch_async_impl(params), "the dispatch")
 
         assert started is not None and not started.done and not started.queued
         assert mgr._agents[legacy_id] is started and legacy_id in mgr._tasks

@@ -37,14 +37,14 @@ Publishing never changes permissions. See [artifacts](artifacts.md).
 | `src/kiro_crew/agent.py` | `_PIPELINE_CONDUCTOR_SYSTEM_PROMPT`, `_PIPELINE_CONDUCTOR_CORE_GRANTS`, `_PIPELINE_CONDUCTOR_DASHBOARD_GRANTS` |
 | `src/kiro_crew/agent_materialization/conductor_agents.py` | `_install_pipeline_conductor_agent` |
 | `src/kiro_crew/agent_files.py` | `PIPELINE_CONDUCTOR_AGENT_FILENAME`, and its membership in `OWNED_KIRO_AGENT_FILES` |
-| `src/kiro_crew/subagent.py` | `UNADVERTISED_AGENTS` — the conductor is never offered in a rendered agent roster |
+| `src/kiro_crew/subagent_parts/agent_policy.py` | `UNADVERTISED_AGENTS` — the conductor is never offered in a rendered agent roster (read through `kiro_crew.subagent`) |
 | `src/kiro_crew/builtin_skills/pipeline-conductor/SKILL.md` | The operating procedure: pipeline spec, claim preflight, work-order brief, probe cycle and action table, intervention ladder, adjudication and override protocol, admission table, credit rules, `conductor-status/v1`, cleanup |
 | `.../pipeline-conductor/scripts/claim_preflight.py` | One claim verdict per candidate item |
 | `.../pipeline-conductor/scripts/coverage_filter.py` | The batch open-PR exclusion for the queue build |
 | `.../pipeline-conductor/scripts/fleet_probe.py` | The batch patrol probe |
 | `.../pipeline-conductor/scripts/credit_spend.py` | Per-item credit rollup and budget verdict |
 | `.../pipeline-conductor/scripts/spec_check.py` | The spec's closed-value fields, checked once before the run arms |
-| `src/kiro_crew/dashboard/session_control.py` | Worker-session stand-up and control: `create_session`, `send_to_target`, `read_messages`, `stop_target`, `authorize_target` |
+| `src/kiro_crew/dashboard/session_control.py` (facade over `src/kiro_crew/dashboard/session_control_parts/`) | Worker-session stand-up and control: `create_session` (`session_create.py`), `send_to_target` (`session_messaging.py`), `read_messages` (`session_status.py`), `stop_target` (`turn_control.py`), `authorize_target` (`target_authorization.py`) |
 | `src/kiro_crew/session_ledger.py` | The conductor's durable item table and the `[work ledger]` snapshot it must not mistake for the record |
 
 ## The generated agent
@@ -362,9 +362,11 @@ invisible unless it keeps its own list.
   script loses that script's answers instead of gaining a default yes.
 - **The patrol expires silently.** `monitor_start` defaults to 24 cycles, so a
   90-second patrol runs out in well under an hour, long before a fleet drains,
-  and the loop simply stops with no symptom. `max_cycles` is passed explicitly
-  and raised mid-run with `monitor_update`. Coasting into the cap is a failure,
-  not a finish, so `autonudge_stop` is called deliberately.
+  and the loop simply stops with no symptom. `max_cycles` and
+  `max_runtime_secs` are passed explicitly, with the interval times the cycle
+  cap covering the runtime so the runtime is what ends the loop, and both are
+  raised together mid-run with `monitor_update`. Coasting into the cap is a
+  failure, not a finish, so `autonudge_stop` is called deliberately.
 - **The conductor cannot detect its own loop's death from the inside.** The
   procedure bounds what recovery it can and says so.
 - **Credit metering covers dashboard-session turns only.** Inspector `spawn_run`
@@ -425,5 +427,7 @@ derive `permissions` from the filtered list; all of them mount
 | `test/test_pipeline_conductor_probe_roundtrip.py` | That the probe classifies what the conversation log actually wrote, that the watchdog patterns match the constants the gateway emits, that the index needle matches the real writer, that a raw slot key finds the transcript the dashboard writes, and that `credit_spend.py` sums what the recorder wrote |
 | `test/test_pipeline_conductor_probe_banned_age.py` | That every banned-process line carries a process age or explicit unknown, and PID recycling cannot splice a new process onto stale ownership/age evidence |
 | `test/test_pipeline_conductor_claim_preflight.py` | The claim verdict lattice: merged-PR coverage and its near misses, fork PRs, prose self-claims, the `forge_claim` ownership check (foreign label or assignee skips, own claim exempt), closure requests outranking claims, and absent-symbol risk handling |
+| `test/test_pipeline_conductor_claim_preflight_check_detectors.py` | The detectors on their own: the guard every closure pattern ships with, item-scoped closure forms, the untrusted-fork annotation, closing-reference matching, symbol extraction and recency risk |
+| `test/test_pipeline_conductor_claim_preflight_end_to_end.py` | `main()` over a stubbed forge and a real git: a partial scan keeping what it confirmed, the read-only guard, every verdict's exit code and printed line, argument handling and the git flags |
 | `test/test_pipeline_conductor_fleet_probe.py` | The fleet probe's own failure directions: reports recognised only in protocol form, sticky reports outliving heartbeats, tool rows never classifying, the index counting only session-produced rows, ownership failing toward `unknown`, and derived paths a config cannot widen |
 | `test/test_pipeline_conductor_coverage_filter.py` | The batch coverage exclusion: that a closing keyword aimed at the item in a pull request's own title or body is coverage while a bare reference is `MENTIONED` and leaves the item in the queue, that fork and draft PRs count while a neighbouring number does not, that an unreadable forge exits 3 with no `uncovered` list, that the filter writes nothing, and that its reference vocabulary agrees with `claim_preflight.py`'s |

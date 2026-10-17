@@ -37,6 +37,7 @@ sandbox posture at their defining modules.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -45,6 +46,8 @@ if TYPE_CHECKING:
 
     from kiro_crew.agent_sdk.context import ContextPromptProvider
 
+logger = logging.getLogger(__name__)
+
 __all__ = [
     "EntitlementRevalidating",
     "catalog_row_would_drop",
@@ -52,6 +55,8 @@ __all__ = [
     "projected_session_mcp_servers",
     "agent_spec_mcp_refs",
     "claude_adapter_cached_negative",
+    "claude_adapter_honours_session_options",
+    "goose_side_home_supported",
     "claude_adapter_install_command",
     "claude_components_resolve",
     "derived_agent_permissions",
@@ -62,6 +67,7 @@ __all__ = [
     "kiro_cli_resolves",
     "narrowed_agent_permissions",
     "provider_error_client",
+    "provider_label",
     "resolve_pin_spelling",
     "resolve_pin_spelling_on",
     "resolve_usable_model",
@@ -163,6 +169,20 @@ def resolve_usable_model(preferred: str, advertised: object, *, backend: str = "
     from kiro_crew.acp.client import resolve_usable_model as _impl
 
     return _impl(preferred, advertised, backend=backend)  # type: ignore[arg-type]
+
+
+def provider_label(provider: object) -> str:
+    """The backend identity key a session or run persists for *provider*.
+
+    Thin delegation to :func:`kiro_crew.providers.acp.provider_label`, so the
+    sub-agent run surface reaches it through the SDK surface instead of
+    importing the providers layer (the agent-sdk-boundary gate refuses a new
+    edge). Plain data out. Function-local import for the same reason as
+    :func:`resolve_pin_spelling`.
+    """
+    from kiro_crew.providers.acp import provider_label as _impl
+
+    return _impl(provider)
 
 
 def catalog_row_would_drop(model_id: str, advertised: object) -> bool:
@@ -465,6 +485,49 @@ def claude_adapter_cached_negative() -> bool:
     except Exception:
         return False
     return not argv
+
+
+def goose_side_home_supported() -> bool:
+    """Whether a goose Side Chat session can be started on a goose home of its own.
+
+    The read-only shape of a goose side or thread-reply session depends on it
+    (``acp.harness.goose.side_home_supported``); off it the turn runs no tools.
+    """
+    from kiro_crew.acp.harness.goose import side_home_supported
+
+    return side_home_supported()
+
+
+def claude_adapter_honours_session_options() -> bool:
+    """Whether the installed claude-agent-acp is at or above the options floor.
+
+    ``CLAUDE_ACP_SETTING_SOURCES_MIN_VERSION`` is where the adapter is verified to
+    spread ``_meta.claudeCode.options`` into the session, which the read-only
+    shape of a Side Chat or thread-reply session depends on. A missing adapter, or
+    one whose version cannot be read, answers False. The spawn's own cached
+    resolution is read first, as :func:`claude_adapter_cached_negative` does.
+    Blocking (resolves the adapter and reads its package.json); call it off the loop.
+    """
+    from kiro_crew.acp import client as _client
+
+    resolution = _client._claude_acp_argv_cache
+    if resolution is _client._UNRESOLVED:
+        resolution = _client._resolve_claude_acp_bin()
+    argv = resolution[0] if isinstance(resolution, tuple) else None
+    if not argv:
+        return False
+    version = _client._claude_adapter_installed_version(argv)
+    if _client._claude_adapter_honours_setting_sources(version):
+        return True
+    logger.warning(
+        "claude-agent-acp %r is not verified to honour session options (needs %s or "
+        "newer), so Side Chat and thread replies run without tools. Upgrade with "
+        "'npm i -g %s'.",
+        _client._scrub_observed(version),
+        ".".join(str(part) for part in _client.CLAUDE_ACP_SETTING_SOURCES_MIN_VERSION),
+        _client.CLAUDE_ACP_NPM_PKG,
+    )
+    return False
 
 
 def codex_adapter_resolves() -> bool:
@@ -848,14 +911,15 @@ def skill_view_source_agent(name: str) -> str | None:
 
 
 def skill_view_sidecar_dirs() -> tuple[str, str]:
-    """``(metadata, leases)``: the two non-spec directory names beside the aliases.
+    """``(metadata, leases)``: where this home keeps the projection's side files.
 
-    For messages that point an operator at them; their contents stay the
-    projection module's business.
+    Absolute paths under the Kiro Crew data home (never beside the aliases in
+    the agents directory), for messages that point an operator at them; their
+    contents stay the projection module's business.
     """
     from kiro_crew.acp.skill_projection import (
-        _PROJECTION_LEASE_DIR_NAME,
-        _PROJECTION_METADATA_DIR_NAME,
+        _projection_lease_dir,
+        _projection_metadata_dir,
     )
 
-    return (_PROJECTION_METADATA_DIR_NAME, _PROJECTION_LEASE_DIR_NAME)
+    return (str(_projection_metadata_dir()), str(_projection_lease_dir()))

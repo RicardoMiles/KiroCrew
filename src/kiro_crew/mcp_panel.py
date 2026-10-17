@@ -182,7 +182,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "learned rather than restating the whole dashboard. Every refusal "
                 "is recorded in your mistake book, which dashboard_fields hands "
                 "back -- so the same wrong guess next cycle is one you were "
-                "already told about."
+                "already told about. To EMPTY an array or object field, pass "
+                "`clear: true` and no `value`: an MCP client can drop `value: []` "
+                "or `value: {}` from the call before it reaches this tool, while a "
+                "boolean arrives intact."
             ),
             "inputSchema": {
                 "type": "object",
@@ -200,11 +203,105 @@ def _tool_definitions() -> list[dict[str, Any]]:
                             "field takes a number and not a string holding one; a "
                             "`boolean` field takes true or false and not 1; an "
                             "`array` field takes the whole series and the page's own "
-                            "script walks it."
+                            "script walks it. Required unless `clear` is true."
+                        ),
+                    },
+                    "clear": {
+                        "type": "boolean",
+                        "description": (
+                            "true empties the field: an `array` field gets `[]` and "
+                            "an `object` field gets `{}`. Use it instead of "
+                            "`value: []` or `value: {}`, and leave `value` out."
                         ),
                     },
                 },
-                "required": ["field", "value"],
+                "required": ["field"],
+            },
+        },
+        {
+            "name": "dashboard_save",
+            "description": (
+                "SAVE the page you composed and PUT IT LIVE as YOUR crewmate's "
+                "Dashboard. A page is three declarations and this call saves all "
+                "three at once: a "
+                "`model` naming the fields the page holds and where each value "
+                "comes from, a `view` laying out the blocks that draw them, and a "
+                "`theme` of tokens. Read dashboard_fields first -- it tells you "
+                "the page in force -- and tell the person what you are changing, "
+                "because the page is theirs. A field reads either from a crew-log fold "
+                '(`{"fold": <name>, "path": <dotted keys>}`, filled by the '
+                'gateway) or from you (`{"agentic": true}`) -- never a number you '
+                "type into the layout, which would be true only at the moment you "
+                "typed it. The "
+                "block types and data types come from a CLOSED catalog, so a "
+                "package naming one that does not exist is refused and the refusal "
+                "lists the ones that do: recompose from that list. NAME YOUR FIELDS "
+                "AND BLOCKS FOR A READER -- `open_prs`, not a token. A name a "
+                "redactor would mask is refused, because a name is a key the page "
+                "joins its cells by and cannot be rewritten on the way out; the "
+                "refusal tells you which position to rename. Values never version "
+                "and never belong in a package. This call STORES the page as your "
+                "own dashboard package; dashboard_apply with no arguments then puts "
+                "it live as a new version -- no preview step. Once live, "
+                "dashboard_write keeps working on its agentic fields and "
+                "dashboard_fields lists them. To go back, dashboard_rollback to the "
+                "version you were on -- a template version brings the template "
+                "page back."
+                " A page you write as `view.html` is RUN once by the gateway over a "
+                "SYNTHETIC copy of your crewmate's current data (the same shape with "
+                "invented values, so a page never sees the record; a key is kept only if "
+                "your page spells it out or the dashboard type catalog lists it), and the "
+                "reply carries a `verification` block: `passed`, `failed` with each script "
+                "error and the `view.html` line and column it was thrown at, `timed_out` "
+                "when the run hit its time limit, or `skipped` with the reason. Fix a "
+                "failed page and save again BEFORE you dashboard_apply it. The run is "
+                "offline: a library the page loads from the CDN allowlist is not fetched, "
+                "and a page whose script stops at that library's name is `skipped`, not "
+                "`failed`. The page is checked as the dashboard shows it: the gateway's "
+                "secret filter rewrites text in a page that looks like a key (a long run "
+                "of letters and digits can), and when it did the reply says how many "
+                "places and which line the first is on. One page is checked at a time "
+                "across the gateway, so a save that finds it busy, or a machine short of "
+                "memory, is `skipped` and does not wait. The save waits for the run, "
+                "usually about a second and never more than about twelve."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "model": {
+                        "type": "object",
+                        "description": (
+                            "The fields the page holds, as "
+                            '`{"types": {<field_name>: {...}}}`. Each field names '
+                            "a data type (`number`, `text`, `bool`, `timestamp`, "
+                            "`enum`) and a `source`, and may carry a `label` and "
+                            "`description` a reader sees. Field names are "
+                            "lowercase letters, digits and underscores."
+                        ),
+                    },
+                    "view": {
+                        "type": "object",
+                        "description": (
+                            'The layout, as `{"blocks": [...]}`, in the order a '
+                            "reader meets them -- that order IS the layout. Each "
+                            "block carries an `id`, a `type` from the block "
+                            "catalog, the `fields` it draws (every one declared by "
+                            "the model) and an optional `title`."
+                        ),
+                    },
+                    "theme": {
+                        "type": "object",
+                        "description": (
+                            'Look, as `{"tokens": {"--name": "value"}}`, with an '
+                            'optional `"css"` string beside it for rules the '
+                            "tokens cannot express. None of "
+                            "the look is fixed by the product, so this is where "
+                            "you set it. An empty `tokens` object is valid and "
+                            "takes the defaults."
+                        ),
+                    },
+                },
+                "required": ["model", "view", "theme"],
             },
         },
         {
@@ -240,13 +337,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "NOTHING IS RECORDED: their current page is untouched, no version "
                 "is written, and the answer carries a link they open to see it. "
                 "Name a `template_id` from dashboard_templates -- that is the only "
-                "argument. You CANNOT preview a page you wrote yourself: a "
-                "dashboard page runs its own script against this crewmate's task "
-                "titles and summaries in a frame that can navigate itself, so only "
-                "pages that shipped with the product are rendered. Custom "
-                "templates come later. ALWAYS show a preview and ask before you "
-                "apply: the page is the person's, not yours, and a page swapped "
-                "without asking is one they have to undo. While the person has "
+                "argument. A preview is OPTIONAL, never a step before applying: use "
+                "it only when the person asks to look first. dashboard_apply with "
+                "the `template_id` puts it live. A page you composed yourself is "
+                "saved with dashboard_save, not previewed here. While the person has "
                 "locked the layout (your [DASHBOARD] block says LOCKED), you can "
                 "still preview a page for them to look at, but do not apply it: "
                 "ask them to unlock it first."
@@ -270,21 +364,36 @@ def _tool_definitions() -> list[dict[str, Any]]:
         {
             "name": "dashboard_apply",
             "description": (
-                "Keep the page you previewed. This is the answer to the person "
-                "saying yes, and it takes NO arguments on purpose: what it "
-                "installs is the page that was staged, so it cannot differ from "
-                "the one they were shown. The previous version stays on disk, so "
-                "dashboard_rollback can go back to it. Refused with "
+                "Put a page live on your crewmate's Dashboard, now, as a new "
+                "version -- there is no preview step. Pass a `template_id` from "
+                "dashboard_templates to use a shipped or operator page, or pass "
+                "nothing to put live the page you saved with dashboard_save. Every "
+                "earlier version stays on disk, so dashboard_rollback goes back in "
+                "one call. Tell the person what you changed. Refused with "
                 "`dashboard_locked` while the page is locked (your [DASHBOARD] "
-                "block says LOCKED). While locked you can still preview."
+                "block says LOCKED)."
             ),
-            "inputSchema": {"type": "object", "properties": {}},
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "template_id": {
+                        "type": "string",
+                        "maxLength": 64,
+                        "description": (
+                            "A template id dashboard_templates listed. Omit it to "
+                            "put live the page you saved with dashboard_save."
+                        ),
+                    },
+                },
+            },
         },
         {
             "name": "dashboard_rollback",
             "description": (
                 "Go BACK to an earlier version of your crewmate's page -- the "
-                "answer to the person saying 'go back'. dashboard_fields lists the "
+                "answer to the person saying 'go back'. A version can be a template "
+                "page or a page you saved with dashboard_save, and the one you "
+                "restore is the one that draws. dashboard_fields lists the "
                 "versions you can still reach; a version the store has dropped is "
                 "refused, so read that list rather than guessing. A rollback moves "
                 "FORWARD: restoring version 1 over version 2 writes version 3, so "
@@ -419,14 +528,25 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         field = args.get("field")
         if not isinstance(field, str) or not field.strip():
             return "Error: `field` must name the dashboard field to fill"
-        if "value" not in args:
+        to_write: Any
+        clear = args.get("clear") is True
+        if not clear and "value" not in args:
             return "Error: `value` is required -- there is nothing to write without it"
         sk, err = _strict_session_key()
         if err:
             return err
+        if clear:
+            # The empty value is spelled HERE, not by the caller: an MCP client that
+            # drops an empty container from a call's arguments delivers a boolean
+            # intact. Which empty value depends on the field's declared type, read
+            # from the same list dashboard_fields shows; the gateway still
+            # type-checks the write like any other.
+            to_write = _empty_value_for(field, sk)
+        else:
+            to_write = args["value"]
         d = _post(
             "/api/agent-panel/dashboard/write",
-            {"field": field, "value": args["value"]},
+            {"field": field, "value": to_write},
             session_key=sk,
         )
         api_err = d.get("error")
@@ -443,6 +563,36 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             f"({written.get('type', 'value')}) to your dashboard."
             + (" It corrected an earlier refused write." if d.get("corrected") else "")
         )
+
+    if name == "dashboard_save":
+        # THE THREE, named one by one rather than forwarded as ``args``. The
+        # gateway fills the package's other two keys -- ``kind`` and the
+        # ``bound_to`` that decides whose tab renders this page -- from the caller
+        # it vetted, so building the payload from an explicit list is what makes a
+        # fourth key impossible to pass through from here. The gateway refuses one
+        # too; this is the half that cannot send it.
+        page: dict[str, Any] = {}
+        for key in ("model", "view", "theme"):
+            part = args.get(key)
+            if not isinstance(part, dict):
+                return (
+                    f"Error: `{key}` must be an object -- a page is a `model`, a "
+                    "`view` and a `theme`, and all three are saved together"
+                )
+            page[key] = part
+        sk, err = _strict_session_key()
+        if err:
+            return err
+        d = _post("/api/agent-panel/dashboard/save", page, session_key=sk)
+        api_err = d.get("error")
+        if api_err:
+            # WHOLE, like a refused write. A package refusal names the key path,
+            # what was wrong with it, and for a closed catalog the values that
+            # would have been taken -- which is the list the next compose is built
+            # from. Shortened to a generic failure it would cost a cycle and teach
+            # nothing.
+            return redact(f"Error: {api_err}")
+        return redact(_render_saved(d.get("saved") or {}, d.get("verification")))
 
     if name == "dashboard_templates":
         query = args.get("query")
@@ -481,16 +631,27 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         return redact(_render_preview(d.get("preview") or {}))
 
     if name == "dashboard_apply":
+        template_id = args.get("template_id")
+        if template_id is not None and (
+            not isinstance(template_id, str) or not template_id.strip()
+        ):
+            return "Error: `template_id` must be a template id from dashboard_templates"
         sk, err = _strict_session_key()
         if err:
             return err
-        d = _post("/api/agent-panel/dashboard/apply", {}, session_key=sk)
+        applying: dict[str, Any] = {} if template_id is None else {"template_id": template_id}
+        d = _post("/api/agent-panel/dashboard/apply", applying, session_key=sk)
         api_err = d.get("error")
         if api_err:
             return redact(f"Error: {api_err}")
+        shown = (
+            "the page you saved with dashboard_save"
+            if d.get("package")
+            else f"template `{d.get('template_id')}`"
+        )
         return redact(
-            f"Your crewmate's page is now version {d.get('instance_version')}, "
-            f"from template `{d.get('template_id')}`." + _guide_tail(d)
+            f"LIVE: your crewmate's page is now version {d.get('instance_version')}, "
+            f"{shown}. dashboard_rollback goes back to any earlier version." + _guide_tail(d)
         )
 
     if name == "dashboard_rollback":
@@ -526,6 +687,104 @@ def _guide_tail(d: dict[str, Any]) -> str:
     """
     block = d.get("dashboard")
     return f"\n\n{block}" if isinstance(block, str) and block else ""
+
+
+_ERROR_LABELS = {
+    "rejection": "unhandled promise rejection: ",
+    "csp": "refused by the frame's policy: ",
+}
+
+
+#: What the agent is told the page ran over, when it ran over anything.
+_SYNTHETIC = (
+    "a synthetic copy of your crewmate's current data (the same shape with invented values)"
+)
+
+
+def _error_lines(verification: dict[str, Any]) -> list[str]:
+    """The numbered errors of a ``failed`` or ``timed_out`` block, each with its position."""
+    errors = [e for e in verification.get("errors") or [] if isinstance(e, dict)]
+    lines = []
+    for number, error in enumerate(errors, start=1):
+        where = ""
+        if error.get("line") is not None:
+            where = f" (view.html line {error['line']}"
+            if error.get("column") is not None:
+                where += f", column {error['column']}"
+            where += ")"
+        label = _ERROR_LABELS.get(str(error.get("kind")), "")
+        lines.append(f"  {number}. {label}{error.get('message')}{where}")
+    hidden = int(verification.get("omitted") or 0)
+    if hidden:
+        lines.append(f"  ... and {hidden} more.")
+    return lines
+
+
+def _render_verification(verification: Any) -> list[str]:
+    """The ``verification`` block of a save reply, as lines for the agent.
+
+    Leads with the verdict, because the verdict decides what the agent does next: a
+    ``failed`` page is fixed and saved again before anyone is told about it. Each error
+    carries where it was thrown, as a position in the agent's own ``view.html``, which is
+    the one thing it cannot find out from its own session. A page that ran says what it
+    ran over: a copy with the record's shape and invented values.
+    """
+    if not isinstance(verification, dict):
+        return []
+    status = verification.get("status")
+    ran_over = _SYNTHETIC if verification.get("data") == "synthetic" else "your crewmate's data"
+    if status == "passed":
+        lines = [
+            f"verification: passed -- the page ran once over {ran_over} and raised no script errors."
+        ]
+    elif status == "skipped":
+        lines = [
+            f"verification: skipped -- {verification.get('reason') or 'the check did not run'}. "
+            "The page was not verified: a script error in it may still be there."
+        ]
+    elif status == "timed_out":
+        errors = _error_lines(verification)
+        lines = [
+            f"verification: timed_out -- {verification.get('reason') or 'the check ran out of time'}. "
+            "The page was not verified. If a script of yours has a loop or a wait that may never "
+            "end, fix it and call dashboard_save again; otherwise call it again."
+        ]
+        lines.extend(errors)
+    elif status == "failed":
+        errors = _error_lines(verification)
+        count = len(verification.get("errors") or []) + int(verification.get("omitted") or 0)
+        lines = [
+            f"verification: failed -- the page ran once over {ran_over} and raised {count} "
+            "error(s). Fix them and call dashboard_save again before you describe the page "
+            "to the person."
+        ]
+        lines.extend(errors)
+    else:
+        return []
+    lines.extend(f"  note: {note}" for note in verification.get("notes") or [])
+    return lines
+
+
+def _render_saved(saved: dict[str, Any], verification: Any = None) -> str:
+    """What was SAVED, the page check's verdict, and the one call that puts it live.
+
+    The verdict comes before the next step: a ``failed`` page is fixed and saved again
+    before it is applied.
+    """
+    lines = [
+        f"SAVED as your dashboard package ({saved.get('fields')} field(s) in "
+        f"{saved.get('blocks')} block(s)). It is not live yet."
+    ]
+    checked = _render_verification(verification)
+    if checked:
+        lines.append("")
+        lines.extend(checked)
+    lines.append("")
+    lines.append(
+        "Next: call dashboard_apply with no arguments to put it on your crewmate's "
+        "Dashboard as a new version."
+    )
+    return "\n".join(lines)
 
 
 def _render_templates(payload: dict[str, Any]) -> str:
@@ -579,8 +838,8 @@ def _render_templates(payload: dict[str, Any]) -> str:
                 lines.append(f"  {row.get('template')}: {row.get('problem')}")
     lines.append("")
     lines.append(
-        "Next: dashboard_preview the one that fits, show the person the link, and only "
-        "call dashboard_apply once they say yes."
+        "Next: dashboard_apply with the template_id that fits. dashboard_preview it "
+        "first only if the person wants to look before choosing."
     )
     return "\n".join(lines)
 
@@ -715,8 +974,9 @@ def _render_preview(preview: dict[str, Any]) -> str:
         lines.append(f"It shows: {', '.join(str(f) for f in fields)}.")
     lines.append("")
     lines.append(
-        "ASK the person whether to keep it. dashboard_apply if they say yes; stage "
-        "another one if they do not. Do not apply a page nobody has looked at."
+        f"dashboard_apply with template_id `{preview.get('template_id')}` puts it live. "
+        "The person may also press Keep or Discard on the preview themselves, so "
+        "re-read your [DASHBOARD] block before calling dashboard_apply."
     )
     return "\n".join(lines)
 
@@ -833,6 +1093,30 @@ def _render_fields(payload: dict[str, Any]) -> str:
             f"list and retry; after {budget} tries, ask the human."
         )
     return "\n".join(lines)
+
+
+def _empty_value_for(field: str, sk: str) -> Any:
+    """The value ``clear: true`` writes to *field*: ``{}`` for an object field, else ``[]``.
+
+    The type comes from the field list ``dashboard_fields`` shows, which is the
+    declared type the write route checks against. Nothing is refused here. The write
+    route answers every clear: a string, number or boolean field with ``wrong_type``,
+    a fold-sourced field with ``field_not_agentic`` and a field the list does not name
+    with ``unknown_field``, each recorded in the mistake book. A refusal here would
+    repeat that answer and keep it out of the book.
+
+    A field list that cannot be read gets ``[]`` as well, so emptying an array field
+    does not depend on the fields route answering. An object field cleared then is
+    refused by the write route as ``wrong_type``, and the next clear that can read
+    the list writes ``{}``.
+    """
+    d = _get("/api/agent-panel/dashboard/fields", session_key=sk)
+    rows = None if d.get("error") else d.get("fields")
+    if isinstance(rows, list):
+        for row in rows:
+            if isinstance(row, dict) and row.get("field") == field:
+                return {} if row.get("type") == "object" else []
+    return []
 
 
 def _call_tool(name: str, raw_args: dict[str, Any]) -> str:

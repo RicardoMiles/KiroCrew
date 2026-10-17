@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef } from 'react'
+import { useCallback, useLayoutEffect, useMemo, useRef } from 'react'
 import type { useImeGuard } from '../../hooks/useImeGuard'
 import type { PasteBlock } from '../../utils/pasteTokens'
 import type { ComposerControl } from '../composerControl'
@@ -75,6 +75,9 @@ export function usePromptHistory() {
       // Only intercept when input is empty OR caret is collapsed at position 0.
       const atStart = ta.selectionStart === 0 && ta.selectionEnd === 0
       if (!atStart && cur !== '') return
+      // A held ↑ scrolling up through the user's own draft stops at its start;
+      // a fresh press recalls, and a held ↑ keeps walking recalled prompts.
+      if (e.repeat && !cursor && cur !== '') return
     } else {
       if (!cursor) return // not in history mode — let textarea handle
       // Only intercept when caret is at end (so multi-line edits still navigate within).
@@ -126,8 +129,11 @@ export function useUndoHistory({ value, pasteBlocks, autoFocusKey, composerContr
   const prevUndoAfkRef = useRef(autoFocusKey)
   const slotSettlingRef = useRef(false)
 
-  // Record undo snapshots as the controlled value changes.
-  useEffect(() => {
+  // Record undo snapshots as the controlled value changes. A layout effect
+  // records in the same commit that puts the value on screen: a passive
+  // effect can run a scheduler task later, and a Ctrl/Cmd+Z pressed in that
+  // gap would find no entry for the text the user can already see.
+  useLayoutEffect(() => {
     const selection = composerControl()?.getSelection()
     // Consume the "this change came from a DOM edit" flag exactly once per run.
     const fromUser = valueFromUserRef.current

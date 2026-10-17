@@ -418,14 +418,14 @@ def _tool_definitions() -> list[dict[str, Any]]:
             "description": (
                 "Read the work ledger this conductor session owns: the conductor "
                 "record, every item with all its fields, each item's derived 'orphaned', "
-                "'stale', 'acceptance_concrete' and 'unpatrolled' flags, the newest "
-                "events per item, and "
+                "'stale', 'acceptance_concrete', 'unpatrolled' and 'pending_overdue' "
+                "flags, the newest events per item, and "
                 "a ready-to-pipe 'accept_batch' document for the goal-conductor skill's "
                 "accept_eval.py. The ledger is your own. With no arguments that is the "
                 "whole board, each item with its last 20 events; every argument NARROWS "
                 "it. compact=true is the cheap patrol read: per item only item_id, title, "
                 "state, created_at, status, reason, summary, decision, verdict, pr, worker_session_key, "
-                "last_report_at and the four flags — no events, acceptance or "
+                "last_report_at and the five flags — no events, acceptance or "
                 "accept_batch. item_id=<id> reads one item in full; state= and since= "
                 "select rows (accept_batch is always the whole board); events=<n> "
                 "shortens the tails. A reply over the tool-result budget is trimmed to "
@@ -450,7 +450,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "verdict=fail on and left open counts again, since that hands the retry "
                 "back to the worker. A worker session that has closed after at least one "
                 "report counts as quiet at once, without waiting out the window. "
-                "Answers 'no_ledger' when this session owns "
+                "An item is pending_overdue once its acceptance has read 'pending' for "
+                "24 hours on end (never for a human_approval bar): ask the user, then "
+                "either write its bar again with action=accept, which starts a fresh "
+                "run, or close it. Answers 'no_ledger' when this session owns "
                 "none yet."
             ),
             "inputSchema": {
@@ -482,8 +485,8 @@ def _tool_definitions() -> list[dict[str, Any]]:
                         "type": "boolean",
                         "description": (
                             "Status columns and the orphaned / stale / "
-                            "acceptance_concrete / unpatrolled flags only — no events, "
-                            "acceptance or accept_batch."
+                            "acceptance_concrete / unpatrolled / pending_overdue flags "
+                            "only — no events, acceptance or accept_batch."
                         ),
                     },
                 },
@@ -509,9 +512,10 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "round (and opens the ledger); 'create' mints an item from title + "
                 "acceptance; 'bind' attaches a worker session key to an item — do this "
                 "BEFORE seeding that session, so the worker never starts unbound. When "
-                "your session has no loop, a bind also arms a default work-ledger "
-                "patrol on it (the reply's 'patrol' says armed, existing, refused or "
-                "unsupported, and 'patrol_note' says what to do when none runs); your "
+                "your session has no active loop (none, or one the system stopped), a "
+                "bind also arms a default work-ledger patrol on it; a loop a person "
+                "stopped is kept. The reply always ends 'patrol=<armed|existing|"
+                "refused|unsupported> (<reason>)', plus what to do when none runs; your "
                 "own monitor_start replaces that default; "
                 "'decide' records what you decided and why (the one field a worker reads "
                 "as an instruction); 'verdict' records accept_eval.py's verdict and the "
@@ -745,11 +749,16 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         item = resp.get("item") or {}
         action = resp.get("action") or payload.get("action") or ""
         if item:
-            return (
+            line = (
                 f"Recorded {action}. item={item.get('item_id') or '(unknown)'} "
                 f"state={item.get('state') or '(unset)'} "
                 f"verdict={item.get('verdict') or '(none)'}"
             )
+            if action == "bind":
+                from kiro_crew.conductor_patrol import reply_line
+
+                line += reply_line(resp)
+            return line
         conductor = resp.get("conductor") or {}
         return f"Recorded {action}. round={conductor.get('round', '(unset)')}"
 

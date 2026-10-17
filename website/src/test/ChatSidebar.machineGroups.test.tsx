@@ -94,7 +94,7 @@ const liveSlot = (key: string, title: string, extra: Partial<ChatSlot> = {}): Ch
   last_turn_ts: ago(60_000), ...extra,
 } as ChatSlot)
 
-function renderSidebar({ activeSlot = 's-local', relay = false, relayFolder, relayParent, onSelectSlot }: {
+function renderSidebar({ activeSlot = 's-local', relay = false, relayFolder, relayParent, relayExtra, onSelectSlot, onOpenPeerSession }: {
   activeSlot?: string
   /** Adds a LOCAL slot whose turns run on `inst-a` (`executor: 'remote'`). */
   relay?: boolean
@@ -102,13 +102,17 @@ function renderSidebar({ activeSlot = 's-local', relay = false, relayFolder, rel
   relayFolder?: string
   /** Makes the plain local slot the relay slot's creator, so the conductor lane exists. */
   relayParent?: boolean
+  /** More fields on that relay slot. */
+  relayExtra?: Partial<ChatSlot>
   onSelectSlot?: (key: string) => void
+  onOpenPeerSession?: (instanceId: string, key: string) => void
 } = {}) {
   const slots = [
     liveSlot('s-local', 'LOCAL plain slot'),
     ...(relay ? [liveSlot('s-relay', 'RELAY slot', {
       executor: 'remote', instance_id: 'inst-a', ...(relayFolder ? { folder_id: relayFolder } : {}),
       ...(relayParent ? { parent: { slot: 's-local', key: 's-local' } } : {}),
+      ...relayExtra,
     } as Partial<ChatSlot>)] : []),
   ]
   const store = createTestStore({
@@ -135,7 +139,8 @@ function renderSidebar({ activeSlot = 's-local', relay = false, relayFolder, rel
         <ThemeProvider>
           <MemoryRouter>
             <ChatSidebar slots={slots} activeSlot={activeSlot} unreadSlots={[]} history={[]}
-              historyHasMore={false} defaultAgent={'default'} installedAgents={[]} onSelectSlot={onSelectSlot} />
+              historyHasMore={false} defaultAgent={'default'} installedAgents={[]} onSelectSlot={onSelectSlot}
+              onOpenPeerSession={onOpenPeerSession} />
           </MemoryRouter>
         </ThemeProvider>
       </Provider>
@@ -454,5 +459,213 @@ describe('ChatSidebar – spaces inside a crew group', () => {
     const notice = within(group).getByTestId('crew-group-spaces-error-inst-a')
     expect(notice).toHaveTextContent('peer down')
     expect(notice).toHaveTextContent(S.crew_spaces_unavailable.replace('{{name}}', 'astro'))
+  })
+})
+
+describe('ChatSidebar – what a crew group header says needs you', () => {
+  // The instances query, then the crew's slots: bounded so a loaded runner fails
+  // on the chain, not on the default deadline.
+  const CHAIN_WAIT = { timeout: 5_000 }
+  const peerRow = (key: string, title: string, extra: Record<string, unknown> = {}) => ({
+    ...PEER_ROW, key, row_identity: `inst-a:${key}`, title, ...extra,
+  })
+  const count = (template: string, n: number) => template.replace('{{count}}', String(n))
+  const chats = (n: number) => count(n === 1 ? S.crew_group_chats_one : S.crew_group_chats_other, n)
+  const approvals = (n: number) => count(n === 1 ? S.crew_attention_approval_one : S.crew_attention_approval_other, n)
+  const questions = (n: number) => count(n === 1 ? S.crew_attention_question_one : S.crew_attention_question_other, n)
+  const working = (n: number) => count(n === 1 ? S.crew_attention_working_one : S.crew_attention_working_other, n)
+  const counts = (...parts: string[]) => new Intl.ListFormat('en', { type: 'unit' }).format(parts)
+  // The button's name: where it goes, then the counts it shows.
+  const nameOf = (target: string, list: string) => S.crew_attention_name.replace('{{target}}', target).replace('{{counts}}', list)
+  const attentionOf = () => screen.queryByTestId('crew-group-attention-inst-a')
+  const targetOf = () => screen.getByTestId('crew-group-attention-target-inst-a').textContent
+  // Newest first: the group draws its rows in the lane's date order.
+  const MIXED = [
+    peerRow('p-run', 'RUN chat', { running: true, last_turn_ts: ago(10_000) }),
+    peerRow('p-approve', 'APPROVE chat', { running: true, pending_approval: true, last_turn_ts: ago(20_000) }),
+    peerRow('p-ask', 'ASK chat', { running: true, needs_input: true, last_turn_ts: ago(30_000) }),
+    peerRow('p-run2', 'RUN2 chat', { running: true, last_turn_ts: ago(40_000) }),
+    peerRow('p-idle', 'IDLE chat', { last_turn_ts: ago(50_000) }),
+  ]
+
+  beforeEach(() => {
+    localStorage.clear()
+    localStorage.setItem(PREVIEW_INSTANCE_SESSIONS, '1')
+    chatFoldersMock.mockReset().mockResolvedValue([])
+    listInstancesMock.mockReset().mockResolvedValue({ instances: [crew('connected')] })
+    instanceChatSlotsMock.mockReset().mockResolvedValue([PEER_ROW])
+    crewPeerGetMock.mockReset().mockResolvedValue([])
+  })
+
+  it('names its count as chats, and draws no attention button when nothing asks', async () => {
+    renderSidebar({ relay: true })
+    const group = await screen.findByTestId('crew-group-inst-a', {}, CHAIN_WAIT)
+    await waitFor(() => expect(rowIn(group, 'REMOTE peer row')).not.toBeNull(), CHAIN_WAIT)
+    expect(screen.getByTestId('crew-group-count-inst-a')).toHaveTextContent(chats(2))
+    expect(attentionOf()).toBeNull()
+  })
+
+  it('counts each row once, approval over question over working, while collapsed', async () => {
+    instanceChatSlotsMock.mockResolvedValue(MIXED)
+    renderSidebar()
+    const group = await screen.findByTestId('crew-group-inst-a', {}, CHAIN_WAIT)
+    await waitFor(() => expect(rowIn(group, 'IDLE chat')).not.toBeNull(), CHAIN_WAIT)
+    fireEvent.click(screen.getByTestId('crew-group-toggle-inst-a'))
+    expect(screen.getByTestId('crew-group-toggle-inst-a')).toHaveAttribute('aria-expanded', 'false')
+
+    expect(screen.getByTestId('crew-group-count-inst-a')).toHaveTextContent(chats(5))
+    const button = attentionOf()!
+    // The approval row is running and the question row is running: neither is
+    // counted as working too.
+    expect(within(button).getByTestId('crew-group-attention-approval-inst-a')).toHaveTextContent(approvals(1))
+    expect(within(button).getByTestId('crew-group-attention-question-inst-a')).toHaveTextContent(questions(1))
+    expect(within(button).getByTestId('crew-group-attention-working-inst-a')).toHaveTextContent(working(2))
+    expect([...button.querySelectorAll('[data-testid^="crew-group-attention-"]:not([data-testid^="crew-group-attention-target-"])')]
+      .map(el => el.textContent))
+      .toEqual([approvals(1), questions(1), working(2)])
+    // The visible text leads with the chat it opens, so the button reads as
+    // opening that chat rather than as answering the approval it counts.
+    expect(targetOf()).toBe(S.crew_attention_go_approval)
+    expect(button.textContent).toBe(S.crew_attention_go_approval + approvals(1) + questions(1) + working(2))
+    // The name is that same text: the target, then the counts.
+    expect(button).toHaveAccessibleName(nameOf(S.crew_attention_go_approval, counts(approvals(1), questions(1), working(2))))
+  })
+
+  it('opens the first approval in draw order, above a newer working chat, and expands the group', async () => {
+    instanceChatSlotsMock.mockResolvedValue([
+      ...MIXED,
+      peerRow('p-approve-old', 'OLDER APPROVE chat', { pending_approval: true, last_turn_ts: ago(60_000) }),
+    ])
+    const onOpenPeerSession = vi.fn()
+    const onSelectSlot = vi.fn()
+    renderSidebar({ onOpenPeerSession, onSelectSlot })
+    const group = await screen.findByTestId('crew-group-inst-a', {}, CHAIN_WAIT)
+    await waitFor(() => expect(rowIn(group, 'IDLE chat')).not.toBeNull(), CHAIN_WAIT)
+    const toggle = screen.getByTestId('crew-group-toggle-inst-a')
+    fireEvent.click(toggle)
+    expect(JSON.parse(localStorage.getItem('mc-sidebar-crew-collapsed') ?? '[]')).toEqual(['inst-a'])
+
+    fireEvent.click(attentionOf()!)
+    expect(onOpenPeerSession).toHaveBeenCalledTimes(1)
+    expect(onOpenPeerSession).toHaveBeenCalledWith('inst-a', 'p-approve')
+    expect(onSelectSlot).not.toHaveBeenCalled()
+    expect(toggle).toHaveAttribute('aria-expanded', 'true')
+    expect(JSON.parse(localStorage.getItem('mc-sidebar-crew-collapsed') ?? '[]')).toEqual([])
+  })
+
+  it('with no approval, opens the first question before any working chat', async () => {
+    instanceChatSlotsMock.mockResolvedValue([
+      peerRow('p-run', 'RUN chat', { running: true, last_turn_ts: ago(10_000) }),
+      peerRow('p-ask', 'ASK chat', { needs_input: true, last_turn_ts: ago(20_000) }),
+      peerRow('p-ask-old', 'OLDER ASK chat', { needs_input: true, last_turn_ts: ago(30_000) }),
+    ])
+    const onOpenPeerSession = vi.fn()
+    renderSidebar({ onOpenPeerSession })
+    const group = await screen.findByTestId('crew-group-inst-a', {}, CHAIN_WAIT)
+    await waitFor(() => expect(rowIn(group, 'OLDER ASK chat')).not.toBeNull(), CHAIN_WAIT)
+    const button = attentionOf()!
+    expect(targetOf()).toBe(S.crew_attention_go_question)
+    expect(button.textContent).toBe(S.crew_attention_go_question + questions(2) + working(1))
+    expect(button).toHaveAccessibleName(nameOf(S.crew_attention_go_question, counts(questions(2), working(1))))
+    fireEvent.click(button)
+    expect(onOpenPeerSession).toHaveBeenCalledWith('inst-a', 'p-ask')
+  })
+
+  it('opens only a working chat when that is all the crew has', async () => {
+    instanceChatSlotsMock.mockResolvedValue([
+      peerRow('p-idle', 'IDLE chat', { last_turn_ts: ago(10_000) }),
+      peerRow('p-run', 'RUN chat', { running: true, last_turn_ts: ago(20_000) }),
+    ])
+    const onOpenPeerSession = vi.fn()
+    renderSidebar({ onOpenPeerSession })
+    const group = await screen.findByTestId('crew-group-inst-a', {}, CHAIN_WAIT)
+    await waitFor(() => expect(rowIn(group, 'RUN chat')).not.toBeNull(), CHAIN_WAIT)
+    const button = attentionOf()!
+    expect(targetOf()).toBe(S.crew_attention_go_working)
+    expect(button.textContent).toBe(S.crew_attention_go_working + working(1))
+    expect(button).toHaveAccessibleName(nameOf(S.crew_attention_go_working, counts(working(1))))
+    fireEvent.click(button)
+    expect(onOpenPeerSession).toHaveBeenCalledWith('inst-a', 'p-run')
+  })
+
+  it('opens a local slot that runs on the crew the way its own click does', async () => {
+    instanceChatSlotsMock.mockResolvedValue([peerRow('p-run', 'RUN chat', { running: true })])
+    const onOpenPeerSession = vi.fn()
+    const onSelectSlot = vi.fn()
+    renderSidebar({ relay: true, relayExtra: { pending_approval: true }, onOpenPeerSession, onSelectSlot })
+    const group = await screen.findByTestId('crew-group-inst-a', {}, CHAIN_WAIT)
+    await waitFor(() => expect(rowIn(group, 'RUN chat')).not.toBeNull(), CHAIN_WAIT)
+    fireEvent.click(attentionOf()!)
+    expect(onSelectSlot).toHaveBeenCalledWith('s-relay')
+    expect(onOpenPeerSession).not.toHaveBeenCalled()
+  })
+
+  it('moves the count and the read-out together under a filter', async () => {
+    instanceChatSlotsMock.mockResolvedValue([
+      peerRow('p-a', 'ALPHA chat', { pending_approval: true, last_turn_ts: ago(10_000) }),
+      peerRow('p-b', 'BETA chat', { needs_input: true, last_turn_ts: ago(20_000) }),
+      peerRow('p-g', 'GAMMA chat', { running: true, last_turn_ts: ago(30_000) }),
+    ])
+    renderSidebar()
+    const group = await screen.findByTestId('crew-group-inst-a', {}, CHAIN_WAIT)
+    await waitFor(() => expect(rowIn(group, 'GAMMA chat')).not.toBeNull(), CHAIN_WAIT)
+    expect(screen.getByTestId('crew-group-count-inst-a')).toHaveTextContent(chats(3))
+    expect(attentionOf()).toHaveAccessibleName(nameOf(S.crew_attention_go_approval, counts(approvals(1), questions(1), working(1))))
+
+    fireEvent.change(screen.getByPlaceholderText(S.search_sessions), { target: { value: 'GAMMA' } })
+    await waitFor(() => expect(rowIn(group, 'ALPHA chat')).toBeNull())
+    expect(screen.getByTestId('crew-group-count-inst-a')).toHaveTextContent(chats(1))
+    expect(attentionOf()).toHaveAccessibleName(nameOf(S.crew_attention_go_working, counts(working(1))))
+    expect(targetOf()).toBe(S.crew_attention_go_working)
+    expect(screen.queryByTestId('crew-group-attention-approval-inst-a')).toBeNull()
+    expect(screen.queryByTestId('crew-group-attention-question-inst-a')).toBeNull()
+  })
+
+  it('drops the read-out with the count when the crew disconnects', async () => {
+    instanceChatSlotsMock.mockResolvedValue(MIXED)
+    const { qc } = renderSidebar()
+    const group = await screen.findByTestId('crew-group-inst-a', {}, CHAIN_WAIT)
+    await waitFor(() => expect(rowIn(group, 'IDLE chat')).not.toBeNull(), CHAIN_WAIT)
+    expect(attentionOf()).not.toBeNull()
+
+    listInstancesMock.mockResolvedValue({ instances: [crew('disconnected')] })
+    await act(async () => { await qc.invalidateQueries({ queryKey: ['instances'] }) })
+    await waitFor(() => expect(screen.getByTestId('crew-group-inst-a')).toHaveAttribute('data-offline'))
+    expect(attentionOf()).toBeNull()
+    expect(screen.queryByTestId('crew-group-count-inst-a')).toBeNull()
+  })
+
+  it('keeps the header a toggle that only toggles, with the attention button beside it', async () => {
+    instanceChatSlotsMock.mockResolvedValue(MIXED)
+    const onOpenPeerSession = vi.fn()
+    const onSelectSlot = vi.fn()
+    const { store } = renderSidebar({ onOpenPeerSession, onSelectSlot })
+    const group = await screen.findByTestId('crew-group-inst-a', {}, CHAIN_WAIT)
+    await waitFor(() => expect(rowIn(group, 'IDLE chat')).not.toBeNull(), CHAIN_WAIT)
+    const toggle = screen.getByTestId('crew-group-toggle-inst-a')
+    const button = attentionOf()!
+    // Two buttons, side by side: neither holds the other.
+    expect(toggle.contains(button)).toBe(false)
+    expect(toggle.querySelector('button')).toBeNull()
+    expect(button.querySelector('button')).toBeNull()
+
+    fireEvent.click(toggle)
+    expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    fireEvent.click(toggle)
+    expect(toggle).toHaveAttribute('aria-expanded', 'true')
+    expect(onOpenPeerSession).not.toHaveBeenCalled()
+    expect(onSelectSlot).not.toHaveBeenCalled()
+    expect(store.getState().chat.activeSlot).toBe('s-local')
+    expect(attentionOf()).toBe(button)
+  })
+
+  it('shows a peer row\'s open question the way a local row shows one', async () => {
+    instanceChatSlotsMock.mockResolvedValue([peerRow('p-ask', 'ASK chat', { needs_input: true })])
+    renderSidebar()
+    const group = await screen.findByTestId('crew-group-inst-a', {}, CHAIN_WAIT)
+    await waitFor(() => expect(rowIn(group, 'ASK chat')).not.toBeNull(), CHAIN_WAIT)
+    const row = within(group).getByText('ASK chat').closest('[data-session-row]') as HTMLElement
+    expect(within(row).getByText(S.needs_your_answer)).toBeInTheDocument()
+    expect(within(row).queryByTestId('session-peer-not-open-here')).toBeNull()
   })
 })

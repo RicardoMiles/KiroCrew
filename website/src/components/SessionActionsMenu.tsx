@@ -1,6 +1,6 @@
 import * as React from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { Pencil, Circle, Pin, Locate, Link2, Tag as TagIcon, X, ExternalLink, Monitor, Undo2, RotateCw, PanelTop, Sparkles, GitFork, BellOff, Volume2, VolumeX } from 'lucide-react'
+import { Pencil, Circle, Pin, Locate, Link2, Tag as TagIcon, X, Unlink, ExternalLink, Monitor, Undo2, RotateCw, PanelTop, Sparkles, GitFork, BellOff, Volume2, VolumeX } from 'lucide-react'
 import type { ChatFolder } from '../types'
 import FolderMoveSubmenu from './FolderMoveSubmenu'
 import ErrorNotice, { ErrorNoticeMenuItem } from './ErrorNotice'
@@ -17,7 +17,7 @@ import { DropdownMenuItem, DropdownMenuSeparator } from './ui/dropdown-menu'
 import { ContextMenuItem, ContextMenuSeparator } from './ui/context-menu'
 import { muteFlagErrorKey } from '../store/dashboardSlice'
 import { useAppSelector } from '../store'
-import { selectSlotSubagents } from '../store/chatSlice'
+import { selectSlotSubagentsActive } from '../store/chatSlice'
 import { useTagPopover } from '../hooks/useTagPopover'
 import { api } from '../api/client'
 import { useSessionActions } from '../hooks/useSessionActions'
@@ -64,6 +64,17 @@ export interface SessionActionsMenuProps {
   /** A second, muted line under Close that says what the press reaches. It wraps,
    *  so on a phone, where this menu is the only close, nothing is cut off. */
   closeHint?: string
+  /** Overrides the close item's label (default "Close session"). An adopted
+   *  remote-crew row passes "Remove from this machine" here, because its ✕ removes
+   *  only this machine's copy — the session stays live on its peer — and the
+   *  default label would promise a durable close it never performs (#19958). */
+  closeLabel?: string
+  /** Render the close item in NEUTRAL colours instead of the destructive red.
+   *  Default false (a real close is destructive and reads red). An adopted
+   *  remote-crew row passes true: removing the local copy is NOT destructive —
+   *  the session keeps running on its peer — so the red danger styling would
+   *  signal an irreversible loss the action does not cause (#19958). */
+  closeNeutral?: boolean
   /** Extra items rendered in the top "informational" group (header-only today:
    *  the MCP-servers submenu). Generic so the shared menu stays surface-agnostic. */
   infoSlots?: React.ReactNode[]
@@ -128,7 +139,7 @@ export function collapseGroups<T>(groups: (T | false | null | undefined)[][]): T
  *   [close]          Close session
  */
 export default function SessionActionsMenu({
-  variant, slotKey, mode, onReveal, onRename, onAutoTitle, onOpenInNewTab, onDuplicate, closeHint, infoSlots, onColorPicked, sidebarOnScreen = false, omitPopout = false,
+  variant, slotKey, mode, onReveal, onRename, onAutoTitle, onOpenInNewTab, onDuplicate, closeHint, closeLabel, closeNeutral = false, infoSlots, onColorPicked, sidebarOnScreen = false, omitPopout = false,
 }: SessionActionsMenuProps) {
   const Item = variant === 'context' ? ContextMenuItem : DropdownMenuItem
   const Separator = variant === 'context' ? ContextMenuSeparator : DropdownMenuSeparator
@@ -177,10 +188,7 @@ export default function SessionActionsMenu({
   // would tear down their shared runtime) — mirror that in the disable so a
   // slot whose turn ended but whose children still run doesn't offer a click
   // the backend will 409.
-  const slotSubagents = useAppSelector(s => selectSlotSubagents(s, slotKey))
-  const hasActiveSubagents = Object.values(slotSubagents).some(
-    a => a.status === 'pending' || a.status === 'running' || a.status === 'tool',
-  )
+  const hasActiveSubagents = useAppSelector(s => selectSlotSubagentsActive(s, slotKey))
   const reloadBlocked = isRunning || hasActiveSubagents
   const currentFolderId = slot?.folder_id
   const colorIndex = slot?.color_index
@@ -458,21 +466,31 @@ export default function SessionActionsMenu({
         )}
       </Item>,
     ],
-    // Close session — terminal, destructive
+    // Close session — terminal, destructive (red). An adopted remote-crew row
+    // passes closeNeutral: removing the local copy is reversible (the session
+    // stays live on its peer), so it renders in the menu's neutral colour AND
+    // with the Unlink glyph (not the ✕) — the glyph that reads "detach this
+    // machine's copy", distinct from the destructive close ✕ every other row
+    // shows, so the two actions never look like the same thing (#19958).
     [
-      <Item key="close" className="text-danger focus:text-danger" onSelect={() => close(slotKey)}>
-        {closeHint ? (
-          <>
-            <X size={13} className="self-start mt-0.5 shrink-0" />
-            <span className="flex min-w-0 flex-col">
-              <span>{i18nT('components.sessionActionsMenu.close_session')}</span>
-              <span className="max-w-[15rem] whitespace-normal text-[11px] leading-snug text-muted" data-testid="close-item-hint">{closeHint}</span>
-            </span>
-          </>
-        ) : (
-          <><X size={13} /> {i18nT('components.sessionActionsMenu.close_session')}</>
-        )}
-      </Item>,
+      (() => {
+        const CloseGlyph = closeNeutral ? Unlink : X
+        return (
+          <Item key="close" className={closeNeutral ? undefined : 'text-danger focus:text-danger'} onSelect={() => close(slotKey)}>
+            {closeHint ? (
+              <>
+                <CloseGlyph size={13} className="self-start mt-0.5 shrink-0" />
+                <span className="flex min-w-0 flex-col">
+                  <span>{closeLabel ?? i18nT('components.sessionActionsMenu.close_session')}</span>
+                  <span className="max-w-[15rem] whitespace-normal text-[11px] leading-snug text-muted" data-testid="close-item-hint">{closeHint}</span>
+                </span>
+              </>
+            ) : (
+              <><CloseGlyph size={13} /> {closeLabel ?? i18nT('components.sessionActionsMenu.close_session')}</>
+            )}
+          </Item>
+        )
+      })(),
     ],
   ])
 

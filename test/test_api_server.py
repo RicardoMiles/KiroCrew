@@ -89,9 +89,11 @@ class TestLocalTokenTransportAdmission:
 
     @staticmethod
     def _allow_owner_bootstrap(monkeypatch: pytest.MonkeyPatch) -> None:
+        from kiro_crew.member_memory_auth import LocalOwnerProvenance
+
         monkeypatch.setattr(
-            "kiro_crew.member_memory_auth.local_owner_bootstrap_allowed",
-            lambda _request: True,
+            "kiro_crew.member_memory_auth.local_owner_bootstrap_provenance",
+            lambda _request: LocalOwnerProvenance(),
         )
         monkeypatch.setattr("kiro_crew.dashboard.handlers.sel", lambda: MagicMock())
 
@@ -581,7 +583,7 @@ class TestApiServerAuth:
         #  - server.py binds ``from kiro_crew.config import data_home`` at module
         #    scope (its own name) — used for the .local_secret write.
         #  - state.py binds ``from kiro_crew.config.loader import config_dir``.
-        #  - token_auth.py imports ``config_dir`` LAZILY inside functions from
+        #  - token_auth_tokens.py imports ``config_dir`` LAZILY inside functions from
         #    kiro_crew.config.loader, so patch the real ``loader.config_dir``.
         # All three are REAL module attributes (loader has no __getattr__), so
         # monkeypatch restores them cleanly. Do NOT patch

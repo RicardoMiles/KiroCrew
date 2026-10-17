@@ -32,6 +32,14 @@ properties the fakes cannot check -- that the corpus names operations the shippe
 rules actually allow, so a red on a future PR means that PR tightened something
 rather than that the corpus was wrong when written.
 
+That one file is read by two loaders: this gate's ``load_corpus`` and the ledger's
+``load_golden_path_corpus``, which ``verify_fix.py`` reads it through. The harness
+keeps its own because the scope lanes stage it with no ``ledger.py`` beside it and
+hand it rows with no ``surface`` and sometimes a blank ``reason``, both of which
+the ledger refuses. So one test pins the shipped file to read as the same rows
+through both, and another shows the ledger refusing a shipped row whose reason was
+blanked.
+
 The gate has no waiver mechanism to test. A row that stops being a golden path is
 withdrawn in its own pull request, which is what the base-owned corpus makes
 possible.
@@ -47,6 +55,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from skill_script_helpers import load_skill_script
 
 from kiro_crew.agent_sdk.host_auth import home_override_env_vars
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
@@ -56,6 +65,7 @@ SCRIPT = ROOT / "scripts" / "deny_diff.py"
 GOLDEN_PATHS = (
     ROOT / "src" / "kiro_crew" / "builtin_skills" / "security-conductor" / "golden-paths.json"
 )
+LEDGER = GOLDEN_PATHS.parent / "scripts" / "ledger.py"
 
 
 def _load(name: str, path: Path):
@@ -698,3 +708,31 @@ def test_corpus_rows_are_all_allowed_by_the_shipped_composite(tmp_path, monkeypa
         if verdict.denied
     ]
     assert refused == []
+
+
+@pytest.fixture(scope="module")
+def ledger():
+    """The security conductor's ``ledger.py``, loaded by path and without bytecode."""
+    return load_skill_script("deny_diff_test_ledger", LEDGER)
+
+
+def test_the_shipped_corpus_reads_the_same_through_both_loaders(ledger):
+    """The harness and ``verify_fix.py`` must read the same golden paths out of the
+    one file, in the same order.
+
+    The ledger's loader is the stricter, so it is the one that judges the file here:
+    a row it refuses raises before the comparison runs.
+    """
+    harness = [(row.kind, row.command, row.platform) for row in deny_diff.load_corpus(GOLDEN_PATHS)]
+    strict = ledger.load_golden_path_corpus(GOLDEN_PATHS.read_text(encoding="utf-8"))
+    assert harness == [(row["kind"], row["command_or_flow"], row["platform"]) for row in strict]
+
+
+def test_a_blank_reason_in_the_shipped_corpus_is_refused_by_the_ledger(ledger):
+    """Why the pin above reads the file through the ledger too: blank one shipped
+    reason, and the ledger refuses the copy by row."""
+    payload = json.loads(GOLDEN_PATHS.read_text(encoding="utf-8"))
+    payload["golden_paths"][0]["reason"] = ""
+
+    with pytest.raises(ValueError, match="entry 0: blank or missing reason"):
+        ledger.load_golden_path_corpus(json.dumps(payload))

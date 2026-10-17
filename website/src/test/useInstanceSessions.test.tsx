@@ -305,6 +305,7 @@ describe('useInstanceSessions', () => {
         agent: 42 as unknown as string,
         created: ['nope'] as unknown as string,
         pending_approval: {} as unknown as boolean,
+        needs_input: 'yes' as unknown as boolean,
         last_turn_ts: '2026-08-31T14:00:00Z',
       },
     ])
@@ -315,8 +316,9 @@ describe('useInstanceSessions', () => {
     expect(row.title).toBeUndefined()
     expect(row.agent).toBeUndefined()
     expect(row.created).toBeUndefined()
-    // A truthy non-boolean must not raise a badge the peer never claimed.
+    // A truthy non-boolean must not raise a badge or a question the peer never claimed.
     expect(row.pending_approval).toBe(false)
+    expect(row.needs_input).toBe(false)
     // The one well-formed field still lands.
     expect(row.last_turn_ts).toBe('2026-08-31T14:00:00Z')
   })
@@ -345,7 +347,7 @@ describe('useInstanceSessions', () => {
   })
 
   it('keeps a crew\'s last rows after it disconnects, and stops asking it', async () => {
-    instanceChatSlotsMock.mockResolvedValue([{ key: 'chat-1', title: 'cached row', running: true, pending_approval: true }])
+    instanceChatSlotsMock.mockResolvedValue([{ key: 'chat-1', title: 'cached row', running: true, pending_approval: true, needs_input: true }])
     const { result, rerender } = renderHook(
       ({ list }: { list: unknown[] }) => useInstanceSessions(true, list as InstanceView[]),
       { wrapper, initialProps: { list: [CONNECTED] } },
@@ -354,12 +356,14 @@ describe('useInstanceSessions', () => {
     const calls = instanceChatSlotsMock.mock.calls.length
 
     expect(result.current.rows[0].running).toBe(true)
+    expect(result.current.rows[0].needs_input).toBe(true)
 
     rerender({ list: [{ ...CONNECTED, status: { state: 'disconnected' } }] })
     expect(result.current.rows.map(r => r.title)).toEqual(['cached row'])
     // A cached answer carries no live state.
     expect(result.current.rows[0].running).toBe(false)
     expect(result.current.rows[0].pending_approval).toBe(false)
+    expect(result.current.rows[0].needs_input).toBe(false)
     expect(result.current.failed).toEqual([])
     expect(instanceChatSlotsMock.mock.calls.length).toBe(calls)
   })

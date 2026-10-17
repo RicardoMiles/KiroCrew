@@ -50,11 +50,12 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Final, Iterator, Mapping
+from typing import Any, Final, Iterable, Iterator, Mapping
 from urllib.parse import quote, urlencode
 
 from kiro_crew import dashboard_frame, pinned_fs
@@ -103,15 +104,24 @@ __all__ = [
     "InstanceError",
     "InstanceLocked",
     "InstanceRefused",
+    "NothingStaged",
+    "PACKAGE_TEMPLATE_ID",
     "Preview",
+    "PreviewChanged",
     "adopt",
+    "apply_package",
     "apply_preview",
     "default_instance",
+    "default_template_id",
     "discard_preview",
+    "discard_shown_preview",
     "edit",
     "history",
     "instance_dir",
     "is_session_key",
+    "PinnedPackage",
+    "keeps_older_package_rule",
+    "pinned_package",
     "preview_url",
     "read",
     "rollback",
@@ -211,6 +221,14 @@ class InstanceLocked(InstanceRefused):
     """A structure change was refused because the person locked this dashboard."""
 
 
+class NothingStaged(InstanceRefused):
+    """An apply found no staged page: it was kept, discarded or expired."""
+
+
+class PreviewChanged(InstanceRefused):
+    """An apply named a staged page that has since been replaced by another."""
+
+
 #: The ONE sentence the agent hears about the lock: as a structure change's refusal
 #: and on every turn in its ``[DASHBOARD]`` block. Only the person can clear the lock,
 #: from the crewmate's Profile card, so the one useful next step is to ask them.
@@ -247,6 +265,17 @@ class Instance:
     #: :func:`_commit` refuses every new version, so adopt, apply, edit and rollback
     #: all answer :class:`InstanceLocked`.
     structure_locked: bool = False
+    #: The crewmate's own ``kind="dashboard"`` artifact this version put in force, and
+    #: the artifact version it pinned. Empty and 0 when the template copy is in force.
+    package_slug: str = ""
+    package_version: int = 0
+    #: The digest naming the gateway-owned snapshot of that page (``crew-panels``).
+    package_digest: str = ""
+    #: True when this version names NO package on purpose -- a template apply or a
+    #: rollback to a template version -- so a package bound to the crewmate does not
+    #: draw over it. False on a record written before packages could be applied,
+    #: which keeps that record's older reading (see :func:`keeps_older_package_rule`).
+    package_released: bool = False
 
     def wire(self) -> dict[str, Any]:
         """The response body ``GET /api/members/{slug}/dashboard`` returns.
@@ -267,8 +296,151 @@ class Instance:
         }
 
 
+#: The ``template.id`` a history row carries for a version that put a package in
+#: force. The same id :func:`member_dashboard_fields.package_manifest` gives the
+#: package's translated manifest, so the history and the field list name one page.
+PACKAGE_TEMPLATE_ID: Final[str] = "dashboard-package"
+
+
+#: A package page snapshot's name inside ``crew-panels``: ``<slug>`` + this + a digest.
+_PAGE_SNAPSHOT_INFIX: Final[str] = ".dashboard-page."
+_PAGE_DIGEST_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{32}")
+
+
+def _package_field(raw: Mapping[str, Any]) -> tuple[str, int, str, bool]:
+    """``(slug, version, digest, released)`` from a stored record's ``package`` key.
+
+    Absent is a record written before packages could be applied: nothing pinned and
+    nothing released. ``None`` is released. A pointer that is not well formed is read
+    as released, so a hand-edited record falls back to its template copy rather than
+    naming a page it cannot prove.
+    """
+    if "package" not in raw:
+        return "", 0, "", False
+    pointer = raw.get("package")
+    if not isinstance(pointer, Mapping):
+        return "", 0, "", True
+    slug = pointer.get("slug")
+    version = pointer.get("version")
+    digest = pointer.get("digest")
+    if (
+        not isinstance(slug, str)
+        or not slug
+        or isinstance(version, bool)
+        or not isinstance(version, int)
+        or version < 1
+        or not isinstance(digest, str)
+        or not _PAGE_DIGEST_RE.fullmatch(digest)
+    ):
+        return "", 0, "", True
+    return slug, version, digest, False
+
+
+def _page_snapshot_path(slug: str, digest: str) -> Path:
+    """Where the gateway keeps one package page a crewmate put in force.
+
+    In ``crew-panels`` beside the person's lock, NOT under ``members/<slug>/``: that
+    tree is writable by the crewmate's own shell, and this file is the page that
+    runs. The gateway is its only writer (:func:`apply_package`), so neither a later
+    artifact write, an artifact deleted and saved again, nor the artifact store's
+    version pruning changes the page a version pins.
+    """
+    from kiro_crew.agent_panel import panel_dir
+
+    if is_session_key(slug):
+        raise InstanceError("a session dashboard has no package page")
+    if not _PAGE_DIGEST_RE.fullmatch(digest):
+        raise InstanceError("a package page digest must be 32 hex characters")
+    return panel_dir() / f"{slug}{_PAGE_SNAPSHOT_INFIX}{digest}.json"
+
+
+def _page_digest(content: str) -> str:
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()[:32]
+
+
+@dataclass(frozen=True)
+class PinnedPackage:
+    """The package page a version put in force: its artifact, version and bytes."""
+
+    slug: str
+    version: int
+    content: str
+
+
+def pinned_package(record: Instance) -> PinnedPackage | None:
+    """The package page *record* pins, read from the gateway's snapshot, or ``None``.
+
+    ``None`` for a record that pins nothing and for a pin whose snapshot is missing,
+    unreadable or does not hash to its digest -- the reader then serves the template
+    copy rather than a page it cannot prove.
+
+    The page read and the write check both ask this, so the page a person sees and
+    the Model a ``dashboard_write`` is checked against are one package.
+    """
+    if not record.package_slug or not record.package_digest:
+        return None
+    try:
+        content = read_bytes_with_retry(
+            _page_snapshot_path(record.slug, record.package_digest)
+        ).decode("utf-8")
+    except (OSError, UnicodeDecodeError, InstanceError):
+        logger.warning("dashboard: %r's pinned package page is unreadable", record.slug)
+        return None
+    if _page_digest(content) != record.package_digest:
+        logger.warning("dashboard: %r's pinned package page does not match its pin", record.slug)
+        return None
+    return PinnedPackage(record.package_slug, record.package_version, content)
+
+
+def keeps_older_package_rule(record: Instance) -> bool:
+    """Whether a bound package is chosen by the rule from before packages were pinned.
+
+    True only for a record that has no ``package`` key at all -- written before this
+    change -- and is NOT locked. A locked older record keeps the template copy the
+    person locked, for the page read and the write check alike.
+    """
+    return not record.package_slug and not record.package_released and not record.structure_locked
+
+
+#: Its own file, apart from the instance lock: a save never writes the instance record.
+_PACKAGE_SAVE_LOCK_FILE: Final[str] = ".package-save.lock"
+
+
+@contextmanager
+def package_save_lock(slug: str) -> Iterator[None]:
+    """Serialize one crewmate's package saves: the binding lookup and the write it decides.
+
+    Two first saves at once would both find no package and create two with one binding,
+    which every later save and apply refuses as ambiguous.
+    """
+    if is_session_key(slug):
+        raise InstanceError("a session dashboard has no package to save")
+    with _locked(instance_dir(slug), lock_file=_PACKAGE_SAVE_LOCK_FILE):
+        yield
+
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+_STAGED_MS_LOCK = threading.Lock()
+_last_staged_ms = 0
+
+
+def _mint_staged_ms(*, after: int = 0) -> int:
+    """A ``staged_ms`` past *after* and past every stamp this process handed out.
+
+    The stamp is the person's Keep / Discard naming the page it was shown, so two
+    stagings that read the same millisecond would look like one page and let a click
+    act on a replacement nobody saw. Each stamp is therefore at least one past the
+    last one handed out and past the page it replaces (*after*, which also covers a
+    restart). It stays within a millisecond or two of the wall clock, so it still
+    measures :data:`MAX_PREVIEW_AGE_MS`.
+    """
+    global _last_staged_ms
+    with _STAGED_MS_LOCK:
+        _last_staged_ms = max(_now_ms(), _last_staged_ms + 1, after + 1)
+        return _last_staged_ms
 
 
 def session_instance_key(slot_key: str) -> str:
@@ -474,8 +646,28 @@ def _empty(slug: str, reason: str) -> Instance:
     )
 
 
+def default_template_id(slug: str, known: Iterable[str]) -> str | None:
+    """The page an unadopted crewmate named *slug* gets, out of the ids in *known*.
+
+    The page whose id IS the slug, when a shipped page has that id, and
+    :data:`DEFAULT_TEMPLATE_ID` otherwise. This is the crew panel's rule that a
+    template named after a crew is that crew's view, side effect included: a crewmate
+    named like a shipped page gets that page. The slug is only ever compared against
+    ids the catalog already loaded, and never names a directory.
+    """
+    ids = set(known)
+    if slug and slug in ids:
+        return slug
+    return DEFAULT_TEMPLATE_ID if DEFAULT_TEMPLATE_ID in ids else None
+
+
 def default_instance(slug: str) -> Instance | None:
-    """:data:`DEFAULT_TEMPLATE_ID` as an UNADOPTED instance, or ``None`` if it is absent.
+    """The default page for *slug* as an UNADOPTED instance, or ``None`` if it is absent.
+
+    The page is :func:`default_template_id`'s pick: one named for the crewmate, else
+    :data:`DEFAULT_TEMPLATE_ID`. Both the read route and the ``[DASHBOARD]`` turn
+    block resolve through here, so the page a reader sees and the page the crewmate
+    is told about are one page.
 
     What a crewmate renders before it adopts anything. Deliberately not part of
     :func:`read`, which answers for the STORED record and nothing else: a fresh read
@@ -489,9 +681,12 @@ def default_instance(slug: str) -> Instance | None:
     Nothing is persisted either, which is the point -- a later version of the default
     template reaches every crewmate that never adopted one, with no migration.
     """
-    try:
-        entry = catalog.load_one(DEFAULT_TEMPLATE_ID)
-    except catalog.UnknownTemplate:
+    by_id = catalog.list_templates().by_id
+    # Shipped pages only: an operator's page is adopted by a person, never picked up
+    # because its folder name happens to match a crewmate's slug.
+    shipped = [tid for tid, e in by_id.items() if e.origin == catalog.BUILTIN_SOURCE]
+    template_id = default_template_id(slug, shipped)
+    if template_id is None:
         # A build that shipped the loader without the templates, which is the quiet
         # failure the packaging gates exist for. The caller's own empty state is the
         # right answer here, so this is reported and not raised.
@@ -499,6 +694,7 @@ def default_instance(slug: str) -> Instance | None:
             "dashboard: the default template %r is not in the registry", DEFAULT_TEMPLATE_ID
         )
         return None
+    entry = by_id[template_id]
     return Instance(
         slug=slug,
         instance_version=0,
@@ -662,6 +858,7 @@ def _instance_from_raw(slug: str, raw: dict[str, Any] | None) -> Instance:
             updated_ms=_updated_ms(raw),
         )
     state, reason = _state_of(template_id, template_version, manifest, html)
+    package_slug, package_version, package_digest, package_released = _package_field(raw)
     return Instance(
         slug=slug,
         instance_version=version,
@@ -672,6 +869,10 @@ def _instance_from_raw(slug: str, raw: dict[str, Any] | None) -> Instance:
         state=state,
         state_reason=reason,
         updated_ms=_updated_ms(raw),
+        package_slug=package_slug,
+        package_version=package_version,
+        package_digest=package_digest,
+        package_released=package_released,
     )
 
 
@@ -831,6 +1032,15 @@ def history(slug: str, *, session_id: str = "") -> tuple[dict[str, Any], ...]:
 #: ``shared`` -- a page imported from a sender -- is not renderable, and neither is a
 #: page an agent wrote: not at preview, not at adopt. See
 #: ``docs/request-for-change/rfc-crewmate-dynamic-dashboard.md``.
+#:
+#: A TEMPLATE INSTANCE is what this set governs, and an agent-written template page is
+#: refused here on exactly that reasoning. A ``kind="dashboard"`` PACKAGE is a separate
+#: surface with a separate rule: the "supersedes P2" amendment in that same RFC admits a
+#: page its own owner wrote, because only that owner may write it, values reach it as
+#: text, the frame carries only its model's allowlist, and the owner agent reaches the
+#: network through its own tools anyway. That amendment turns on the author, so it leaves
+#: this set alone: a sender's page, and any page an agent other than the dashboard's
+#: owner wrote, is still unrenderable.
 RENDERABLE_SOURCES: Final[frozenset[str]] = frozenset({catalog.BUILTIN_SOURCE, catalog.USER_SOURCE})
 
 
@@ -890,8 +1100,16 @@ def _commit(
     manifest: Mapping[str, Any],
     from_version: int,
     session_id: str,
+    package: Mapping[str, Any] | None = None,
 ) -> Instance:
     """Write one new instance version. The lock is already held.
+
+    *package* is ``{"slug", "version"}`` when this version puts the crewmate's own
+    package in force, and ``None`` otherwise. The key is written EITHER WAY, so a
+    template version says it released any package rather than leaving the reader to
+    guess (see :func:`keeps_older_package_rule`). The template copy is stored beside the
+    pointer in both cases, so a rollback to a package version still has a page to
+    re-check.
 
     ORDER IS LOAD-BEARING. The version payload is written first, then the record that
     points at it: a crash between them leaves a payload nothing references, which is
@@ -929,6 +1147,15 @@ def _commit(
         "action": action,
         "from_version": from_version,
         "updated_ms": at_ms,
+        "package": (
+            {
+                "slug": str(package["slug"]),
+                "version": int(package["version"]),
+                "digest": str(package["digest"]),
+            }
+            if package
+            else None
+        ),
     }
     body = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     if pinned is not None:
@@ -961,12 +1188,18 @@ def _commit(
         fsync_dir(directory)
         _prune_versions(versions_dir)
 
+    # A committed version replaces whatever was staged for a look: a preview shown
+    # beside a page that has since changed would offer the person a Keep for a page
+    # that is not the next step. Under the same lock the commit holds.
+    discard_preview(slug)
     entry = {
         "slug": slug,
         "instance_version": next_version,
         "action": action,
-        "template_id": template_id,
-        "template_version": template_version,
+        # A package version is named as the package in the history, not as the
+        # template copy stored under it, so "go back" reads which page each was.
+        "template_id": PACKAGE_TEMPLATE_ID if package else template_id,
+        "template_version": int(package["version"]) if package else template_version,
         "from_version": from_version,
         "fields": len(declared) if isinstance(declared, dict) else 0,
         "html_bytes": len(html.encode("utf-8")),
@@ -1058,6 +1291,142 @@ def adopt(slug: str, template_id: str, *, session_id: str = "") -> Instance:
         )
 
 
+def _pointer_of(record: Instance) -> dict[str, Any] | None:
+    """*record*'s package pointer in the shape :func:`_commit` takes, or ``None``."""
+    if not record.package_slug:
+        return None
+    return {
+        "slug": record.package_slug,
+        "version": record.package_version,
+        "digest": record.package_digest,
+    }
+
+
+def _write_page_snapshot(slug: str, content: str) -> str:
+    """Store *content* as a gateway-owned package page for *slug*; return its digest."""
+    digest = _page_digest(content)
+    path = _page_snapshot_path(slug, digest)
+    if not path.exists():
+        # BYTES, so the file hashes to its digest on every platform: a str is
+        # written in text mode, and on Windows that turns the stored form's
+        # newlines into CRLF and the pin stops matching.
+        atomic_write(path, content.encode("utf-8"), fsync=True)
+    return digest
+
+
+def _referenced_digests(slug: str) -> set[str]:
+    """Every page digest the current record, the lock and the kept versions pin.
+
+    COMPLETE OR RAISES. A record, lock or version that cannot be listed or read may
+    pin a page, so an incomplete scan raises (``OSError`` / :class:`InstanceError`)
+    and the caller prunes nothing, rather than deleting a page still pinned.
+    """
+    found: set[str] = set()
+    lock = _lock_snapshot(slug)
+    if lock is not None and "record" not in lock:
+        raise InstanceError("the structure lock is unreadable, so its pin is unknown")
+    raws: list[Any] = [_read_record(slug), (lock or {}).get("record")]
+    try:
+        names = os.listdir(instance_dir(slug) / _VERSIONS_SUBDIR)
+    except FileNotFoundError:
+        names = []
+    for name in names:
+        stem = name[: -len(".json")] if name.endswith(".json") else ""
+        if stem.isdigit():
+            raws.append(_read_version(slug, int(stem)))
+    for raw in raws:
+        if isinstance(raw, Mapping):
+            digest = _package_field(raw)[2]
+            if digest:
+                found.add(digest)
+    return found
+
+
+def _prune_page_snapshots(slug: str) -> None:
+    """Drop the package pages no kept version, current record or lock still pins.
+
+    Best effort: a snapshot left behind is inert, and one still pinned is never
+    dropped, so a rollback reaches every page its kept versions name.
+    """
+    from kiro_crew.agent_panel import panel_dir
+
+    try:
+        keep = _referenced_digests(slug)
+        prefix = f"{slug}{_PAGE_SNAPSHOT_INFIX}"
+        for child in panel_dir().iterdir():
+            name = child.name
+            if not (name.startswith(prefix) and name.endswith(".json")):
+                continue
+            if name[len(prefix) : -len(".json")] not in keep:
+                child.unlink()
+    except (OSError, InstanceError):
+        logger.warning("dashboard: %r's old package pages were not pruned", slug, exc_info=True)
+
+
+def apply_package(
+    slug: str,
+    *,
+    package_slug: str,
+    package_version: int,
+    content: str,
+    session_id: str = "",
+) -> Instance:
+    """Put the crewmate's own package version in force, as a NEW instance version.
+
+    No person-approval step: the page is the owner crewmate's own package, written
+    through the store's owner gate, and the frame contains it however it was written
+    (no network, ``allow-scripts`` only, values as text). What a person keeps is the
+    history: every apply is a version, and :func:`rollback` goes back to any of them
+    in one call -- to an earlier package version or to the template page.
+
+    *content* is the package's canonical stored bytes. They are kept as a
+    gateway-owned snapshot (:func:`_page_snapshot_path`) and the version pins its
+    digest, so the page in force is exactly the bytes saved -- whatever later happens
+    to the artifact.
+
+    The version also stores a template copy -- the current one, or the default page
+    for a crewmate that never adopted one -- so the record stays readable by every
+    reader of a template instance, and a rollback to this version has a page to
+    re-check.
+    """
+    if not package_slug or isinstance(package_version, bool) or package_version < 1:
+        raise InstanceRefused("a package apply needs the package's slug and a version")
+    if not isinstance(content, str) or not content:
+        raise InstanceRefused("a package apply needs the package's stored content")
+    if is_locked(slug):
+        raise InstanceLocked(LOCKED_REFUSAL)
+    # ONE critical section for the snapshot write, the commit that pins it and the
+    # prune: a concurrent apply's prune cannot see the new snapshot before the record
+    # that pins it, so it can never delete the page this apply is committing.
+    with _locked(instance_dir(slug)):
+        digest = _write_page_snapshot(slug, content)
+        current = read(slug)
+        base: Instance | None = current
+        if current.instance_version == 0 or current.state not in (
+            STATE_LIVE,
+            STATE_STALE,
+        ):
+            base = default_instance(slug)
+        if base is None:
+            raise InstanceRefused(
+                "this gateway ships no default dashboard page to keep beside the package"
+            )
+        checked = _check(dict(base.manifest), base.html)
+        record = _commit(
+            slug,
+            action="adopted",
+            template_id=base.template_id,
+            template_version=base.template_version,
+            html=base.html,
+            manifest=checked,
+            from_version=0,
+            session_id=session_id,
+            package={"slug": package_slug, "version": package_version, "digest": digest},
+        )
+        _prune_page_snapshots(slug)
+    return record
+
+
 def _manifest_json(entry: catalog.CatalogEntry) -> dict[str, Any]:
     """The template's manifest as it sits on disk.
 
@@ -1145,6 +1514,9 @@ def edit(
             manifest=checked,
             from_version=current.instance_version,
             session_id=session_id,
+            # An edit changes the template copy's manifest, not which page is in
+            # force, so a package in force stays in force.
+            package=_pointer_of(current),
         )
 
 
@@ -1177,6 +1549,11 @@ def rollback(slug: str, to_version: int, *, session_id: str = "") -> Instance:
         if not isinstance(html, str) or not isinstance(manifest, dict):
             raise InstanceError(f"instance version {to_version} holds no page to restore")
         checked = _check(manifest, html)
+        # THE VERSION'S OWN PAGE IN FORCE comes back with it: a package version
+        # restores its pinned package, and a template version -- including one written
+        # before packages could be applied -- restores the template, releasing any
+        # package. That is what makes one rollback the way back from either page.
+        slug_v, version_v, digest_v, _released = _package_field(payload)
         return _commit(
             slug,
             action="rolled_back",
@@ -1186,6 +1563,7 @@ def rollback(slug: str, to_version: int, *, session_id: str = "") -> Instance:
             manifest=checked,
             from_version=to_version,
             session_id=session_id,
+            package={"slug": slug_v, "version": version_v, "digest": digest_v} if slug_v else None,
         )
 
 
@@ -1390,13 +1768,10 @@ class Preview:
 #: both this module and the MCP tool above it answer the same question and an agent
 #: that reads two different answers tries the second one.
 AUTHORED_PAGE_REFUSAL: Final[str] = (
-    "a preview takes a template_id only. A page written here cannot be previewed or "
-    "adopted yet: a rendered page runs its own script against this crewmate's task "
-    "titles and summaries inside a frame that can navigate itself, so it could carry "
-    "them out, and only a page that shipped with the product has been looked at by "
-    "anyone here. Custom templates come later -- they need a wrapper document this "
-    "gateway mints, which holds the authored markup without granting it that "
-    "navigation. Name a template from dashboard_templates instead"
+    "a template call takes a template_id only: name a template from "
+    "dashboard_templates and put it live with dashboard_apply. A page you write is "
+    "not a template. To put a page you composed on your Dashboard, save it with "
+    "dashboard_save as your own dashboard package, then dashboard_apply it"
 )
 
 
@@ -1440,16 +1815,19 @@ def stage_preview(
     staged_manifest = json.loads(json.dumps(_manifest_json(entry)))
     staged_html = entry.html
     _check(staged_manifest, staged_html)
-    staged_ms = _now_ms()
-    payload = {
-        "schema": SCHEMA_VERSION,
-        "slug": slug,
-        "template": {"id": entry.id, "version": entry.version},
-        "html": staged_html,
-        "manifest": staged_manifest,
-        "staged_ms": staged_ms,
-    }
     with _locked(instance_dir(slug)):
+        # Minted under the slug's lock, beyond the page it replaces, so the stamp the
+        # person's click names can only ever match the page that was shown.
+        shown = staged_preview(slug)
+        staged_ms = _mint_staged_ms(after=shown.staged_ms if shown is not None else 0)
+        payload = {
+            "schema": SCHEMA_VERSION,
+            "slug": slug,
+            "template": {"id": entry.id, "version": entry.version},
+            "html": staged_html,
+            "manifest": staged_manifest,
+            "staged_ms": staged_ms,
+        }
         _write(
             instance_dir(slug),
             _PREVIEW_FILE,
@@ -1465,13 +1843,12 @@ def stage_preview(
     )
 
 
-def staged_preview(slug: str) -> Preview | None:
-    """The page staged for *slug*, or ``None`` when there is none to apply.
+def _preview_payload(slug: str) -> dict[str, Any] | None:
+    """The staged file's decoded payload, or ``None`` when there is nothing to apply.
 
-    ``None`` covers four cases that are one case to every caller: nothing was staged,
-    the file will not decode, it was written under another schema, and it is older than
-    :data:`MAX_PREVIEW_AGE_MS`. Each means there is no page this gateway will install,
-    and the answer a caller can act on is the same one -- stage it again.
+    The four cases :func:`staged_preview` documents: nothing staged, text that will not decode, another schema, and older than
+    :data:`MAX_PREVIEW_AGE_MS`. Each means no page this gateway will install, and the
+    answer a caller can act on is the same one -- stage it again.
     """
     try:
         raw = json.loads(read_bytes_with_retry(_preview_path(slug)).decode("utf-8"))
@@ -1479,13 +1856,40 @@ def staged_preview(slug: str) -> Preview | None:
         return None
     if not isinstance(raw, dict) or raw.get("schema") != SCHEMA_VERSION:
         return None
+    try:
+        staged_ms = int(raw.get("staged_ms") or 0)
+    except (TypeError, ValueError, OverflowError):
+        # A fifth bad case alongside the four above: a hand-forged envelope whose
+        # ``staged_ms`` is not a number. A gateway writer always stamps an int, so this
+        # is only reachable from a forged file -- answered the same way, stage it again,
+        # rather than letting the conversion escape as an uncaught 500.
+        return None
+    if staged_ms <= 0 or _now_ms() - staged_ms > MAX_PREVIEW_AGE_MS:
+        return None
+    raw["staged_ms"] = staged_ms
+    return raw
+
+
+def staged_preview(slug: str) -> Preview | None:
+    """The TEMPLATE page staged for *slug*, or ``None`` when there is none to apply.
+
+    ``None`` covers four cases that are one case to every caller: nothing was staged,
+    the file will not decode, it was written under another schema, and it is older than
+    :data:`MAX_PREVIEW_AGE_MS`. Each means there is no page this gateway will install,
+    and the answer a caller can act on is the same one -- stage it again.
+
+    A package staged by an older gateway answers ``None`` here too: its payload carries
+    no ``html`` and no ``manifest``. A package is never staged here -- ``dashboard_save``
+    puts it in force through :func:`apply_package`.
+    """
+    raw = _preview_payload(slug)
+    if raw is None:
+        return None
     html = raw.get("html")
     manifest = raw.get("manifest")
     if not isinstance(html, str) or not isinstance(manifest, dict):
         return None
-    staged_ms = int(raw.get("staged_ms") or 0)
-    if staged_ms <= 0 or _now_ms() - staged_ms > MAX_PREVIEW_AGE_MS:
-        return None
+    staged_ms = int(raw["staged_ms"])
     template = raw.get("template")
     template = template if isinstance(template, dict) else {}
     template_id = str(template.get("id") or "")
@@ -1516,7 +1920,29 @@ def discard_preview(slug: str) -> None:
         pass
 
 
-def apply_preview(slug: str, *, session_id: str = "") -> Instance:
+def discard_shown_preview(slug: str, *, expected_staged_ms: int) -> None:
+    """Drop the staged page the person was shown, and only that one.
+
+    The person's Discard. Checked inside the lock like :func:`apply_preview`'s Keep,
+    so a page staged after the look is refused :class:`PreviewChanged` instead of
+    being thrown away unseen. Nothing staged any more is not a refusal: the person's
+    "not that one" is already true.
+    """
+    with _locked(instance_dir(slug)):
+        preview = staged_preview(slug)
+        if preview is None:
+            return
+        if preview.staged_ms != expected_staged_ms:
+            raise PreviewChanged(
+                "a different page was staged after this one was shown; look at the new "
+                "preview before discarding it"
+            )
+        discard_preview(slug)
+
+
+def apply_preview(
+    slug: str, *, session_id: str = "", expected_staged_ms: int | None = None
+) -> Instance:
     """Commit the staged page as *slug*'s dashboard, and return the new instance.
 
     The only writer behind "keep this one". The staged template becomes a new instance
@@ -1538,14 +1964,23 @@ def apply_preview(slug: str, *, session_id: str = "") -> Instance:
     racing a preview would throw away the page that was just staged -- and a second
     apply arriving in the same window would consume the first one's preview before
     it was deleted at all.
+
+    *expected_staged_ms* is the person's Keep button naming the page it was drawn
+    beside. Checked INSIDE the lock, so a page staged again between the look and the
+    click is refused with :class:`PreviewChanged` rather than installed unseen.
     """
     with _locked(instance_dir(slug)):
         preview = staged_preview(slug)
         if preview is None:
-            raise InstanceRefused(
+            raise NothingStaged(
                 "there is no page staged to keep; preview one first, and stage it again "
                 "if it has been sitting for more than "
                 f"{MAX_PREVIEW_AGE_MS // 60_000} minutes"
+            )
+        if expected_staged_ms is not None and preview.staged_ms != expected_staged_ms:
+            raise PreviewChanged(
+                "a different page was staged after this one was shown; look at the new "
+                "preview before keeping it"
             )
         checked = _check(preview.manifest, preview.html)
         instance = _commit(

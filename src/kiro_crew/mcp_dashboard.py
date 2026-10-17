@@ -81,6 +81,7 @@ from collections.abc import Callable
 from typing import Any
 from urllib.parse import quote
 
+from kiro_crew.conductor_patrol import reply_line
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.config.sections import FOLDER_SORT_DEFAULT, FOLDER_SORT_MODES
 from kiro_crew.dashboard.folder_ownership import (
@@ -771,12 +772,24 @@ def _session_tools() -> tuple[Tool, ...]:
                         "description": (
                             "Model the new session starts on, pinned exactly as if the "
                             "person had picked it in the session's model dropdown: an id "
-                            "from that same list, or 'auto'. Omit to use the agent's or "
-                            "the global default. A well-formed id the account cannot serve "
-                            "is accepted here but withheld at the session's first turn: "
-                            "the turn succeeds on the account's default model, and the only "
-                            "signal is a notice in that session's transcript. The person "
-                            "can still change it later."
+                            "from that same list, or 'auto'. Omit to inherit: when YOU are "
+                            "a crewmate, the child takes your profile's worker model (or "
+                            "your own model when none is set); otherwise it uses the "
+                            "agent's or the global default. A well-formed id the account "
+                            "cannot serve is accepted here but withheld at the session's "
+                            "first turn: the turn succeeds on the account's default model, "
+                            "and the only signal is a notice in that session's transcript. "
+                            "The person can still change it later."
+                        ),
+                    },
+                    "reasoning_effort": {
+                        "type": "string",
+                        "description": (
+                            "Reasoning effort the new session starts at, one of the five "
+                            "standard levels: 'low', 'medium', 'high', 'xhigh', 'max'. "
+                            "Omit to inherit the same way as `model`: a crewmate's child "
+                            "takes the profile's worker effort (or the crewmate's own); "
+                            "anyone else's child keeps the model's default."
                         ),
                     },
                 },
@@ -1192,6 +1205,47 @@ def _session_tools() -> tuple[Tool, ...]:
                 "GET /api/chat/slots",
                 "GET /api/chat/folders",
                 "POST /api/chat/folders",
+            ),
+        ),
+        Tool(
+            name="session_history_list",
+            description=(
+                "List ARCHIVED (history) sessions the caller could bring back with "
+                "session_revive, newest first: one row per session with the key "
+                "session_revive takes, its title, when it was last active, and the "
+                "folder it is filed in. Read-only. Use it to find the target before "
+                "reviving, e.g. when asked to reopen last week's investigation in a "
+                "folder. Only sessions session_revive would accept for this caller "
+                "are listed: same workspace, not incognito or temporary, not "
+                "app-scoped or channel-linked; a crew member or agent-created "
+                "session sees only sessions it created itself (the same crew-log "
+                "lineage check session_revive applies). Live sessions are not here; "
+                "chat_folder_tree lists those."
+            ),
+            schema={
+                "type": "object",
+                "properties": {
+                    "folder": {
+                        "type": "string",
+                        "description": (
+                            "Only sessions filed in this sidebar folder: a folder id or "
+                            "a '/'-separated human path from chat_folder_tree. Omit for "
+                            "every folder and the unfiled ones."
+                        ),
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "description": "Most rows to return (default 20). The reply says when more exist.",
+                    },
+                },
+            },
+            run=_run_session_history_list,
+            identity="strict",
+            routes=(
+                "GET /api/session-control/history",
+                "GET /api/chat/folders",
             ),
         ),
         Tool(
@@ -1814,7 +1868,7 @@ def _chat_folder_siblings(
     return sorted(kids, key=_chat_folder_sort_key(mode))
 
 
-# ``ChatSidebar``'s ``renderFolderBlock`` returns nothing for ``depth > 10``, so a
+# ``chat-sidebar/folderBlocks.tsx``'s ``renderFolderBlock`` returns nothing for ``depth > 10``, so a
 # row nested deeper is not drawn. The store caps folder COUNT but not nesting, so
 # such a tree is legal rather than corrupt. Only the reported DEPTH is clamped
 # here, never the row: this listing is an agent's one view of the tree and it
@@ -2820,6 +2874,8 @@ def _run_session_create(args: dict[str, Any], ctx: ToolContext) -> str:
     payload: dict[str, Any] = {"title": args.get("title", ""), "agent": args.get("agent", "")}
     if args.get("model"):
         payload["model"] = args["model"]
+    if args.get("reasoning_effort"):
+        payload["reasoning_effort"] = args["reasoning_effort"]
     if args.get("agent_kind"):
         payload["agent_kind"] = args["agent_kind"]
 
@@ -2863,10 +2919,22 @@ def _run_session_create(args: dict[str, Any], ctx: ToolContext) -> str:
         return f"Error: {_refused(refused, made_note)}"
     filed = f" filed in `{folder_label}`" if folder_label else ""
     on_model = f" on model `{resp['model']}`" if resp.get("model") else ""
+    if resp.get("reasoning_effort"):
+        on_model += f" at reasoning effort `{resp['reasoning_effort']}`"
+    # Name what the caller did not choose, so a conductor reading its own reply
+    # learns the child runs on its profile's pick rather than the default.
+    inherited = resp.get("inherited") or []
+    if inherited:
+        on_model += f" (inherited from your crewmate profile: {', '.join(inherited)})"
+    if resp.get("inherited_model_dropped"):
+        on_model += (
+            " (your crewmate profile's worker model is not usable here, so the "
+            "session starts on the default model; fix the profile or pass `model`)"
+        )
     return redact(
         f"\U0001f195 Opened `{resp.get('target')}` ({resp.get('title')}){filed}{on_model}.{made_note} "
         "It is empty and waiting in the user's sidebar; watch it with "
-        "session_read_message."
+        "session_read_message." + reply_line(resp)
     )
 
 
@@ -3148,6 +3216,60 @@ def _run_session_revive(args: dict[str, Any], ctx: ToolContext) -> str:
         f"{resp.get('messages', 0)} messages{filed}.{unfiled_note}{made_note} It is open and idle "
         "in the user's sidebar; session_send starts its next turn."
     )
+
+
+def _run_session_history_list(args: dict[str, Any], ctx: ToolContext) -> str:
+    limit = int(args.get("limit") or 20)
+    query = f"limit={limit}"
+    folder_label = ""
+    folder_ref = str(args.get("folder") or "").strip()
+    if folder_ref:
+        # Read-only resolution: a filter must never create the folder it
+        # names, and an unknown one is refused rather than widened to "all".
+        chat_folders, folders_err = _get_rows(ctx.client, "/api/chat/folders")
+        if folders_err:
+            return f"Error: {folders_err}"
+        fid, folder_err = _resolve_chat_folder_id(folder_ref, chat_folders)
+        if folder_err:
+            return redact(f"Error: {folder_err}")
+        if fid:  # "root" resolves to the top level, which filters nothing
+            query += f"&folder_id={quote(fid)}"
+            folder_label = _chat_folder_paths(chat_folders).get(fid, fid)
+    try:
+        resp = ctx.client.get(f"/api/session-control/history?{query}", session_key=ctx.caller_key)
+    except DashboardError as refused:
+        return redact(f"Error: could not list archived sessions: {refused.error}")
+    hist_rows = resp.get("sessions") or []
+    where = f" in `{folder_label}`" if folder_label else ""
+    notes: list[str] = []
+    if resp.get("lineage_unknown"):
+        notes.append(
+            "Some sessions you created may be missing: the crew log's session-tree "
+            "lineage could not vouch for them (log off, or not seeded yet), and "
+            "session_revive would refuse them for the same reason."
+        )
+    more = " (more exist; raise `limit` or narrow by `folder`)" if resp.get("more") else ""
+    if not hist_rows:
+        # Rows kept by the scan can be revived before the answer is built
+        # while older rows remain unread, so an empty page is not an empty
+        # archive whenever ``more`` is set.
+        if more:
+            empty = f"\U0001f5c4\ufe0f No archived sessions on this page{where}{more}."
+        else:
+            empty = f"\U0001f5c4\ufe0f No archived sessions you can revive{where}."
+        return redact(" ".join([empty, *notes]))
+    hist_lines = [
+        f"\U0001f5c4\ufe0f {len(hist_rows)} archived session(s){where}, newest first{more}:"
+    ]
+    for row in hist_rows:
+        bits = [str(row.get("last_active") or "")]
+        if row.get("folder_id") and not folder_label:
+            bits.append(f"folder {row['folder_id']}")
+        meta = f" — {', '.join(b for b in bits if b)}" if any(bits) else ""
+        hist_lines.append(f"  `{row.get('target', '')}` ({row.get('title', '')}){meta}")
+    hist_lines.append("Pass a key to session_revive to reopen it.")
+    hist_lines.extend(notes)
+    return redact("\n".join(hist_lines))
 
 
 def _run_session_send(args: dict[str, Any], ctx: ToolContext) -> str:
@@ -4653,7 +4775,7 @@ def _call_tool(name: str, raw_args: dict[str, Any]) -> str:
 #: the caller through :func:`mcp_core._resolve_session_key_strict`, whose first
 #: source is that block.
 #:
-#: Advertising is not cosmetic. ``mcp_gateway/backend.py`` strips any client-forged
+#: Advertising is not cosmetic. ``mcp_gateway/backend_stubs.py`` strips any client-forged
 #: caller block from EVERY forwarded request and re-injects its own only when the
 #: backend advertised this capability — so without the advertisement the block
 #: never arrives, and this server's resolver reads an empty identity no matter how

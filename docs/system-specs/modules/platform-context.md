@@ -607,9 +607,9 @@ Core consumption sites read the context rather than a module global. Standalone
 behavior is unchanged because each Default adapter delegates to that same global.
 Wired sites:
 
-- `cli.py:main` / `slack/gateway.py:run_gateway` — `boot_platform(cfg)` once at
+- `cli.py:main` / `slack/gateway_runtime/process_entry.py:run_gateway` — `boot_platform(cfg)` once at
   startup (gateway raises fail-closed; cli is defensive — standalone never raises).
-- `slack/gateway.py` gateway boot — `AgentRuntime.run_first_run_setup()` through
+- `slack/gateway_runtime/service_boot.py` gateway boot — `AgentRuntime.run_first_run_setup()` through
   `safe_context_call`. Previously this imported `agent.run_first_run_setup`
   directly, bypassing the seam; routing it through the context makes first-run
   provisioning genuinely extensible (an edition adds its own one-time steps).
@@ -619,10 +619,10 @@ Wired sites:
   `test_gateway_first_run_setup_routes_through_the_seam`). Best-effort: the
   gateway's surrounding `except` keeps a failure non-fatal to startup, and
   `PlatformCompositionError` still propagates fail-closed.
-- `sandbox.py` — `_live_plan_host`, the plan host `_build_launcher_script` /
+- `sandbox_argv.py` — `_live_plan_host`, the plan host `_build_launcher_script` /
   `_build_seatbelt_profile` both plan with, sources the sensitive-dir lists from
   `current_context().sandbox` through `sandbox._sandbox_policy` (Seatbelt's
-  `.aws`-exclusion at the cc tier is preserved, as that renderer's declared capability). `sandbox.py`'s
+  `.aws`-exclusion at the cc tier is preserved, as that renderer's declared capability). `sandbox_argv.py`'s
   `namespace_argv` / `sandbox_exec_argv` resolve argv[0] through
   `current_context().agent_executable` before applying the core sandbox. The
   public Default is identity; a companion may return the direct
@@ -636,7 +636,7 @@ Wired sites:
 - Credential redaction — all egress scrubs route through the single
   `kiro_crew.platform.redact_via_context` shim (the one canonical
   fail-closed-aware shim; modules import it as `redact`). Covers: `agent.py`
-  SEL-audit callers, `mcp_core.py` chat-history/spawn output, `mcp_cron.py`
+  SEL-audit callers, `mcp_core_parts/` chat-history/crew output, `mcp_cron.py`
   deny-reason + script-vet + timezone messages, and `dashboard/handlers/files.py`
   file-content egress (slot append, file_read; file-watch and the download gate in
   `dashboard/file_api/transfer.py`) as well as the filename/path/description gates.
@@ -644,6 +644,15 @@ Wired sites:
   exfil-then-credential two-pass (the Default `CredentialPolicy.redact` delegates
   to `security.redact`); a loaded companion adds its internal-token regexes
   uniformly across every egress surface.
+- Code text (`kiro_crew.platform.context.redact_code_via_context`) — `redact_via_context` run
+  inside a `security.redaction_switch.code_text()` scope, where pass 3 of the core credential pass
+  (the entropy-and-shape guess at a secret key) spares an ordered alphabet and a data URI payload of
+  64 characters or more and judges every other run as it does anywhere, while every other pass, the
+  exfiltration-URL pass and a loaded companion's patterns run as they do for `redact_via_context`.
+  Its one caller is the member dashboard page scrub, which takes `redact_via_context` over the whole
+  page as its baseline and puts what this returns in place of the baseline's for the text of the
+  page's `<script>` and `<style>` elements. Like `redact_owner_view_via_context` it is a scope the
+  caller must open, so a sink that does not call it keeps the full pass.
 - Content scans (`binary_content_is_flagged`, `wide_content_is_flagged`) are serialized
   behind one re-entrant lock (`_SCAN_LOCK`) and their verdicts are kept in a 256-entry LRU
   (`_SCAN_VERDICTS`) keyed by (scan kind, SHA-256 of the bytes, `governance_generation()`),
@@ -720,6 +729,33 @@ Wired sites:
   `frozenset()` — the empty set means MORE redaction (every host runs the
   heuristics), the safe direction, and stricter than any companion-supplied list
   could be; NO logging on the degrade path (runs inside the stdio MCP servers).
+- Pass-4 token-parameter URL prefixes
+  (`CredentialPolicy.token_param_exempt_url_prefixes()`) — redaction pass 4
+  redacts every `token=` URL value by name. It skips only a literal `?token=`
+  immediately after a companion-supplied `https://host/path` prefix whose local
+  boundary and preceding text prove it is not nested in another destination,
+  whose value is one URL-safe/base64 run plus closers, and which no earlier pass
+  claimed. The companion must list the host in `exempt_exact_hosts()` too, or
+  earlier base64/query heuristics can redact the URL before pass 4. The
+  preceding-text guard rejects URL, backslash, scheme and HTML
+  destination signals — any `&` (character reference) or `<` (tag) counts, scanned
+  over the raw text and never decoded — after blanking earlier links that already
+  passed the exemption together with their own `<` autolink opener, so a list of
+  approval links remains usable without making whitespace a trust boundary.
+  Context-incomplete streaming windows never apply the exemption; the complete
+  stored message may apply it when the destination guards can inspect all prior text.
+  While the prefix set is non-empty, the dashboard's per-delta redaction of the text
+  it accumulates for that stored message leaves pass 4 to the whole-segment run
+  (`redact_credentials(..., defer_token_param=True)`), so a delta cut inside the
+  link cannot redact a value the whole text would exempt; every other pass still
+  runs per delta, and the live wire window still redacts the value.
+  For links the user must open whose token is a lookup key, e.g. a one-time
+  approval workflow. Read lazily on the first pass-4 match via
+  `installed_context()` (declared in `PEEK_CALLERS`) with the same degrade
+  contract as `exempt_exact_hosts`: no context, a pre-method adapter, an
+  exception or a member without a path all mean MORE redaction. The display
+  redaction memo folds the prefix set into its key. Public default:
+  `frozenset()`; never sourced from `config.json`.
   The set is read via `installed_context()`, so a process with no installed
   context takes that same empty set WITHOUT resolving one: resolving would load
   config and discover entry points per call, and on a non-standalone profile
@@ -928,7 +964,7 @@ Wired sites:
   `current_context().knowledge.extra_connectors(cfg)` after the built-ins
   (`local_folder`/`obsidian_vault`); Default returns `{}` so standalone is
   unchanged.
-- `cli.py` `main` (jail gate, factored into `_jail_reexec_gate`) +
+- `cli.py` `main` (jail gate, factored into `cli_jail._jail_reexec_gate`) +
   `cli_doctor.py` — for `_JAILED_COMMANDS`
   (`chat`/`run`/`consolidate`/`eval` — the rule is "every command that
   builds a provider factory / runs in-process agent work"; `gateway` is excluded
@@ -973,9 +1009,19 @@ the public fork dropped without the core importing it. All are v1 additions (a
 `Default*` no-op reproduces today's OSS behavior exactly — a standalone process
 is byte-identical) with no `CONTRACT_VERSION` bump.
 
-- `SlackEnterpriseGate.heartbeat_safe_tools() -> frozenset[str]` — unioned into
+- `SlackEnterpriseGate.heartbeat_safe_tools() -> frozenset[str]` — consulted by
   `slack/gateway_runtime/tool_policy.py::_is_heartbeat_safe_tool` after the core
-  `HEARTBEAT_SAFE_TOOLS` exact-match. Default `frozenset()`. ADD-only; never sourced from config.
+  branches, matched only as the exact trusted `@server/tool` identity. Default
+  `frozenset()`. ADD-only; never sourced from config. The `@server/` prefixes of
+  its pins also decide which default-spec servers
+  `worker_agent.heartbeat_mirrored_servers()` mounts on the heartbeat agent after
+  `HEARTBEAT_MIRRORED_SERVERS`: each is copied verbatim (narrowing filters
+  included) minus `autoApprove`, which would let kiro-cli approve a call before
+  `_heartbeat_approval` and its SEL audit saw it; a name the default spec does not
+  mount is skipped; the spawn-path fingerprint and freshness check read the same
+  list. The read goes through `safe_context_call`, so an older companion's
+  `AttributeError` degrades to the core list and `PlatformCompositionError`
+  re-raises.
 - `AppsLoader.registry_rows() -> List[Dict]` — ADD-only merged by
   `apps/registry_pipeline/sources.py::_load_registry_file` after bundled `app-registry.json`
   (same-`name` core row wins). Default `[]`.
@@ -1022,7 +1068,7 @@ is byte-identical) with no `CONTRACT_VERSION` bump.
   Default: one destination for a non-empty `telemetry.otlp_endpoint`, none
   otherwise (byte-identical to the endpoint-only exporter it replaced).
 - `DashboardContributor.on_user_message(app, message)` — fired once per user
-  message by `dashboard/chat_handlers.py::api_chat` before the turn, inside a
+  message by `dashboard/chat_api/chat_send.py::api_chat` before the turn, inside a
   fail-safe `safe_context_call`. OBSERVER only. Default no-op.
 - `McpToolingProvider.extra_skills()` — WIRED: `SkillsLoader.__init__`
   appends returned paths as lowest-precedence extra skill roots (sensitivity- +

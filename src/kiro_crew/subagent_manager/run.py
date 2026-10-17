@@ -18,6 +18,7 @@ from ..subagent_persistence import (
     remember_live_cleanup_identity,
     write_run_agent,
 )
+from ..subagent_wait_reasons import DEFERRED_QUEUED_REASONS
 from ..tool_permission import (
     GATE_GRANT,
     Ask,
@@ -33,6 +34,7 @@ from ..tool_permission import (
     SubagentRows,
 )
 from ._component import ManagerComponent
+from .admission.taskq_bridge import _in_memory_queued_entries
 from .admission.types import WINDOW_ENTRY_RECOVERING
 
 if TYPE_CHECKING:
@@ -276,11 +278,25 @@ class _SubagentNarrator(Narrator):
             self._info.tool_count += 1
 
 
+def _stop_in_progress(info: SubagentInfo) -> bool:
+    """Whether *info* is being stopped: a Stop, a parent end or a reap has begun.
+
+    Read live by the run loop and by its permission ladder (``Policy.stopping``).
+    The stop cancels the run task only after its session teardown, and the
+    approval wait turns that cancel into a denial, so a run can still be reading
+    its stream while this holds.
+    """
+    return bool(info._reap_started or info.user_stopped or info.reaped)
+
+
 class RunEventCoordinator(ManagerComponent):
     """Own run transitions while state remains facade-owned."""
 
     _publish_identity = staticmethod(publish_live_cleanup_identity)
     _remember_identity = staticmethod(remember_live_cleanup_identity)
+    # Reached as an attribute: an ``_impl`` method resolves its globals in the
+    # facade module, which does not hold this module's helpers.
+    _stop_in_progress = staticmethod(_stop_in_progress)
     _write_run_agent = staticmethod(write_run_agent)
     __slots__ = ()
 
@@ -1425,7 +1441,12 @@ class RunEventCoordinator(ManagerComponent):
         return in_window + self._manager._admission.taskq_overflow(parent_session_key)
 
     def _window_depth(self, parent_session_key: str, *, include_recovering: bool = True) -> int:
-        """Unstarted spawns *parent_session_key* holds in the in-memory window.
+        """Unstarted spawns *parent_session_key* holds in memory.
+
+        The dispatch window and the entries the pump holds while it re-checks
+        them (:func:`_in_memory_queued_entries`): an entry popped for a re-check
+        with no store row is in neither the window nor the store until the gate
+        decides, and it is still waiting to start.
 
         A ``_resume_id`` entry is not one: it is a RESIDENT run asking for its
         lane slot back, already counted where running runs are, and it leaves
@@ -1443,7 +1464,7 @@ class RunEventCoordinator(ManagerComponent):
         resident = self._manager._admission.entry_is_resident_resume
         return sum(
             1
-            for q in self._manager._queue
+            for q in _in_memory_queued_entries(self._manager)
             if q.get("parent_session_key", "") == parent_session_key
             and not resident(q)
             and (include_recovering or not q.get(WINDOW_ENTRY_RECOVERING))
@@ -1476,9 +1497,12 @@ class RunEventCoordinator(ManagerComponent):
         return await self._manager._queued_depth_async(parent_session_key)
 
     def _in_window_count(self, parent_session_key: str) -> int:
-        """This parent's spawns in the in-memory dispatch window."""
+        """This parent's spawns in memory: the dispatch window and the entries
+        the pump holds mid re-check (:func:`_in_memory_queued_entries`)."""
         return sum(
-            1 for q in self._manager._queue if q.get("parent_session_key", "") == parent_session_key
+            1
+            for q in _in_memory_queued_entries(self._manager)
+            if q.get("parent_session_key", "") == parent_session_key
         )
 
     def _has_live_parent_run_task(self, parent_session_key: str, *, exclude_id: str = "") -> bool:
@@ -1592,7 +1616,8 @@ class RunEventCoordinator(ManagerComponent):
 
         *wait* is the gate's label for WHY the rows wait (a ``QUEUED_REASON_*``
         ``reason``, plus ``available_gb`` / ``required_gb`` for the memory
-        kinds; ``memory_pressure`` carries no figures). It is recorded per parent with the request and rides on every
+        kinds, or ``cause`` in place of ``available_gb`` when the cgroup usage
+        is unreadable; ``memory_pressure`` carries no figures). It is recorded per parent with the request and rides on every
         later non-zero frame for that parent until a depth-0 read that no
         request overlapped forgets it; an overlapped 0 read is published bare
         and keeps the label, since the overlapping request may have written it.
@@ -1711,6 +1736,13 @@ class RunEventCoordinator(ManagerComponent):
             extra: dict[str, Any] = {"queued": depth}
         else:
             extra = {"queued": depth, **manager._queue_wait.get(parent_session_key, {})}
+            if extra.get("reason") in DEFERRED_QUEUED_REASONS:
+                # The live bound on a memory wait, read as the frame is sent so
+                # a config reload shows on the next frame (0 is no bound).
+                # One reader with the sweep and the pressure hold that end the wait.
+                extra["max_wait_secs"] = max(
+                    0, int(manager._admission.taskq_memory_wait_bound_secs())
+                )
         info = SubagentInfo(
             id="_queue", task="", parent_session_key=parent_session_key, batch_id=batch_id
         )
@@ -2062,6 +2094,7 @@ class RunEventCoordinator(ManagerComponent):
                 annotate=_unverified_title,
             ),
             narrator=_SubagentNarrator(info, rows, log),
+            stopping=lambda: self._stop_in_progress(info),
         )
 
     async def _run_inner_impl(
@@ -3232,6 +3265,24 @@ class RunEventCoordinator(ManagerComponent):
                 # wall-clock reaper fires. Generous multiple of the parent's
                 # limit: legitimate crews fan many small child tool calls.
                 _ask = tool_permission.Ask(event, _wire, session_key)
+                # A run that is being stopped bails every request as ``stopped``
+                # before any grant or person is consulted: audited, and rejected
+                # bare on the wire. The stop cancels this task only after its
+                # session teardown; when the teardown and its kill both fail, the
+                # stream keeps going, and a request read here would otherwise be
+                # settled for a run the user stopped. The request is answered
+                # (it is already dequeued) and the run ends here, as at the limit
+                # bails below; the stream's own ending arms record the stop.
+                if self._stop_in_progress(info):
+                    logger.warning(
+                        "Subagent %s: rejecting a tool request, a stop is in progress",
+                        info.id,
+                    )
+                    try:
+                        await tool_permission.bail(_ask, _policy, "stopped")
+                    except Exception:
+                        logger.exception("failed to reject a request after a stop")
+                    break
                 if not event.sub_session_id:
                     turns += 1
                     info.turns = turns
@@ -3319,7 +3370,14 @@ class RunEventCoordinator(ManagerComponent):
                     usage.settle()
                     self._manager._write_tombstone(info, "turn_limit")
                     return
-                await tool_permission.settle(_ask, _policy)
+                settled = await tool_permission.settle(_ask, _policy)
+                if settled.rung == "stopped":
+                    # The ladder bailed this request for a stop that landed
+                    # while it was being settled: the run ends here, as at the
+                    # bail above. A person's no (a stop's cancel the approval
+                    # wait turned into a denial) reads on: a stream the stop tore
+                    # down raises at the next read, a live one meets the bail.
+                    break
             elif event.kind == EVENT_AGENT_SWITCHED:
                 # A mid-run mode switch runs a different agent, so ITS spec hooks gate
                 # the permission requests that follow, not the previous agent's. An

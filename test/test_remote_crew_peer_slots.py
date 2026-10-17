@@ -198,11 +198,12 @@ class TestRelayArchivesHideNoPeerRow:
         data = await _body(await hi.api_instances_chat_slots(_request(state)))
 
         assert data == [
-            {"running": False, "pending_approval": False},
+            {"running": False, "pending_approval": False, "needs_input": False},
             {
                 "key": "peer-chat-9",
                 "running": False,
                 "pending_approval": False,
+                "needs_input": False,
                 "row_identity": "nobita:peer-chat-9",
             },
         ]
@@ -314,6 +315,7 @@ class TestPeerTextIsRedactedAndAllowlisted:
             "agent",
             "running",
             "pending_approval",
+            "needs_input",
             "last_turn_ts",
             "last_ts",
             "created",
@@ -342,6 +344,7 @@ class TestPeerTextIsRedactedAndAllowlisted:
             "agent": "claude",
             "running": True,
             "pending_approval": True,
+            "needs_input": True,
             "last_turn_ts": "2026-01-01T00:00:00Z",
             "last_ts": "2026-01-01T00:00:01Z",
             "created": "2025-12-31T00:00:00Z",
@@ -493,21 +496,26 @@ class TestPeerTextIsRedactedAndAllowlisted:
         assert data[0]["key"] == "p1"
 
     async def test_a_truthy_non_boolean_raises_no_badge_it_never_claimed(self, monkeypatch):
-        """``running`` and ``pending_approval`` are coerced, not truth-tested.
+        """``running``, ``pending_approval`` and ``needs_input`` are coerced, not
+        truth-tested.
 
         A peer answering ``"running": "no"`` would otherwise spin a row's
-        activity indicator, and a string in ``pending_approval`` would raise an
-        approval badge for a decision nobody is waiting on.
+        activity indicator, a string in ``pending_approval`` would raise an
+        approval badge for a decision nobody is waiting on, and ``"yes"`` in
+        ``needs_input`` would say a question is waiting when none is.
         """
         _enable_instances(monkeypatch)
         mgr = _manager(
-            body=json.dumps([{"key": "p1", "running": "no", "pending_approval": 1}]).encode()
+            body=json.dumps(
+                [{"key": "p1", "running": "no", "pending_approval": 1, "needs_input": "yes"}]
+            ).encode()
         )
 
         data = await _body(await hi.api_instances_chat_slots(_request(_state(mgr))))
 
         assert data[0]["running"] is False
         assert data[0]["pending_approval"] is False
+        assert data[0]["needs_input"] is False
 
 
 @pytest.mark.asyncio

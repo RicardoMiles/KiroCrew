@@ -664,7 +664,7 @@ class TestPerToolDenyIsDeclaredAndTrue:
     def narrowed(self, tmp_path, monkeypatch):
         """A spec whose third-party server AND control plane are both narrowed.
 
-        Same seam as ``test_codex_session_mcp.py``: materialization would rebuild
+        Same seam as ``codex_session_mcp_helpers.py``: materialization would rebuild
         the managed default from bundled defaults, and this supplies the spec.
         """
         import json

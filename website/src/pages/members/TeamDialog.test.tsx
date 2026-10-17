@@ -26,7 +26,7 @@ import TeamDialog from './TeamDialog'
 /* TeamDialog's CREATE mode, pinned on the component.
  *
  * The Crewmates page no longer draws a New team door -- team creation is hidden
- * for the current phase (`MembersPage.tsx`, the "+" menu) -- so these cases are
+ * for the current phase (`MembersPageRoster.tsx`, the "+" menu) -- so these cases are
  * what keeps the create half honest while nothing on screen reaches it: the
  * checklist it opens with, the gate on a name, the body it posts, and the draft
  * guard. They are also the proof that restoring the door is a revert rather

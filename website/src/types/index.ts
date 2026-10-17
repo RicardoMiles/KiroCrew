@@ -1250,6 +1250,9 @@ export interface ChatSlot extends TurnIdentityFields {
    * task-runner slot, or an app/cron-minted session (which can share the
    * `chat-<n>-<ts>` key shape) never triggers it. */
   origin?: string
+  /** The installed app that owns this session, or null/absent for a person's own
+   *  chat. Lets the model chip ask for that app's own model setting. */
+  app?: string | null
   /** Slot key of the session that asked for this one via the session-control
    * create verb; "" / absent for a person's own tab, a fork, a restore. Durable
    * (written at birth, rehydrated), so it is the one link from a crew member's
@@ -1661,6 +1664,14 @@ export interface SubagentActivity {
   retrying?: boolean      // transient-backend retry (or cancel auto-continue) in flight
   approval_id?: string
   approving?: boolean
+  /** The `approval_id` a resolve attempt found gone (`isTerminalApprovalRefusal`):
+   *  decided or expired where this client could not see it. Scoped by id so a
+   *  fresh approval on the same card is decidable again; the card itself stays
+   *  pending, since no outcome is known. */
+  approvalGone?: string
+  /** The authoritative spawn inventory found no process for a gone approval.
+   *  Distinguishes a never-launched retired card from a user-stopped run. */
+  approvalRetired?: boolean
   /** Inline terminal output for native (`native:*`) cards only. Native cards
    *  cannot lazy-load from disk (no SubagentManager record), so the bounded
    *  done-event result is stored here. Managed cards leave this unset and use
@@ -1687,6 +1698,9 @@ export interface ToolActivity {
   output?: string       // tool output (stdout, results, etc.)
   input_cut?: ToolPayloadCut   // set only when `input` was clamped
   output_cut?: ToolPayloadCut  // set only when `output` was clamped
+  /** True while `output` holds only a MID-STREAM frame (a shell's streamed
+   *  stdout): the call is still running. Cleared by its terminal result. */
+  output_partial?: boolean
   ts: number
   execution_started_at?: number // when execution began (after approval); survives remount
   auto?: boolean        // auto-approved tool call
@@ -1756,6 +1770,14 @@ export interface PendingApproval {
 
 export interface SubagentInfo {
   id: string; task: string; done: boolean; error?: string; result?: string
+  parent?: string
+  /** The terminal-state contract for a finished run (`SubagentInfo.outcome`). */
+  outcome?: 'completed' | 'failed' | 'stopped'
+  agent?: string
+  started?: number
+  last_tool?: string
+  stopped?: boolean
+  awaiting_approval?: boolean
 }
 
 export interface SessionInfo {

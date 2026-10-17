@@ -1214,6 +1214,110 @@ def _own_console_script() -> str | None:
     return str(path)
 
 
+#: How much of a dead replacement's gateway.log a restart relays to the terminal.
+#: A boot refusal (persistence preflight, signing-key preflight or its deadline, no
+#: worker thread, a truncated key) writes its reason and repair steps in a handful of
+#: lines just before the exit, so the tail is what carries the diagnosis.
+_RESTART_LOG_RELAY_LINES = 20
+_RESTART_LOG_RELAY_BYTES = 16 * 1024
+_RESTART_LOG_RELAY_LINE_CHARS = 400
+
+
+#: Where gateway.log stood before a spawn: ``(st_dev, st_ino, size)``, with
+#: ``st_dev``/``st_ino`` ``None`` when there was no file yet.
+_GatewayLogMark = tuple[int | None, int | None, int]
+
+
+def _gateway_log_mark() -> _GatewayLogMark | None:
+    """Record which file gateway.log is and how long it is, before a replacement spawns.
+
+    The replacement rotates a non-empty gateway.log to gateway.log.prev at boot
+    (``cli._setup_cli_logging``) and writes everything after that into a fresh file, so
+    a size alone cannot say where its output starts: the identity says whether the file
+    read later is still the one measured here. ``None`` when gateway.log cannot be
+    stat'ed, which makes the relay print nothing rather than an older gateway's lines
+    passed off as the replacement's.
+    """
+    try:
+        st = (config_dir() / "gateway.log").stat()
+    except FileNotFoundError:
+        return (None, None, 0)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino, st.st_size)
+
+
+def _read_log_tail(path: Path, start: int) -> tuple[bytes, bool]:
+    """Return *path*'s bytes from *start*, at most the final relay cap, and whether cut."""
+    with open(path, "rb") as fh:
+        end = fh.seek(0, os.SEEK_END)
+        if end <= start:
+            return b"", False
+        begin = max(start, end - _RESTART_LOG_RELAY_BYTES)
+        fh.seek(begin)
+        return fh.read(end - begin), begin > start
+
+
+def _gateway_log_lines_since(mark: _GatewayLogMark | None) -> list[str]:
+    """Return the last lines a dead replacement wrote to gateway.log after *mark*.
+
+    When gateway.log is still the file *mark* measured, only the bytes past its size
+    are read. When the replacement rotated it, its output is whatever it wrote to the
+    old file before the rotation (now gateway.log.prev, read past the mark's size when
+    that file is the one measured) followed by the whole fresh gateway.log. Nothing from
+    an earlier gateway is shown. At most the final ``_RESTART_LOG_RELAY_BYTES`` are kept
+    and the final ``_RESTART_LOG_RELAY_LINES`` non-blank lines returned. Each line is
+    reduced to printable characters and capped, because log text can quote values
+    another process chose and must not drive the operator's terminal. Any read error
+    yields an empty list: the caller already points at ``kirocrew logs -f``.
+    """
+    if mark is None:
+        return []
+    dev, ino, size = mark
+    log_file = config_dir() / "gateway.log"
+    prev_log = log_file.with_suffix(".log.prev")
+
+    def _same(path: Path) -> bool:
+        if ino is None:
+            return False
+        try:
+            st = path.stat()
+        except OSError:
+            return False
+        return (st.st_dev, st.st_ino) == (dev, ino)
+
+    segments: list[tuple[Path, int]]
+    if _same(log_file):
+        segments = [(log_file, size)]
+    else:
+        segments = [(prev_log, size)] if _same(prev_log) else []
+        segments.append((log_file, 0))
+    data = b""
+    cut = False
+    try:
+        for path, start in segments:
+            try:
+                chunk, chunk_cut = _read_log_tail(path, start)
+            except FileNotFoundError:
+                continue
+            if chunk_cut:
+                data, cut = chunk, True
+            else:
+                data += chunk
+    except OSError:
+        return []
+    if len(data) > _RESTART_LOG_RELAY_BYTES:
+        data, cut = data[-_RESTART_LOG_RELAY_BYTES:], True
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    if cut and lines:
+        lines = lines[1:]  # the first line was cut mid-way by the byte cap
+    safe = [
+        "".join(ch for ch in line if ch.isprintable())[:_RESTART_LOG_RELAY_LINE_CHARS]
+        for line in lines
+    ]
+    return [line for line in safe if line.strip()][-_RESTART_LOG_RELAY_LINES:]
+
+
 def _spawn_detached_gateway(port: int | None = None) -> subprocess.Popen[bytes]:
     """Spawn a detached ``kirocrew gateway`` so the calling shell returns.
 
@@ -1837,6 +1941,7 @@ def _restart(cli_port: int | None = None) -> None:
     # more, right before the spawn, and refuse on a held or indeterminate lock.
     _refuse_if_lock_held("gateway_restart", port)
 
+    log_mark = _gateway_log_mark()
     proc = _spawn_detached_gateway(port)
     pid = proc.pid
     # A pid is not a running gateway. The replacement can be refused by the
@@ -1866,6 +1971,11 @@ def _restart(cli_port: int | None = None) -> None:
                 f"another process still owning {config_dir()}, or a broken config.\n"
                 f"   To see why it exited, run: kirocrew logs -f"
             )
+            tail = _gateway_log_lines_since(log_mark)
+            if tail:
+                print("   Its last lines in gateway.log:")
+                for line in tail:
+                    print(f"     {line}")
         else:
             print(
                 f"❌ Replacement gateway (pid {pid}) did not become ready within "
@@ -3056,7 +3166,7 @@ async def _run_task(args: argparse.Namespace) -> None:
     # Vector memory (structured semantic store)
 
     vector_memory = VectorMemoryStore(embedding_dim=cfg.memory.embedding_dim, config=cfg)
-    # CALLER CONTRACT (vector_memory.py): async callers offload init() — it is
+    # CALLER CONTRACT (vector_memory_lifecycle.py): async callers offload init() — it is
     # blocking file IO end to end (sqlite connect, migrations, lockdown pass)
     # and would stall the loop.
     await asyncio.to_thread(vector_memory.init)

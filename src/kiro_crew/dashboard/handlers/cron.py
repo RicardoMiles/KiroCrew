@@ -90,13 +90,13 @@ from kiro_crew.validation import (
     LEARN_ADD_SCHEMA,
     LESSON_LIST_LIMIT,
     LESSON_LIST_LIMIT_MAX,
-    LESSON_LIST_OFFSET_MAX,
     MAX_CRON_MESSAGE,
     MAX_SHORT_STRING,
     SLACK_THREAD_TS_RE,
     WORKSPACE_NAME_RE,
     FieldSpec,
     ValidationError,
+    clamp_query_offset,
     normalize_lesson_category,
     validate_string_field,
     validate_tool_args,
@@ -2690,6 +2690,11 @@ async def _recognize_session(
     # Private proof/store authorization and restricted-mode gates stay separate.
     sessions = getattr(state, "sessions", None)
     subagents = getattr(state, "subagents", None)
+    # ``wf-scope:`` is absent on purpose, although ``resolve_session_memory_mode``
+    # lists it: that prefix names a workflow run's memory anchor (``WorkflowScope.anchor``),
+    # and no session is created under it, so there is no live owner to find. Such a key
+    # is recognised only the way any key outside this tuple is: a slot, a restricted
+    # key, a channel namespace, or a persisted transcript.
     in_live_session = (
         sk.startswith(("subagent:", "wf:", "wf-pool:", "wf-unpooled:", "wf-worker:", "wf-author:"))
         and sessions is not None
@@ -3057,6 +3062,17 @@ async def api_lessons_create(request: web.Request) -> web.Response:
         # Redacting HERE covers both readers: the dashboard and the ``learn_add`` tool
         # each see only what this route sends.
         superseded = _redact_memory_field(list(result.superseded))
+        # The stored lesson a ``deduped`` write lost to, redacted on the same chain
+        # for the same reason: it is stored user text leaving the process. Naming it
+        # lets a caller act on the winner directly instead of paging the list route.
+        winner = _redact_memory_field(result.winner) if result.winner else None
+        # The scope goes out as the ``DELETE /api/lessons`` selector that names the
+        # winner's row: ``""`` for a global row, the fragment for a scoped one, and
+        # ``None`` when the fragment is unusable or carries a credential shape, so a
+        # stored scope never leaves this route unredacted.
+        winner_repo_scope = (
+            _lesson_scope_selector(result.winner_repo_scope) if result.winner else None
+        )
         # Avoid even scanning or scheduling the model-based sweep for V2;
         # explicit corrections remain available through the owner review flow.
         # Skipped without a rule vector too: the scan would embed the rule again
@@ -3166,6 +3182,9 @@ async def api_lessons_create(request: web.Request) -> web.Response:
         # oldest record to the ``_MAX_LESSONS_TOTAL`` cap, but that is an eviction,
         # not this write superseding a rule it overlaps.)
         superseded = []
+        # This store never answers ``deduped``, so there is no winner to name.
+        winner = None
+        winner_repo_scope = None
     # Refreshed unconditionally, and deliberately so. An earlier revision of this
     # change gated the push on the write having landed, which is wrong: a DECLINING
     # outcome can still have mutated the store. ``write_lesson``'s second pass
@@ -3190,9 +3209,18 @@ async def api_lessons_create(request: web.Request) -> web.Response:
     # so a client that re-reads /api/lessons after this response cannot see what it
     # lost. Always present, empty when nothing was superseded, so a client does not
     # have to tell "no deletions" from "this gateway is too old to say".
-    return web.json_response(
-        {"ok": stored, "outcome": outcome, "reason": reason, "superseded": superseded}
-    )
+    response: dict[str, Any] = {
+        "ok": stored,
+        "outcome": outcome,
+        "reason": reason,
+        "superseded": superseded,
+    }
+    # ``winner`` is additive too, and sent only on the outcome that has one: the
+    # stored lesson a ``deduped`` write lost to, with that row's own scope.
+    if winner:
+        response["winner"] = winner
+        response["winner_repo_scope"] = winner_repo_scope
+    return web.json_response(response)
 
 
 async def api_lessons_delete(request: web.Request) -> web.Response:
@@ -3424,6 +3452,12 @@ async def api_crons(request: web.Request) -> web.Response:
     if app:
         jobs = [j for j in jobs if app_owner_name(j.created_by) == app]
         _audit_app_cron(app, "crons.list", "allowed", f"jobs={len(jobs)}")
+    # A crewmate's goal check-ins are controlled only by its Goals tab switches,
+    # so neither the Schedule page nor a crewmate's Schedules tab lists them;
+    # the store still runs them. Only those: every other managed job stays.
+    from kiro_crew.dashboard.goal_reminder import is_reminder_job
+
+    jobs = [j for j in jobs if not is_reminder_job(j)]
     now = time.time()
     tz_name, _ = get_local_tz()
     # Secret-grant metadata is owner-view only (see the field comment below).
@@ -3694,10 +3728,10 @@ async def api_cron_folders_delete(request: web.Request) -> web.Response:
 def _lesson_list_page(query: Mapping[str, str]) -> tuple[int, int] | web.Response:
     """``(limit, offset)`` from the ``GET /api/lessons`` query, or the 400.
 
-    ``limit`` is clamped into ``[1, LESSON_LIST_LIMIT_MAX]`` and ``offset`` into
-    ``[0, LESSON_LIST_OFFSET_MAX]`` rather than refused, because the body echoes
-    both effective values back and the clamp is therefore never silent. The
-    offset ceiling matters: the vector tier binds the offset as a SQLite
+    ``limit`` is clamped into ``[1, LESSON_LIST_LIMIT_MAX]`` and ``offset`` by
+    the shared ``clamp_query_offset`` rather than refused, because the body
+    echoes both effective values back and the clamp is therefore never silent.
+    The offset ceiling matters: the vector tier binds the offset as a SQLite
     parameter, and a value past the 64-bit range raises there instead of
     yielding an empty page. A non-integer is refused: the caller asked for a
     page it did not get, and defaulting would return the first page under a
@@ -3710,10 +3744,7 @@ def _lesson_list_page(query: Mapping[str, str]) -> tuple[int, int] | web.Respons
         return web.json_response(
             {"error": "limit/offset must be integers", "code": "invalid_pagination"}, status=400
         )
-    return (
-        max(1, min(limit, LESSON_LIST_LIMIT_MAX)),
-        max(0, min(offset, LESSON_LIST_OFFSET_MAX)),
-    )
+    return (max(1, min(limit, LESSON_LIST_LIMIT_MAX)), clamp_query_offset(offset))
 
 
 def _lesson_scope_selector(stored: object) -> str | None:

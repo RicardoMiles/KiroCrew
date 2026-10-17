@@ -252,7 +252,11 @@ def _synchronous_tool_bounds(ast: Any, package: Any) -> dict[str, float]:
     """``{"file:line name": seconds}`` for each timeout bound named in the
     kirocrew-core tool sources (see the test above). Names resolve against
     each module's own top-level numeric assignments, then ``mcp_core``'s."""
-    files = sorted((package / "mcp_tools").rglob("*.py")) + [package / "mcp_core.py"]
+    files = (
+        sorted((package / "mcp_tools").rglob("*.py"))
+        + sorted((package / "mcp_core_parts").glob("*.py"))
+        + [package / "mcp_core.py"]
+    )
     trees = {path: ast.parse(path.read_text(encoding="utf-8")) for path in files}
 
     def constants(tree: Any) -> dict[str, float]:

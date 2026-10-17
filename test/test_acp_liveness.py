@@ -526,6 +526,61 @@ def test_every_production_dispatch_wires_the_trusted_wait_identity():
     assert not missing, f"dispatch sites not wiring the wait identity: {missing}"
 
 
+@pytest.mark.parametrize(
+    ("trusted", "expected"),
+    [(True, "oracle"), (False, "")],
+)
+def test_main_dispatch_names_the_server_only_from_a_trusted_identity(
+    monkeypatch, trusted, expected
+):
+    """The main handle stamps ``mcp_server_name`` onto the in-flight call ONLY when
+    the event's identity is provenance-verified. The construction-site ratchet
+    above checks that the keyword is passed; this pins its VALUE, so an unverified
+    frame cannot select the wait contract by naming a server."""
+    import asyncio
+    import time
+    from unittest.mock import AsyncMock, MagicMock
+
+    from kiro_crew.acp import session_handle as sh
+    from kiro_crew.acp.types import (
+        EVENT_TOOL_CALL,
+        METHOD_SESSION_UPDATE,
+        AcpEvent,
+        JsonRpcMessage,
+    )
+
+    event = AcpEvent(
+        kind=EVENT_TOOL_CALL,
+        tool_call_id="c1",
+        title="wait",
+        tool_name="wait",
+        mcp_server_name="oracle",
+        mcp_identity_trusted=trusted,
+    )
+    monkeypatch.setattr(sh, "parse_session_update", lambda *_a, **_k: [event])
+    rt = MagicMock()
+    rt._last_activity = time.monotonic()
+    rt.pid = None
+    rt.acp_backend = "kiro"
+    rt.is_alive = MagicMock(return_value=True)
+    rt.send_notification = AsyncMock()
+    rt.send_request = AsyncMock(return_value=1)
+    handle = sh.AcpSessionHandle("sA", asyncio.Queue(), rt)
+
+    handle._handle_update(
+        JsonRpcMessage(
+            method=METHOD_SESSION_UPDATE,
+            params={
+                "sessionId": "sA",
+                "update": {"sessionUpdate": "tool_call", "toolCallId": "c1"},
+            },
+        )
+    )
+
+    assert handle._inflight_tool is not None
+    assert handle._inflight_tool.mcp_server_name == expected
+
+
 def test_missing_boot_stamp_keeps_the_full_window(tmp_path):
     """No boot-clock stamp, no absence claim.
 
@@ -1246,8 +1301,8 @@ def test_helpers_never_raise_on_garbage(tmp_path):
 #
 # consult_offloaded is the single copy of the guard sequence AcpClient and
 # AcpSessionHandle both delegate to. The call-site behaviors (retirement at
-# boundaries, oracle generation swaps) stay pinned by test_acp_client.py and
-# test_acp_stale_recovery.py; these tests pin the helper's own contract so a
+# boundaries, oracle generation swaps) stay pinned by test_acp_client_stale_turn.py
+# and test_acp_stale_recovery.py; these tests pin the helper's own contract so a
 # regression in it is attributed to the shared code, not to one caller.
 
 
@@ -1571,3 +1626,31 @@ def test_tracker_idless_judged_call_clears_when_nothing_remains():
     assert changed is True
     assert tr.current is None
     assert tr.active_calls == {}
+
+
+def test_tracker_bound_evicts_the_oldest_and_keeps_the_new_call():
+    """At ``max_calls`` a NEW id evicts the oldest stored call, the call just
+    dispatched is kept and judged, a re-dispatch under a held id evicts nothing,
+    and ``evicted`` stays set until ``clear``."""
+    tr = liveness.InFlightToolTracker(max_calls=2)
+    tr.dispatch("a", _ts("a"))
+    tr.dispatch("b", _ts("b"))
+    assert tr.evicted is False
+    tr.dispatch("b", _ts("b2"))
+    assert list(tr.active_calls) == ["a", "b"] and tr.evicted is False
+    newest = _ts("c")
+    tr.dispatch("c", newest)
+    assert list(tr.active_calls) == ["b", "c"]
+    assert tr.current is newest and tr.evicted is True
+    tr.result("b", terminal=True)
+    tr.result("c", terminal=True)
+    assert tr.any_active is False and tr.evicted is True
+    tr.clear()
+    assert tr.evicted is False
+
+
+def test_tracker_without_a_bound_never_evicts():
+    tr = liveness.InFlightToolTracker()
+    for i in range(300):
+        tr.dispatch(f"t{i}", _ts())
+    assert len(tr.active_calls) == 300 and tr.evicted is False

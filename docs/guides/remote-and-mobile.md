@@ -192,7 +192,7 @@ What matters, and where it lives:
 | Config | `~/.kiro/crew/config.json` | Model preferences, dashboard settings, and integration config. The sync overwrites the remote copy, then patches `dashboard.url`; inspect it for legacy inline credentials before copying |
 | Skills | `~/.kiro/crew/skills/` | Custom skill definitions |
 | Tasks | `~/.kiro/crew/tasks/` | Task runner state |
-| Webhook hooks | `~/.kiro/crew/hooks.json`, `hooks/` | Script-hook definitions (`hooks.py` `ScriptHookStore`) and their scripts |
+| Webhook hooks | `~/.kiro/crew/hooks.json`, `hooks/` | Script-hook definitions (`hook_runtime/script_hooks.py` `ScriptHookStore`) and their scripts |
 | Cron jobs | `~/.kiro/crew/crons.json` | Scheduled recurring jobs (`cron.py`). Once copied, the jobs run on both hosts unless you pause them on one |
 | Dashboard metadata | `~/.kiro/crew/folders.json`, `tags.json`, `tag_boards.json`, `autonudge.json` | Sidebar folders, tag vocabulary, kanban columns and auto-nudge state |
 
@@ -264,7 +264,7 @@ ssh -fN -L 7779:localhost:7779 user@your-host.example.com   # background
 
 Pass `-C` to enable SSH transport compression. A hand-rolled tunnel gets no
 compression by default, while Kiro Crew's own tunnel manager turns it on for
-exactly this traffic (`src/kiro_crew/instances/ssh_tunnel_manager.py`): the
+exactly this traffic (`src/kiro_crew/instances/ssh_tunnel_manager_child_text.py`): the
 forwarded stream carries the dashboard SPA bundle plus all API/WS payloads,
 which are highly compressible, and the gateway does not gzip at the HTTP layer.
 
@@ -625,7 +625,7 @@ desktop-style command menu first.
 ### Session duration
 
 Three clocks. The first two are signed into the access token payload
-(`dashboard/token_auth.py`), the third into the refresh cookie
+(`dashboard/token_auth_tokens.py`), the third into the refresh cookie
 (`dashboard/refresh_tokens.py`):
 
 | Clock | Value | What it governs |

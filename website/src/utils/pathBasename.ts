@@ -4,7 +4,7 @@
  *  `\\host\share\a.ts`), so splitting on `/` alone shows the whole path where a
  *  file name belongs. Splitting on `\` everywhere is wrong too: on POSIX a
  *  backslash is a legal file-name character, so `/tmp/we\ird.md` is ONE name.
- *  The rule here is the one `breadcrumbSegments` (MarkdownPanel.tsx) uses: `\`
+ *  The rule here is the one `breadcrumbSegments` (MarkdownPanelHeader.tsx) uses: `\`
  *  is a separator only when the path itself is Windows-shaped -- drive-rooted
  *  (`C:\`, `C:/`) or a backslash UNC path (`\\host\`).
  *
@@ -35,4 +35,28 @@ export function pathBasename(p: string): string {
  *  `p.replace(/\/+$/, '')`; a Windows-shaped path also drops trailing `\`. */
 export function stripTrailingSeparators(p: string): string {
   return p.replace(backslashIsSeparator(p) ? /[\\/]+$/ : /\/+$/, '')
+}
+
+// Characters a decoded segment must not gain: controls and bidi overrides would
+// let an encoded name render as something it is not, and a separator would
+// split one name into two.
+const UNSAFE_DECODED_RE = /[\u0000-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069/\\]/
+
+/** `p` with its percent-escapes decoded, for DISPLAY only (`a%20b.md` →
+ *  `a b.md`). Some transports name a file by its URL-encoded spelling; shown
+ *  raw, every space reads as `%20`. Each segment decodes on its own and keeps
+ *  its encoded form when decoding fails or would yield a separator, a control
+ *  or a bidi character. Never use the result to open or probe a file: a name
+ *  can genuinely contain `%20`. */
+export function decodePathForDisplay(p: string): string {
+  if (!/%[0-9A-Fa-f]{2}/.test(p)) return p
+  return p.split('/').map(seg => {
+    if (!seg.includes('%')) return seg
+    try {
+      const d = decodeURIComponent(seg)
+      return UNSAFE_DECODED_RE.test(d) ? seg : d
+    } catch {
+      return seg
+    }
+  }).join('/')
 }

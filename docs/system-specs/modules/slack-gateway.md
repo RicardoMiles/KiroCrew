@@ -159,7 +159,7 @@ Slack Socket Mode → events.py (dispatch) → handler.py → SessionManager →
 | `slack/format.py` | Markdown → Slack mrkdwn conversion (headings, links, strike, tables, mermaid, ANSI strip, truncation). `render_for_slack` is the one way text reaches Slack: `strip_ansi` → redact → pre-split → convert → redact → display-settle → redact → split, with each converted block, split piece and truncation settled under the Slack mrkdwn reading |
 | `slack/handler.py` | The native turn path's composition facade: `handle_message()` — orchestrates one turn and streams the ACP response, `handle_interaction()` — button clicks (with None provider guard), and every name the module exported. See [Native handler composition](#native-handler-composition) |
 | `slack/handler_runtime/` | Private owners the handler facade composes, one responsibility each (see [Native handler composition](#native-handler-composition)); nothing else imports them |
-| `slack/gateway.py` | `GatewayOrchestrator` — the composition facade: service construction and boot, the cron/heartbeat/subagent/task callbacks, approvals and the redacting delivery legs, shutdown, the update apply chain. Entry point: `run_gateway()`. See [Composition](#composition) |
+| `slack/gateway.py` | `GatewayOrchestrator` — the composition facade: the class declares the orchestrator's fields and binds the methods its owners define. Entry point: `run_gateway()`, defined in `gateway_runtime/process_entry.py` and importable from here. See [Composition](#composition) |
 | `slack/gateway_runtime/` | Private owners the facade composes, one responsibility each (see [Composition](#composition)); nothing else imports them |
 | `slack/events.py` | Socket Mode event routing — dedup (`SeenCache`), slash commands, `member_joined_channel` tracking, message dispatch |
 | `slack/interactions.py` | Block Kit button routing — tool approval, OPTIONS choices, cron/subagent ack, session resume, track channel approve/deny |
@@ -186,7 +186,7 @@ there; the responsibilities below live in private owners under
 
 | Owner | Responsibility |
 |---|---|
-| `slack/gateway_runtime/tool_policy.py` | Which tool calls an unattended turn may run: the `--approval reads` verb test (`hooks.py` imports it through the facade), `HEARTBEAT_SAFE_TOOLS` and `_is_heartbeat_safe_tool`, the heartbeat-scoped hooks, `_BACKGROUND_APPROVAL_SOURCES`, tool-title normalisation |
+| `slack/gateway_runtime/tool_policy.py` | Which tool calls an unattended turn may run: the `--approval reads` verb test (`hooks.py` imports it through the facade), the heartbeat allowlist (`_HEARTBEAT_SAFE_CORE_MCP_TOOLS`) and the identity-based `_is_heartbeat_safe_tool`, the heartbeat-scoped hooks, `_BACKGROUND_APPROVAL_SOURCES`, tool-title normalisation |
 | `slack/gateway_runtime/cron_dispatch.py` | What a cron run clears before and while it dispatches: the bounded fire-time gate and its retention marker, the reserved-env screen, the first-run tab, the claim-time re-vet with its handoff, the one-shot post-token resume |
 | `slack/gateway_runtime/cron_verdict.py` | What a cron run's tool-gate outcomes and result add up to: the per-run tally and its refusal summary, the banner on a partially blocked result, the dedup hash and reminder windows |
 | `slack/gateway_runtime/delivery.py` | Where an unattended result is routed: the origin key, the channel conversation behind it, the channel leg that hands a result to that conversation, the dedup anchor a confirmed delivery advances, OPTIONS bookkeeping, the bounded DM open, whether a job is silent |
@@ -194,9 +194,32 @@ there; the responsibilities below live in private owners under
 | `slack/gateway_runtime/mcp_broker.py` | The MCP broker's lifecycle: launch approvals, the agent-overlay rewrite, start/stop, the npm pre-resolve prefetch, the dashboard enable/stub callbacks |
 | `slack/gateway_runtime/memory_lifecycle.py` | Memory preparation behind `MemoryStartup`, the paced member-store repair, embeddings and the model download, the legacy migration and re-embed sweep |
 | `slack/gateway_runtime/admission.py` | Opening subagent dispatch and the dashboard workers after the memory fence, child liveness, the adaptive controller and its overload-health sources, the dependency coordinator, runner task admission |
+| `slack/gateway_runtime/install_repair.py` | Repairing the install at boot: missing pip dependencies, the console script, the kiro-cli version check, the bounded kill and reap of those children, the pinned kiro-cli path an unattended spawn execs |
+| `slack/gateway_runtime/update_schedule.py` | When an available update applies: the scheduled provider and legacy checks, the update's effect, the in-flight-work census, the pause, drain and settle around an apply, the update restart (`_restart_after_update_body`), the claimed restart and its re-exec |
+| `slack/gateway_runtime/update_apply.py` | Applying an update unattended: the git checkout path (fetch, reset, rebuild, dependency sync) and the managed-venv wheel |
+| `slack/gateway_runtime/nudge_wiring.py` | Building and starting AutoNudge: the fire and monitor dispatchers, the observer that persists and publishes loop transitions, the wake judge's evidence readers, the held and expired notices |
+| `slack/gateway_runtime/nudge_dashboard_fire.py` | One nudge or monitor wake into a dashboard slot: the slot turn, the work-ledger wake steer, the fire-time mode and crew-boundary refusals |
+| `slack/gateway_runtime/nudge_channel_fire.py` | One unattended nudge turn into a channel session: a Slack thread, or a DM channel through the shared DM adapter, with the monitor completion accounting (`_delivery_result` and `_monitor_completion_hook`, which the dashboard fire path uses too) |
+| `slack/gateway_runtime/turn_approvals.py` | The tool-approval callbacks unattended and channel turns ask: the interactive approval that races the dashboard prompt against the Slack owner DM, the attached-client check, and the heartbeat's read-only gate |
+| `slack/gateway_runtime/service_boot.py` | Constructing the long-lived services and running the gateway: the memory, skills, hooks, context, history and session stack, the task runner, the dashboard or API-only server, `run` from boot to shutdown, and the post-bind session-start sizing log |
+| `slack/gateway_runtime/heartbeat_turns.py` | Building and starting the heartbeat service and each heartbeat turn, with `_persist_turn_row`, the per-turn usage row the background surfaces record |
+| `slack/gateway_runtime/result_egress.py` | The delivery legs that render and redact an unattended result before egress: a cron session's response to its own channel, a channel reply, a heartbeat or background result to the dashboard slot or Slack, and the slot title it leaves |
+| `slack/gateway_runtime/exit_path.py` | The process exit path: the run marker's writer and self-clear, the signal handlers, the bounded cleanup of every service, and the final exit |
+| `slack/gateway_runtime/process_entry.py` | The process entry point: `run_gateway` with its signing-key preflight, and the background sweeps it starts (the KAS kiro-cli floor, predecessor session work directories, orphaned read-only specs) |
+| `slack/gateway_runtime/cron_fire.py` | Building the cron service and the one callback it fires for every job (`_init_cron`, whose `_cron_callback` runs the goal reminder, the overlap-guard check, the message job's fire-time gate and first-run tab, then dispatches), and what a fire needs before its turn runs: the capture (`_cron_capture`), resolving a crew alias to the agent it dispatches, acquiring that agent's session; arming the scheduler once memory is ready, and the notice that startup moved an unreadable cron store aside |
+| `slack/gateway_runtime/cron_exec.py` | Running a command or script job while holding the overlap guard, and delivering what a script returns; the live dashboard secret a script's `notify()` authenticates with |
+| `slack/gateway_runtime/cron_turn.py` | A message job's agent turn: the agent sequence, and the single-agent turn with its dispatch, ACP-death and transient retries and cleanup, whose flags stay locals of one method |
+| `slack/gateway_runtime/cron_delivery.py` | Delivering a single-agent cron result: the duplicate and silent paths, the dashboard tab and bell, the channel the job came from, the Slack post and its uploads |
+| `slack/gateway_runtime/cron_failure.py` | Telling the user a cron run failed, once per distinct failure: the four one-spelling helpers and their two callers, the command/script/denial alert and the single-agent turn's failure path |
+| `slack/gateway_runtime/orchestrator_init.py` | Constructing the orchestrator: `__init__`, which records the run's options and credentials, runs each channel's hoist, registers the config appliers and gives every service, task and update field its not-yet-started value |
+| `slack/gateway_runtime/channel_boot.py` | Each channel's boot state, the live config appliers and the channel transports: the per-channel `_hoist_*` (`restart_channel` re-runs exactly one), `_register_config_appliers` with `_SLACK_APPLIER_PREFIXES`, `_start_channel_transports` |
+| `slack/gateway_runtime/subagent_wiring.py` | Building the sub-agent manager and the callbacks it reports through (`_init_subagents`): the status and event frames, spawn approval, the orphan notices, and `_subagent_done`, the one consumer every terminal report goes through, which resolves the parent's tab, composes the report, peeks at the wave, then hands the completion to the digest and its delivery route; the manager reads made off the loop, the scale coalescer, the slot a workflow step's spawn answers to |
+| `slack/gateway_runtime/subagent_report.py` | What a sub-agent completion says: `_compose_subagent_completion` (status, detail, announce and card facts, pure apart from redaction) and the wave digest `_subagent_wave_digest`, synchronous from reading the wave's record to the hold-or-flush decision |
+| `slack/gateway_runtime/subagent_injection.py` | Delivering a sub-agent completion into its parent: the tab that shows it (a turn, a queued card, the inline-collected skips, the bell once the tab closed), a channel or session parent with no tab, a cron parent, and the bell; the delivery marks a queued or dispatched hand-off owes |
+| `slack/gateway_runtime/runtime_charge.py` | Charging a runtime death only to whoever caused it: the cron gate verdict (`_apply_gate_verdict`), the cron failure attribution and substitute-streak hand-over (`_cron_failure_attribution`), the indivisible hand-over and charge (`_charge_failure`), and the completion injection's retry (`_inject_with_retry`), whose death arms reset the parent only for its own runtime |
 
-**One namespace.** `gateway_runtime.compose`, called once after the class body,
-rebinds every function an owner defines -- its module functions, the orchestrator
+**One namespace.** `kiro_crew._facade_compose.compose`, called once after the class
+body with `GatewayOrchestrator` as its `host`, rebinds every function an owner defines -- its module functions, the orchestrator
 methods it holds (bound as the `GatewayOrchestrator` attribute of the same name)
 and the methods of the classes it defines -- onto the facade's module globals. A
 patch of `kiro_crew.slack.gateway.<name>` therefore reaches owner code exactly as
@@ -206,36 +229,59 @@ only holder of state: an owner keeps none, so a `GatewayOrchestrator.__new__`
 fixture or an unbound `GatewayOrchestrator.<method>(stub, ...)` call reaches an
 owner method unchanged. An owner imports the facade only under `TYPE_CHECKING`,
 so the facade is the one import edge; `test/test_slack_gateway_composition_contract.py`
-sweeps every owner function's bytecode for globals the facade does not bind.
+sweeps every owner function's bytecode for globals the facade does not bind. Under
+`TYPE_CHECKING` an owner names a standard-library module by its own `import`
+(`import time`, `import os`), not through the facade, because
+`scripts/check_sync_io_in_async.py` resolves a blocking call only from an import in the
+same file; `test/test_gateway_runtime_bindings.py` plants a blocking call in each such
+owner and checks the gate reports it.
 
-**What stays in the facade, and why.** Repository guards read these constructs in
-`slack/gateway.py` by path, text, AST or `inspect.getsource`, so they live there:
+**Split by binding.** The class body binds an owner's methods under a
+`# gateway_runtime/<owner>.py` header, and a class constant an owner defines is bound
+the same way, so `patch.object(GatewayOrchestrator, …)` and an unbound
+`GatewayOrchestrator.<method>(stub, …)` call reach the owner's function. An owner's
+docstring names the orchestrator fields its members read and write. Because owners
+read the facade's imports as their globals, `setup.cfg` turns flake8's F401 off for
+`slack/gateway.py`; `test/test_gateway_runtime_bindings.py` asserts what it stood for
+-- every facade import is read by a facade or owner function, or is part of the
+module's frozen public surface -- plus that no bound function needs a class body
+(zero-argument `super()`, `__class__`, a mangled name), that every bound member has a
+`_BASE_SURFACE` row, and that every name a test patches on the facade is read by some
+function at call time.
 
-- construction and boot: `__init__`, the per-channel `_hoist_*`,
-  `_register_config_appliers`, `_start_channel_transports`, `_init_services`,
-  `run`, the signal handlers, `_shutdown`, `_shutdown_and_exit`,
-  `_write_marker_worker` (boot-order, readiness, hot-reload and exit-path audits);
-- the cron callback (`_init_cron`) with `_apply_gate_verdict`, `_init_heartbeat`
-  and the subagent completion path (`_init_subagents`): usage-row, runtime-death,
-  dispatch-site, memory-store and reap-race audits;
-- AutoNudge: `_init_autonudge`, every `_fire_*_nudge` adapter and the fire paths
-  they delegate to, and the loop-stop notices: composer, turn-ceiling, event-log
-  and wake-judge audits;
-- the approval callbacks and every delivery leg that renders or redacts before
-  egress (`_interactive_approval`, `_heartbeat_approval`, `_deliver_channel_reply`,
-  `_deliver_cron_response`, `_deliver_result` with its heartbeat Slack rendering,
-  the failure alerts): the security-posture sink row and the baseline-log census;
-- the dependency repair and the whole update path, its checks included
-  (`_check_missing_deps`, `_check_console_script`, `_warn_if_kiro_cli_outdated`,
-  `_run_update_checks`, `_check_for_updates`, `_check_for_updates_via_provider`,
-  `_auto_apply_update`, `_auto_apply_wheel_update`, `_restart_after_update` and
-  its fence): spawn-site and restart audits;
-- the ACP/provider import lines the agent-SDK boundary baseline counts,
-  `_persist_turn_row`, and the predecessor run-directory sweep helpers.
+**What stays in the facade, and why.** These constructs stay in `slack/gateway.py`:
 
-The contract test lists the constructs those guards enumerate and fails when an
-owner grows one. A guard whose rule spans code by path rather than naming
-constructs covers the owners with the facade: `test_no_config_dir_in_async.py`
+- the orchestrator's field declarations: the constructor and the channel hoists
+  assign through an annotated `self: GatewayOrchestrator`, where an inline annotation
+  is a type error, so the class declares every field they assign, without a value
+  (`test/test_gateway_orchestrator_init.py` pins the set and each annotation, and that
+  a `__new__` fixture still gets `AttributeError`);
+- `_restart_after_update`: `update_ownership.owning` wraps it at definition time,
+  and compose cannot rebind a wrapper another module compiled, so the decorated
+  method stays and runs `_restart_after_update_body` (`update_schedule.py`) through
+  the class;
+- `_REQUIRED_DEPS` and `_is_brazil_install`, which the install repair reads through
+  the class: the internal content scan judges every line a change adds, and a line
+  of `_is_brazil_install` matches one of its rules, so the method stays where it was
+  written rather than being re-added in an owner;
+- the ACP/provider import lines the agent-SDK boundary baseline counts, and the
+  module task globals that `run_gateway` writes through `global`.
+
+The dependency repair, the update path and AutoNudge moved to their owners together
+with their guards, and so did the approval callbacks, service boot, the heartbeat, the
+result egress legs, the exit path, the process entry point, the cron callback with
+its arms, turn, delivery and failure alerts, the constructor and channel boot, the
+sub-agent completion consumer with its report, digest and delivery routes, and the
+runtime-death charge (its guards read the one-file co-location of the ownership
+predicate, the shared-death streak and its clear in `runtime_charge.py`): the spawn and isolator
+audits (`test_spawn_audit`, `test_internal_python_isolation`), the respawn and
+restart-fence pins, the composer, turn-ceiling, event-log, wake-judge, transcript and
+memory-store tables, the hard-exit drain ratchets (SEL, `gateway.log`, crew log, member
+event log), the boot-order, readiness and sweep pins, and the usage-row census read the
+owners as well. The contract test maps each construct those guards enumerate to the exact
+files that hold it (`_GUARDED_TOKEN_HOMES`) and fails when a holder gains or loses
+one. A guard whose rule spans code by path rather than naming constructs covers the
+owners with the facade: `test_no_config_dir_in_async.py`
 scans each owner that defines a coroutine, and the `AUTOSDE.yaml` rule
 `no-new-work-on-gateway-boot-path` matches `slack/gateway_runtime/` because the
 boot path reaches `_init_mcp_gateway`, `_start_embeddings` and the runner
@@ -268,8 +314,8 @@ orchestrator of a turn. The responsibilities below live in private owners under
 | `slack/handler_runtime/voice.py` | Voice replies: loading `voice_reply` into the live voice state, and the reply a finished turn starts |
 | `slack/handler_runtime/finalize.py` | What a finished turn leaves in the thread: the timing footer and its OPTIONS / Link-to-Dashboard controls, the review-mode draft post and store, the dashboard mirror, the auto-title task |
 
-**One namespace.** `handler_runtime.compose` (pinned byte-identical to
-`hook_runtime.compose`), called once at the foot of `slack/handler.py`, rebinds every
+**One namespace.** `kiro_crew._facade_compose.compose` (the one helper every
+composition facade shares), called once at the foot of `slack/handler.py`, rebinds every
 function an owner defines -- its module functions and the methods of its classes --
 onto the facade's module globals. A patch of `kiro_crew.slack.handler.<name>`
 therefore reaches owner code exactly as it reached the one-module file, and an owner
@@ -287,7 +333,7 @@ one-module file.
 
 - `handle_message`'s turn decisions: the early dispatch order and the first OPTIONS
   expiry (`test_slack_options_lifecycle`), inbound admission
-  (`test_update_check_install_aware`), session acquisition and the thread claim
+  (`test_update_check_install_aware_background_work`), session acquisition and the thread claim
   (`test_options_click_validation`), the memory-store resolution
   (`test_memory_v2_isolation`), the re-injection consume / rearm beside
   `check_context_usage` (`test_reinjection_gate`), the turn-ceiling gate
@@ -349,6 +395,8 @@ The manifest also requests user scopes `channels:history`, `channels:read`,
 separately configured Slack MCP/search integration's `xoxp-...` token. The
 gateway constructs every Slack client with `SLACK_BOT_TOKEN`; it does not read
 or store the user token.
+
+The manifest's one slash command is `/{{COMMAND}}`, rendered by `slack_manifest.slash_command(alias)` as `kirocrew-<alias>` (lowercase, cut to Slack's 32-character limit), because Slack resolves command names across a whole Enterprise Grid org and two installs registering the same `/kirocrew` collide. The dashboard's default alias `kirocrew` keeps `/kirocrew`. The gateway answers only `/{slack.command}`, so `kirocrew manifest` prints the matching `kirocrew config set slack.command kirocrew-<alias>` line, and `GET /api/slack/manifest` returns it as `command` to a caller that passes `?alias=` (Settings → Slack passes none, so its one-click app keeps `/kirocrew`); the setup wizard's default stays `kirocrew` (or the configured command), because it cannot know which alias the app was created with. Another `/kirocrew…` name means the app was created or re-imported from a manifest that names the command differently, as when an older install re-imports this manifest and its `/kirocrew` becomes `/kirocrew-<alias>`. `_handle_slash` still runs nothing for it: it logs a WARNING with the matching `kirocrew config set slack.command` line and posts that line to the owner as an ephemeral reply. Any other name is dropped.
 
 ### `run_gateway(cfg: KiroCrewConfig, *, no_dashboard=False, no_crons=False, no_tunnel=False, no_open=False, port_override=None, json_ready=False, approval_mode=None, test_mode=False) -> None`
 
@@ -552,10 +600,18 @@ the gateway signals. Its TERM trap is what stops that step, so a `cli.sh` that
 ignores SIGTERM past the grace can leave pip running after the arm returns.
 
 **Shutdown starts the stop first.** `_shutdown` cancels any in-flight wheel apply
-and then `_update_check_task`, before the rest of the teardown. The early steps run alongside the stop because they do not
-touch the install. Before the handler and service teardown, `_shutdown` waits
-for the stop until `UPDATE_INSTALLER_STOP_SECS` after the cancel. Without that
-wait, the 10 s cap's force-exit can orphan the installer mid-write.
+and then every installer task: `_update_check_task` and each policy apply the
+dashboard started (`POST /api/update`, read through
+`dashboard.handlers.updates.policy_applies_in_flight()` from `sys.modules`, so
+the stop path never imports a module an update may have replaced). Those run as
+tracked tasks rather than inline in a request handler because aiohttp cancels
+its handlers only after its own shutdown timeout, which the graceful cap exits
+ahead of. The early steps run alongside the stop because they do not touch the
+install. Before the handler and service teardown, `_shutdown` waits for the
+stop until `UPDATE_INSTALLER_STOP_SECS` after the cancel, and a task still
+pending past that is named in the warning (`update-coordinator`,
+`dashboard-policy-apply`). Without that wait, the 10 s cap's force-exit can
+orphan the installer mid-write.
 
 **Once a stop is signalled (`shutdown_event` is set):**
 
@@ -597,13 +653,15 @@ Not covered here:
    the PID file before `os._exit(0)`.
 
 **Self-initiated exits carry a non-zero status.** `_shutdown_and_exit` composes
-`shutdown_exit_code(watchdog) or listener_guard_exit_code(...)`, so an operator
+`shutdown_exit_code(watchdog) or persistence_lost_exit_code(...) or
+listener_guard_exit_code(...)`, so an operator
 stop still exits 0 while a shutdown the gateway asked for itself does not —
 a restart-on-failure supervisor never relaunches an exit 0:
 
 | Status | Source | Meaning |
 | --- | --- | --- |
 | 0 | operator (SIGTERM, `systemctl stop`, Ctrl+C) | stay down as asked |
+| 72 (`EX_OSFILE`) | persistence watchdog (`dashboard/persistence_watchdog.py`) | the data home stopped persisting after a healthy boot and the re-confirmed failure is the restart-curable `ENOSYS` case (a seccomp filter inherited from a torn-down sandbox). Only `ENOSYS` self-exits: a failure a restart cannot cure (full disk `ENOSPC`, read-only remount `EROFS`, quota) is logged loudly once per distinct reason (not every tick) but keeps serving, since a relaunch would meet the same boot preflight and crash-loop. Unlike the stale-asset watchdog this one does NOT gate the exit on a supervisor being able to relaunch (`supervisor_reentry`): the gateway this targets is typically started by hand inside a sandbox (`nohup`) and may have no supervisor, where exiting 72 stops a silent zombie loudly rather than restarting it; a systemd/launchd gateway never inherits the filter but gets the clean relaunch when any other persistence fault later turns `ENOSYS`-shaped |
 | 75 (`EX_TEMPFAIL`) | stale-asset watchdog | the served assets vanished and no update step this gateway is running owns the gap. Not while the service manager could not relaunch the gateway (`supervisor_reentry`), or after an update chose to stay up instead of restarting |
 | 69 (`EX_UNAVAILABLE`) | listener guard (`dashboard/listener_guard.py`), primary or secondary listener | the TCP listener could not be restored, so the process was alive but unreachable; a sidecar listener that cannot be withdrawn gives up with 69 before any rebind attempt |
 | 78 (`EX_CONFIG`) | gateway lock refusal (`gateway_lock.LIVE_HOLDER_EXIT_CODE`), before the gateway runs — not a shutdown | the serving-holder predicate (`GatewayLock._serving_verdict`) is True: the process `/proc/locks` positively identifies as holding `gateway.lock` is running, holds the configured dashboard port with its OWN socket at the address this gateway is configured to bind, and answers HTTP there — a sibling gateway already serves this home. The systemd unit's `RestartPreventExitStatus=` names this one status so it is NOT relaunched (see [cli](cli.md), *Service Management*); every other lock refusal — a holder no surface can identify, however the recorded pid looks; a holder whose own socket at the probed address is silent (a wedged gateway); a holder on the port only at another address, or one the platform did not report (the residual row, unasserted by design, so a stranger's answer there is never credited to it) among them — exits 1 and is relaunched |
@@ -728,7 +786,7 @@ that follow it, and the signal, do not yield.
 The gateway runs a single asyncio loop, so any blocking call on the loop thread freezes the whole backend. App Home skill loader construction and listing run together in a worker: listing can initialize/read the persistent SQLite metadata index. Two mechanisms contain this (see `dashboard/loop_watchdog.py`, `executors.py`):
 
 - **Lag enrichment** — when the heartbeat measures lag over 1 s it claims one lag enrichment per episode (`claim_lag_enrichment`: skipped when `check()` already enriched or a capture is in flight, with a 60 s cooldown) and writes it through `log_lag_enrichment` to the logger only, never to the dump file.
-- **`LoopStallWatchdog`** — armed only when `faulthandler.is_enabled()` (the real `gateway` entrypoint; not `chat`/`tui`). The async heartbeat (`dashboard/server_runtime/heartbeat.py`, 5s interval) `beat()`s it each tick, re-arming the kernel's per-process alarm (`setitimer(ITIMER_REAL)` for `exit_after` seconds, `platform_compat.arm_process_alarm`) with `faulthandler.register(SIGALRM, chain=True)` on the crash-dump file: if the loop goes silent, the alarm dumps all thread stacks from inside the signal handler — in C, with no GIL, so it fires whether the loop thread is blocked in a syscall or holding the GIL inside a long C call — and then hands `SIGALRM` to its default disposition, which ends the process. **A suspend is not a stall:** the alarm pauses while the host sleeps (Linux runs `ITIMER_REAL` on `CLOCK_MONOTONIC`; macOS schedules it on the absolute mach timebase), and the loop's own monotonic clock stands still too, so a laptop resume misses no beat and fires no deadline. faulthandler's own `dump_traceback_later` timer cannot be that decider on every platform: it waits on an interpreter lock whose deadline clock is fixed when CPython is built (`sem_clockwait(CLOCK_MONOTONIC)` with `HAVE_SEM_CLOCKWAIT`, otherwise `sem_timedwait` on `CLOCK_REALTIME`, which jumps by the whole suspend on resume and fires any pending deadline the instant the host wakes, whatever its budget — the branch every portable interpreter build and every macOS build takes). Windows has no process alarm, and a process that already handles `SIGALRM` from Python (pytest-timeout in a test worker, an embedding host) owns `ITIMER_REAL` too; in both cases that timer carries the exit at the same budget and the alarm is never armed or cancelled (`exit_mechanism()`; the startup line says `exit_after=<budget> (alarm|faulthandler)`). The mechanism is decided once per arm and latched (`_armed_mechanism`), and each beat's cancel targets the latched one, so a `SIGALRM` owner that appears between two beats moves the exit onto faulthandler's timer at the next re-arm instead of leaving the pending alarm to fire beside it. Each alarm arm releases faulthandler's `SIGALRM` registration and registers it afresh: a repeat `faulthandler.register` reinstalls nothing while faulthandler believes it still holds the signal, so a temporary owner that handed `SIGALRM` back with `SIG_DFL` would otherwise leave the next alarm to end the process without a dump. On Windows, whose `time.monotonic()` counts a sleep, the heartbeat's lag and the daemon thread's silence are read on the unbiased interrupt time instead (`platform_compat.awake_now`), so a resume is neither lag nor silence there either; faulthandler's timer, re-armed by every beat, still carries the exit. The exit is by `SIGALRM` rather than status 1 and the dump carries no `Timeout (` preamble line; no consumer of either exists. `SIGALRM` and `ITIMER_REAL` belong to the watchdog in the gateway process, and to no successor image: the exec seams cancel the alarm before `os.execv` and the successor's entrypoint clears any deadline that still arrived (see "Restart after update"). A daemon thread measures the silence since the last beat on the clock a suspend does not advance (`platform_compat.awake_now`: `time.monotonic()` on Linux and macOS, the unbiased interrupt time on Windows) for the observability layer — enrichment, then the soft dump — on its 5s poll; each poll also samples the suspend-inclusive clock `platform_compat.boottime_now` (`CLOCK_BOOTTIME` on Linux, the wall clock on macOS, `None` where none exists) and an advance there of `SUSPEND_SKEW_MIN_SECS` (2s) or more beyond the monotonic advance is logged once at INFO as a resume; it decides no exit. Desktop/foreground launches automatically use 25s; managed systemd/launchd gateways automatically use 90s because they have no Electron probe and WSL, VM, or heavy disk pressure can suspend scheduling long enough to make 25s a false death. The config value is nullable/automatic so an unrelated full config save cannot pin either launch-class default; any explicit `dashboard.loop_stall_exit_after_secs` value, including 25, overrides both. Older full-config saves may have materialized the former 25-second default; Kiro Crew reports that through the read-only superseded-default warning and `doctor` rather than guessing whether the value was deliberate. The managed path emits a non-fatal all-thread dump to stderr at `stall_after=30s`, never to the fatal crash-sentinel file, then exits at its service budget if the loop has not recovered. If the alarm is off (`exit_after=None`) or fails to arm or re-arm, no fatal capture can follow, so that soft-only dump is written to the dedicated dump file as well as stderr to remain discoverable. `KIROCREW_SERVICE_MANAGED=1` in the generated systemd unit or launchd plist is the sole managed-launch authority; inherited systemd metadata is deliberately ignored because descendants receive it too. `kirocrew doctor` detects an installed definition without the marker and tells the operator to run `kirocrew service install` once to regenerate it and adopt the managed-service default.
+- **`LoopStallWatchdog`** — armed only when `faulthandler.is_enabled()` (the real `gateway` entrypoint; not `chat`/`tui`). The async heartbeat (`dashboard/server_runtime/heartbeat.py`, 5s interval) `beat()`s it each tick, re-arming the kernel's per-process alarm (`setitimer(ITIMER_REAL)` for `exit_after` seconds, `platform_compat.arm_process_alarm`) with `faulthandler.register(SIGALRM, chain=True)` on the crash-dump file: if the loop goes silent, the alarm dumps all thread stacks from inside the signal handler — in C, with no GIL, so it fires whether the loop thread is blocked in a syscall or holding the GIL inside a long C call — and then hands `SIGALRM` to its default disposition, which ends the process. **A suspend is not a stall:** the alarm pauses while the host sleeps (Linux runs `ITIMER_REAL` on `CLOCK_MONOTONIC`; macOS schedules it on the absolute mach timebase), and the loop's own monotonic clock stands still too, so a laptop resume misses no beat and fires no deadline. faulthandler's own `dump_traceback_later` timer cannot be that decider on every platform: it waits on an interpreter lock whose deadline clock is fixed when CPython is built (`sem_clockwait(CLOCK_MONOTONIC)` with `HAVE_SEM_CLOCKWAIT`, otherwise `sem_timedwait` on `CLOCK_REALTIME`, which jumps by the whole suspend on resume and fires any pending deadline the instant the host wakes, whatever its budget — the branch every portable interpreter build and every macOS build takes). Windows has no process alarm, and a process that already handles `SIGALRM` from Python (pytest-timeout in a test worker, an embedding host) owns `ITIMER_REAL` too; in both cases that timer carries the exit at the same budget and the alarm is never armed or cancelled (`exit_mechanism()`; the startup line says `exit_after=<budget> (alarm|faulthandler)`). The mechanism is decided once per arm and latched (`_armed_mechanism`), and each beat's cancel targets the latched one, so a `SIGALRM` owner that appears between two beats moves the exit onto faulthandler's timer at the next re-arm instead of leaving the pending alarm to fire beside it. Each alarm arm releases faulthandler's `SIGALRM` registration and registers it afresh: a repeat `faulthandler.register` reinstalls nothing while faulthandler believes it still holds the signal, so a temporary owner that handed `SIGALRM` back with `SIG_DFL` would otherwise leave the next alarm to end the process without a dump. On Windows, whose `time.monotonic()` counts a sleep, the heartbeat's lag and the daemon thread's silence are read on the unbiased interrupt time instead (`platform_compat.awake_now`), so a resume is neither lag nor silence there either; faulthandler's timer, re-armed by every beat, still carries the exit. The exit is by `SIGALRM` rather than status 1 and the dump carries no `Timeout (` preamble line; no consumer of either exists. `SIGALRM` and `ITIMER_REAL` belong to the watchdog in the gateway process, and to no successor image: the exec seams cancel the alarm before `os.execv` and the successor's entrypoint clears any deadline that still arrived (see "Restart after update"). A daemon thread measures the silence since the last beat on the clock a suspend does not advance (`platform_compat.awake_now`: `time.monotonic()` on Linux and macOS, the unbiased interrupt time on Windows) for the observability layer — enrichment, then the soft dump — on its 5s poll; each poll also samples the suspend-inclusive clock `platform_compat.boottime_now` (`CLOCK_BOOTTIME` on Linux, the wall clock on macOS, `None` where none exists) and an advance there of `SUSPEND_SKEW_MIN_SECS` (2s) or more beyond the monotonic advance is logged once at INFO as a resume; it decides no exit. Desktop/foreground launches automatically use 25s; managed systemd/launchd gateways automatically use 90s because they have no Electron probe and WSL, VM, or heavy disk pressure can suspend scheduling long enough to make 25s a false death. The config value is nullable/automatic so an unrelated full config save cannot pin either launch-class default; any explicit `dashboard.loop_stall_exit_after_secs` value, including 25, overrides both. Older full-config saves may have materialized the former 25-second default; Kiro Crew reports that through the read-only superseded-default warning and `doctor` rather than guessing whether the value was deliberate. The managed path emits a non-fatal all-thread dump to stderr at `stall_after=30s`, never to the fatal crash-sentinel file, then exits at its service budget if the loop has not recovered. **A paging loop thread is not a wedge:** on a host short of memory the kernel swaps out part of the gateway, and the loop thread stops beating while it faults those pages back in. So on Linux, once a silence reaches two poll intervals, each poll reads the loop thread's major-fault count (field 12 of `/proc/self/task/<tid>/stat`, parsed by `diag.threads._parse_stat`); a rise since the previous poll of the same silence re-arms the alarm, never past `exit_after + PAGING_GRACE_MAX_SECS` (600s) of total silence, and logs one WARNING per silence saying the exit is deferred. A beat that lands after the poll's sample wins, so a deferral never shortens a recovered loop's fresh deadline. A thread blocked in a syscall or holding the GIL in a C call takes no major faults and still exits on the normal budget; a thread wedged in Python code that keeps touching swapped-out memory looks the same as paging and can stay down for up to the full grace. A budget below `stall_after` (the desktop default) defers nothing, because the desktop app's own liveness probe ends a silent gateway within a minute anyway. If the alarm is off (`exit_after=None`) or fails to arm or re-arm, no fatal capture can follow, so that soft-only dump is written to the dedicated dump file as well as stderr to remain discoverable. `KIROCREW_SERVICE_MANAGED=1` in the generated systemd unit or launchd plist is the sole managed-launch authority; inherited systemd metadata is deliberately ignored because descendants receive it too. `kirocrew doctor` detects an installed definition without the marker and tells the operator to run `kirocrew service install` once to regenerate it and adopt the managed-service default.
 - **Cautious boot** (`dashboard/cautious_boot.py`, `dashboard.cautious_boot`, default on, restart-only) — when startup finds a loop-stall crash dump with thread stacks under 30 min old (`RECENT_DUMP_MAX_AGE_SECS`), `pause_before(group)` staggers the startup battery (MCP servers, cron scheduler, app backends, session restores): `MAX_DELAY_SECS` (10 s) on a `tight`/`critical` `resource_status` posture, `MILD_DELAY_SECS` (2 s) otherwise. A third signal downgrades it one step: both sites that publish `DashboardState.ready` dispatch (never await, so a stalled data home cannot hold `KIROCREW_READY`) `crash_dump_store.record_healthy_boot`, which writes this process's `(pid, domain, start_id)` to `<dumps dir>/last-healthy-boot` through `atomic_write`; `dump_owner_reached_healthy` matches it against the dump header, and when the dump's writer had reached ready the next boot runs un-staggered on a calm host and mildly staggered on a pressured one. The match fails closed toward staggering: a missing marker, a start identity absent on either side, a recycled PID or another host's marker all answer no, and the read uses `O_NOFOLLOW`/`O_NONBLOCK` plus an `S_ISREG` check, bounded to 256 bytes, so a planted link or FIFO reads as absent. Any evaluation error boots normally (#16954).
 - **Bounded executors** — blocking work is offloaded off the default executor (which the loop uses for DNS) into dedicated bounded pools defined in `executors.py`; for example `maintenance_executor()` (`mc-maint`, fast orphan-reaping sweeps + agent-overlay rewrites) and `cron_executor()` (`mc-cron`, long/concurrent cron command & script jobs), kept separate so a burst of cron jobs cannot starve the orphan sweeps. MCP `probe_all()` fan-out is bounded by `PROBE_MAX_CONCURRENCY` (5).
 - **`init_socket_mode` is a coroutine awaited ON the loop, never offloaded whole** — `WSSocketModeClient.__init__` ends in `asyncio.ensure_future`, which requires a current event loop in the constructing thread, so running the function in a `to_thread` worker would crash every Slack-enabled boot with `RuntimeError: There is no current event loop` (under systemd the unit would crash-loop into `StartLimitBurst` and stay `failed`). Its two blocking calls — the YOLO grant's profiles-dir walk (`set_yolo_mode` → `grant_declared_yolo`) and the enterprise `auth.test` network call (`validate_enterprise`) — are offloaded individually *inside* the coroutine, which keeps the security-relevant early-return ordering (owner check → YOLO grant → enterprise validation) intact. Pinned by `test_slack_events_coverage.py::TestInitSocketMode` — including a test that constructs the **real** `WSSocketModeClient` (a mocked constructor would hide the defect) and a source-level pin refusing `to_thread(init_socket_mode, ...)` at the gateway call site.
@@ -1027,7 +1085,7 @@ Slack `file_share` messages are processed in `_route_message()` after dedup + au
 - **The run the native stream's `StreamRedactor` still holds** is settled where its message ends. At the seal (`settle_tail`) it is sent when the final text is clean and dropped when the final copy replaces the message. Before a tool card it stays held. At a `wait` it is carried (`carried`), so the filter sees it joined to the next text. When that joined text comes out of the filter whole and unchanged, `_give_back` reads the closed message back and edits it with `chat.update` on its own blocks (`markdown` or `rich_text`, plus any `plan` / `task_card` / `divider` after it) with the run added, and the next message, its final copy and the saved answer start after the run. Otherwise -- the filter changed the joined text, the blocks are another shape, or the read or edit fails -- the run opens the next message. A closed message is edited only this way
 - **Redaction notice** — when the delivered text (answer or thinking) still carries a `security.CREDENTIAL_REDACTION_TAGS` placeholder or a `security.EXFILTRATION_REDACTION_TAG_PREFIX` (suspicious-URL) placeholder, one `messaging.renderer.redaction_notice` message is posted in the thread after the answer is committed, so the reader knows a command or link they copy will not run as pasted. Worded by kind (credential → re-enter the secret; URL → re-check the link), and byte-identical to the prior `credential_redaction_notice` sentence when only credentials were rewritten. Redaction is NOT relaxed — Slack is an egress path. Counted from the tag in the sent text rather than the redactor's warnings list, which is empty on the streaming path because each chunk was already redacted upstream. **One notice per turn**: answer and thinking share a single tally. Approving a review-mode draft (`interactions.py`) posts the same notice for the same reason, since that publishes to the whole channel. Both posts are best-effort — a failed notice must never turn a delivered answer into a failed turn. The transport-path renderer (`slack/renderer.py`, the default `messaging.use_transport` delivery) posts the same one-per-turn notice: the final display-safe answer body and the posted 💭 reasoning share a single tally, counted with `messaging.renderer.count_redaction_tags` over the form the reader is left with — which can carry placeholders the driver's byte-level stream scan never wrote, because `_display_safe` re-redacts against what Slack renders
 
-## Message Queue (`session.py` + `events.py`)
+## Message Queue (`session_parts/claims.py` + `events.py`)
 
 When a message arrives while a session is actively processing, it's queued instead of spawning a competing session:
 
@@ -1035,7 +1093,7 @@ When a message arrives while a session is actively processing, it's queued inste
 - **Orchestrator-level queue**: `_pending_queue` dict for the startup race (task running but session object not yet created)
 - **⏳ reaction**: added to queued messages so the user sees visual feedback
 - **FIFO drain**: `_on_done` callback drains both queue levels after each handler completes
-- **Cancellation**: `message_deleted` event removes queued messages or marks in-flight messages as cancelled; a `!stop` sent as a thread message (`_route_message`) clears the CALLER's queued messages only — every enqueue site and the `_pending_queue` stash tag each entry with `queued_owner` (`owner_token("slack", (sender_id, channel))`, via `_queue_tags`). The handler detaches both queues at the press into a per-key hold beside `_session_tasks` (`_stops_in_flight`, read through `_key_busy`) and calls `stop_turn(..., preserve_queue=True)`; a soft or idle outcome records the presser's owner token in the hold's drop set with the index of the snapshot that stop detached, so only entries detached at or before it are dropped (a message sent after one's own `!stop` survives another member's overlapping stop). The hold is released from one `finally` on every path. While any stop on the key is in flight `_key_busy` marks it busy, so neither turn-end drain, `_drain_slack_queue`, nor the busy check starts a message a stop would cancel. When the last overlapping stop settles, `_settle_stop_hold` merges the detached snapshots in press (= arrival) order, drops each stopping member's entries up to their stop's snapshot (`clear_queue(only=...)`, unlinking their temp files) and puts the rest back at the head of their queue, then runs `_drain_slack_queue` (which falls back to `_pending_queue`), so a kept entry is dispatched even when the stopped turn was never registered there. A stop that escalates to a hard reset still drops every member's queued messages (the forced repeat on a compacting session instead carries them all to the successor); the other Slack stop entry points (`handler.py`'s inline `!stop`, the interaction buttons) still clear the whole queue. An untagged entry (a dashboard-linked session's own queue) is nobody's to drop. The owner is the sender in the channel, not the thread: a thread session is one thread, and a single-session DM merges its threads into one key by design. The `message_deleted` drop in `_handle_message_deleted` stays keyed by timestamp — a deleted message is one entry, not one person's.
+- **Cancellation**: `message_deleted` event removes queued messages or marks in-flight messages as cancelled; a `!stop` sent as a thread message (`_route_message`) clears the CALLER's queued messages only — every enqueue site and the `_pending_queue` stash tag each entry with `queued_owner` (`owner_token("slack", (sender_id, channel))`, via `_queue_tags`). The handler detaches both queues at the press into a per-key hold beside `_session_tasks` (`_stops_in_flight`, read through `_key_busy`) and calls `stop_turn(..., preserve_queue=True)`; a soft or idle outcome records the presser's owner token in the hold's drop set with the index of the snapshot that stop detached, so only entries detached at or before it are dropped (a message sent after one's own `!stop` survives another member's overlapping stop). The hold is released from one `finally` on every path. While any stop on the key is in flight `_key_busy` marks it busy, so neither turn-end drain, `_drain_slack_queue`, nor the busy check starts a message a stop would cancel. When the last overlapping stop settles, `_settle_stop_hold` merges the detached snapshots in press (= arrival) order, drops each stopping member's entries up to their stop's snapshot (`clear_queue(only=...)`, unlinking their temp files) and puts the rest back at the head of their queue, then runs `_drain_slack_queue` (which falls back to `_pending_queue`), so a kept entry is dispatched even when the stopped turn was never registered there. A stop that escalates to a hard reset still drops every member's queued messages (the forced repeat on a compacting session instead carries them all to the successor); the other cooperative Slack stop entry points (the native handler's `!stop` in `handler_runtime/commands.py`, the Stop confirm button and the inline Stop button in `interactions.py`) pass `stop_turn(owned_by=entries_queued_by(_entry_owner(user, channel)))`, so `stop_turn`'s own pre-cancel clear drops only the presser's entries. The two buttons run that call inside `slack_stop_in_flight`, which joins the same `_stops_in_flight` hold, so a turn ending mid-stop cannot start a kept entry that an escalation would then abort; the last release settles the hold and runs `_drain_slack_queue`. The handler's `!stop` needs no hold: it runs as the turn registered on the key. Both `slack_stop_in_flight` and `_drain_slack_queue` reduce a canonical `slack:<ts>` (a button value, the session layer's `register_drain` wake) to the bare ts the router keys its tasks, holds and stash by. Their forced repeat parks the whole queue for the successor, and Kill Now's hard reset drops it for everybody. An untagged entry (a dashboard-linked session's own queue) is nobody's to drop. The owner is the sender in the channel, not the thread: a thread session is one thread, and a single-session DM merges its threads into one key by design. The `message_deleted` drop in `_handle_message_deleted` stays keyed by timestamp — a deleted message is one entry, not one person's.
 - **`is_cancelled()` check**: handler checks before responding and before the LLM call to suppress responses for deleted messages
 
 ## Linked Thread Sync (`handler.py` + `interactions.py`)
@@ -1128,7 +1186,7 @@ LLM responses ending with `[OPTIONS: choice1 | choice2 | choice3]` are rendered 
 
 Action IDs: `options_checkboxes` (toggle), `options_submit` (send). Checkbox `value` contains the choice text.
 
-Beyond the reply-finalization path in `handler.py`, two other Slack delivery paths also render `[OPTIONS: ...]` as buttons: the dashboard `send_message` MCP tool (`api_send_message` in `dashboard/handlers/messaging.py`) and cron subagent delivery (`_deliver_cron_response` in `gateway.py`). Both call `extract_options()` / `build_options_blocks()`, skip the tag parse when the caller supplies explicit `blocks` (those own their own layout), and wrap the follow-up options post in `try/except` so a failed options post never fails the primary message.
+Beyond the reply-finalization path in `handler.py`, two other Slack delivery paths also render `[OPTIONS: ...]` as buttons: the dashboard `send_message` MCP tool (`api_send_message` in `dashboard/handlers/messaging.py`) and cron subagent delivery (`_deliver_cron_response` in `gateway_runtime/result_egress.py`). Both call `extract_options()` / `build_options_blocks()`, skip the tag parse when the caller supplies explicit `blocks` (those own their own layout), and wrap the follow-up options post in `try/except` so a failed options post never fails the primary message.
 
 ### Inline action values (`action::`)
 
@@ -1211,7 +1269,7 @@ See `session.py` module spec. Each Slack thread_ts maps to a separate AcpClient 
 
 ### Message Queue
 
-Messages arriving while a session is busy are queued with ⏳ reaction and drained FIFO after each handler completes. See [Message Queue](#message-queue-sessionpy--eventspy) above.
+Messages arriving while a session is busy are queued with ⏳ reaction and drained FIFO after each handler completes. See [Message Queue](#message-queue-session_partsclaimspy--eventspy) above.
 
 ### Startup
 
@@ -1221,8 +1279,9 @@ Messages arriving while a session is busy are queued with ⏳ reaction and drain
 
 `GatewayOrchestrator` is the process's channel host, so it owns three config
 appliers, registered in `_register_config_appliers` on the shared `ConfigWatch`
-(the appliers, `restart_channel` and the boot re-hoist are
-`slack/gateway_runtime/channel_lifecycle.py`; the hoists stay in `gateway.py`)
+(the appliers' callbacks, `restart_channel` and the boot re-hoist are
+`slack/gateway_runtime/channel_lifecycle.py`; the hoists and the registration are
+`slack/gateway_runtime/channel_boot.py`)
 (`config/live.py`). The `Subscription` objects are kept on `self._config_subs`
 because the watcher holds a bound method WEAKLY — an orchestrator a test builds and
 discards must not pin itself into the registry. See
@@ -1342,7 +1401,7 @@ may drive a turn; the per-message admission decision is still audited where it i
 made.
 
 `slack.command` is the one Slack field marked `restart=True` in
-`config/sections.py`: the slash command is registered with Slack's app manifest, so
+`config/sections_slack.py`: the slash command is registered with Slack's app manifest, so
 no in-process apply can change it. No channel CONNECTION field is marked, because
 `restart_channel` applies those without a process restart.
 
@@ -1378,7 +1437,7 @@ Bidirectional sync: Slack ack → resolves dashboard approval future + broadcast
 
 When a subagent with a Slack parent session completes, the synthesized LLM response is posted to the owner's DM thread. Long replies are split into multiple messages using `_split_message()` from `handler.py` (3900 chars per chunk, split on newline boundaries), matching the behavior of final chat messages.
 
-A parent session born on any other channel (Telegram, Discord, `unified:` DM buckets, …) delivers the same synthesized reply through the governed cross-surface transport ladder instead (`_deliver_channel_reply` in `gateway.py`): the conversation is resolved via origin link (recorded by Discord's inbound dispatch) → non-Slack mirror link (e.g. a Telegram `/link` binding) → for direct (1:1) sessions only, the stored `"{namespace}:{user_id}"` channel value resolved through `transport.resolve_configured_target`; the target is vetted by `_resolve_channel_target` (SEL-audited, fail-closed, capability-gated on `supports_proactive_send`), then redacted and chunked to the transport's `max_message_chars`. Delivery is best-effort and fail-closed on ambiguity — group/forum sessions without an origin or mirror link, dispatchers that record neither, and denied egress all degrade to the dashboard notification (never a cross-conversation send), and the injected ACP turn still keeps the parent session aware of the result.
+A parent session born on any other channel (Telegram, Discord, `unified:` DM buckets, …) delivers the same synthesized reply through the governed cross-surface transport ladder instead (`_deliver_channel_reply` in `gateway_runtime/result_egress.py`): the conversation is resolved via origin link (recorded by Discord's inbound dispatch) → non-Slack mirror link (e.g. a Telegram `/link` binding) → for direct (1:1) sessions only, the stored `"{namespace}:{user_id}"` channel value resolved through `transport.resolve_configured_target`; the target is vetted by `_resolve_channel_target` (SEL-audited, fail-closed, capability-gated on `supports_proactive_send`), then redacted and chunked to the transport's `max_message_chars`. Delivery is best-effort and fail-closed on ambiguity — group/forum sessions without an origin or mirror link, dispatchers that record neither, and denied egress all degrade to the dashboard notification (never a cross-conversation send), and the injected ACP turn still keeps the parent session aware of the result.
 
 ## Tool Approval via Slack
 
@@ -1482,17 +1541,24 @@ stall cron, heartbeat, task-runner, or AutoNudge turns.
 - The Slack and dashboard windows reference `DashboardState._BACKGROUND_APPROVAL_TIMEOUT_SECS`
   / `DashboardState._APPROVAL_TIMEOUT` as the single source of truth.
 
-### Heartbeat Tool Allowlist (`HEARTBEAT_SAFE_TOOLS`)
+### Heartbeat Tool Allowlist
 
-Heartbeat sessions run unattended and cannot prompt a human for tool approval. `_is_heartbeat_safe_tool(event_title)` (`slack/gateway_runtime/tool_policy.py`) checks whether a tool is safe to auto-approve using a strict **exact-match** against the `HEARTBEAT_SAFE_TOOLS` frozenset — no verb/heuristic fallback (deny-by-default, per security-controls).
+Heartbeat sessions run unattended and cannot prompt a human for tool approval. `_is_heartbeat_safe_tool(event)` (`slack/gateway_runtime/tool_policy.py`) decides whether a tool is safe to auto-approve — exact-match, no verb/heuristic fallback (deny-by-default, per security-controls).
 
-**Title normalization** (applied before the set lookup):
+**The decision keys on the event's trusted identity, never on `event.title`.** The title is model-authored prose (`select_tool_title` can prefer the model's own `description`), so a heartbeat polling untrusted content could otherwise forge a title spelled like a safe tool over a real write. The gate reads `event.mcp_identity_trusted` (set only when `tool_name` / `mcp_server_name` came from the adapter's `_meta` channel; `False` denies outright), `event.tool_name` and `event.mcp_server_name` (empty only for a genuine host built-in or shell). A trusted pair of two empty strings — what a backend with no `_meta.kiro` support produces — is denied too: every branch needs a non-empty `tool_name`.
 
-1. Strip leading status prefix (`Running: `) via `_HEARTBEAT_STATUS_PREFIXES`.
-2. Strip ACP `mcp__<server>__<Tool>` prefix.
-3. Strip runtime `@<server>/<Tool>` prefix (kiro-cli titles arrive as `Running: @internal-mcp/ReadInternalWebsites`).
+Four branches, one per identity shape:
 
-Only the **bare tool name** (e.g. `ReadInternalWebsites`) is tested against the frozenset. Unknown tools are denied and a SEL audit event (`outcome: denied`, `reason: not_in_heartbeat_safe_tools`) is emitted so operators can tune the list. SEL failure on the approve path fails closed (denies the tool).
+| Shape | Rule |
+|---|---|
+| Host shell (`is_shell`, no server) | the recovered `shell_command` must pass `is_read_only_bash` and must not run `git` (`name_grant.program_names` walks every command position; a program set it cannot establish denies, and any program whose basename is `git`, any case, denies; then `is_read_only_bash`). git reads `.git/config` on invocation and `core.fsmonitor` / `core.hooksPath` name a program there that no text classifier sees; heartbeat has no human behind it to catch that. `_heartbeat_approval` then runs `name_grant.refusal_for_event`, the check every other unattended shell auto-approve runs; a refusal denies (`reason=name_grant_refused`) |
+| Host built-in (no server) | `hooks._is_host_read_only_builtin` on the real `_meta.kiro.toolName` spellings (`fs_read`, `glob`, `grep`, `web_fetch`, `web_search`; kiro-cli's `read` alias included). A built-in name with a server attached is an MCP server claiming the name and is denied |
+| Core MCP read | a `_HEARTBEAT_SAFE_CORE_MCP_TOOLS` name, matched only on `kirocrew-core`; the same name from another server, or with no server, is denied |
+| Edition addition | the exact `@server/tool` identity a companion pinned in `SlackEnterpriseGate.heartbeat_safe_tools()`; a bare entry never matches, and an MCP tool that declares `kind="execute"` is judged here on its identity, never on command text |
+
+Anything that matches no branch is denied and a SEL audit event (`outcome: denied`) is emitted so operators can tune the list: `reason: no_trusted_identity` when the event carries no trusted identity or an empty trusted `tool_name` -- the shape a backend with no `_meta` identity channel produces (a cache hit on empty names), so on such a backend every heartbeat tool call is denied this way, and the gateway warning says so, `reason: not_in_heartbeat_safe_tools` otherwise; the row's `tool_name` is the trusted `server/tool` identity when the event is trusted and the redacted title otherwise. SEL failure on the approve path fails closed (denies the tool).
+
+The heartbeat-scoped hooks (`_build_heartbeat_hooks`) set `HooksConfig.defer_reads_to_approver`, so the gate's read-only classifier tier gives no verdict for this session and every call the deny tiers let through reaches `_heartbeat_approval`: the tier approves on the ACP `kind`, the title and `is_shell`, all agent-influenced, and would otherwise run an edition tool declaring `kind="read"` before the allowlist saw it.
 
 ## Dashboard Token Authentication
 

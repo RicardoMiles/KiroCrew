@@ -69,3 +69,47 @@ def test_teams_doc_names_the_real_dashboard_url_key():
     text = _doc("teams-integration.md")
     assert "`dashboard.url`" in text
     assert "dashboard.host" not in text
+
+
+def _registered_slash_commands() -> set[str]:
+    """Every name passed to ``register_slash_command`` anywhere in the package.
+
+    Read from the source, not from ``SLASH_REGISTRY``: tests register throwaway
+    ``zz*`` commands into that shared dict, so its runtime contents depend on
+    which tests ran first in the worker.
+    """
+    import ast
+
+    names: set[str] = set()
+    for path in sorted((DOCS.parent).rglob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        if "register_slash_command(" not in source:
+            continue
+        for node in ast.walk(ast.parse(source, filename=str(path))):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            called = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if called != "register_slash_command":
+                continue
+            first = node.args[0] if node.args else None
+            assert isinstance(first, ast.Constant) and isinstance(first.value, str), (
+                f"{path}:{node.lineno}: register_slash_command needs a literal name "
+                "so the Slash Commands table can be checked against it"
+            )
+            names.add(first.value)
+    return names
+
+
+def test_slack_slash_command_table_lists_every_registered_command():
+    """The doc's Slash Commands table names exactly the registered sub-commands."""
+    text = _doc("slack-integration.md")
+    section = text.split("\n## Slash Commands\n", 1)[1].split("\n## ", 1)[0]
+    documented = set(re.findall(r"^\| `/kirocrew (\w+)", section, re.MULTILINE))
+
+    registered = _registered_slash_commands()
+    assert registered, "no register_slash_command call found"
+    assert documented == registered, (
+        f"missing from the table: {sorted(registered - documented)}; "
+        f"not registered: {sorted(documented - registered)}"
+    )

@@ -310,6 +310,18 @@ export default [
       // module parser-facing only, and keep it DOM-free, which is the property
       // that makes that easy to check.
       'src/hooks/themeCss.ts',
+      // The Paste CSS tab's parser and serialiser: every literal is stylesheet
+      // text (the `.dark` / `.light` block template, the placeholder's sample
+      // values) or a CSS pattern, handed to a CSS reader, never shown as words.
+      // The parse result carries property NAMES and counts, not sentences; the
+      // tab's messages are resolved from the catalog in `themeEditor.tsx`, which
+      // stays fully gated.
+      //
+      // Verified copy-free by the same mechanical boundary as `themeCss.ts`
+      // above: no `i18nT` / `useTranslation` import, no JSX, no DOM access.
+      // Stated as a false-negative class: copy added to THIS path will not be
+      // reported, so keep it data in, data out.
+      'src/lib/themeCssImport.ts',
       // The Kiro-ghost avatar generator's art tables. Every literal in the module
       // is SVG handed to the SVG parser: the shipped mark's `d` path data, the
       // per-part fragments built from it, and the hex tile colors. Translating any
@@ -870,6 +882,10 @@ export default [
               // splits into `data:`, `;base64,` and `` — the first matches the data-URI
               // pattern above, the second needs this.
               '[;,]?base64,?$',
+              // The `U+` of Unicode code-point notation (`U+${hex}`), which every
+              // locale writes the same way. Only the bare two-character quasi is
+              // exempt, so no sentence can pass as one.
+              'U\\+$',
               // API paths with an optional query string: `/api/file-raw?path=`. The
               // `^[.~]?/` entry above cannot match these — the plugin full-anchors every
               // pattern, so a prefix-only one is inert.
@@ -911,13 +927,14 @@ export default [
               // the same reason and enforced there by `glossary.test.ts`: "GitLab" is
               // "GitLab" in every language, and a localized spelling would name a
               // product that does not exist. They reach the UI as the provider name in
-              // Issue Radar's connect picker and as the `{{provider}}` value
-              // interpolated into its refresh tooltips, so the bare brand is the whole
+              // Issue Radar's connect picker, as the `{{provider}}` value
+              // interpolated into its refresh tooltips, and as the source provider's
+              // name in the pull-request panel header, so the bare brand is the whole
               // literal. Whole-value-anchored like the entry above, so a sentence that
               // merely mentions a forge is still reported — only the bare name is
               // exempt, and the sentences AROUND it stayed in the catalog (that is
               // what `{{provider}}` is for).
-              '^(GitHub|GitLab|Azure DevOps)$',
+              '^(GitHub|GitLab|Azure DevOps|Bitbucket Server)$',
               // The PPTX Maker chat-token KEYWORDS (`[Style: name]`,
               // `[Template: name]`). Enumerated and whole-value-anchored, exactly like
               // the modifier-key caps below: the agent prompts parse this literal
@@ -1180,6 +1197,10 @@ export default [
               'autoComplete', 'inputMode', 'enterKeyHint', 'spellCheck',
               'viewBox', 'xmlns', 'fill', 'stroke', 'd', 'points', 'transform',
               'encType', 'accept', 'pattern', 'lang', 'dir',
+              // `ErrorNotice`'s `noHandoffReason`: a sentence for the code reviewer
+              // saying why the notice has no agent hand-off. The component never
+              // renders it, so it is not copy.
+              'noHandoffReason',
             ],
           },
 
@@ -1349,13 +1370,18 @@ export default [
   // into the calls to earn the callee exemption would duplicate its branch logic
   // three times — a worse module for a lint technicality.
   //
-  // Scoped to this one file for the same reason as the two above: the module is the
-  // SDK's protocol surface (event tables, hooks, provider) and holds no other prose.
-  // The pieces that DO render copy — `ChatEmbed`, `ChatPanel`, `ChatMessageList` —
-  // are separate files and stay covered. Copy added here later belongs in the
-  // catalog, not under this exemption; keep this module protocol-and-diagnostics.
+  // Scoped to these two files for the same reason as the two above: they are the
+  // SDK's protocol surface (event tables, hooks, provider, the permission-fenced
+  // client) and hold no other prose. `scopedApi.ts` is the half the barrel split
+  // out; its one flagged literal is the permission-denied diagnostic that quotes the
+  // API path the author must add to `permissions.api`, passed to
+  // `AppApiPermissionError` (a typed `Error` the send wire matches by class, so the
+  // `^(Type)?Error$` callee exemption does not reach it). The pieces that DO render
+  // copy — `ChatEmbed`, `ChatPanel`, `ChatMessageList` — are separate files and stay
+  // covered. Copy added here later belongs in the catalog, not under this
+  // exemption; keep these modules protocol-and-diagnostics.
   {
-    files: ['src/app-sdk/index.ts'],
+    files: ['src/app-sdk/index.ts', 'src/app-sdk/scopedApi.ts'],
     rules: {
       'i18next/no-literal-string': 'off',
     },

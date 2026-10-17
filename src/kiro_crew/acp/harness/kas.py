@@ -1,6 +1,11 @@
-"""The KAS relay, reached through kiro-cli's own ACP transport.
+"""The KAS engine: through kiro-cli's own ACP relay, or from Crew's own bundle.
 
-KAS shares kiro-cli's binary, but reports MCP readiness through session-scoped
+Two spawn routes, one harness. By default KAS shares kiro-cli's binary (the
+relay, :mod:`kiro_crew.acp.kas_transport`). With ``agent.kas_bundle`` on, the
+harness spawns the engine ``kirocrew kas install`` laid down under the data
+home (:mod:`kiro_crew.acp.kas_bundle`) with its own Node runtime, and no
+kiro-cli is involved. Every seam after the spawn is identical: the wire is the
+engine's either way. KAS reports MCP readiness through session-scoped
 ``_kiro/mcp/status`` and ``_kiro/tools/didChange`` snapshots.
 
 It takes no ``--agent`` flag, so the agent definition travels on every session
@@ -42,7 +47,11 @@ from kiro_crew.acp.harness.base import (
 )
 from kiro_crew.acp.kas_agents import KasAgentTranslationError
 from kiro_crew.acp.kas_host_auth import answer_get_access_token, vault_holds_identity_off_loop
-from kiro_crew.acp.kas_transport import METHOD_KAS_AUTH_GET_ACCESS_TOKEN, build_kas_argv
+from kiro_crew.acp.kas_transport import (
+    METHOD_KAS_AUTH_GET_ACCESS_TOKEN,
+    build_kas_argv,
+    build_kas_bundle_argv,
+)
 from kiro_crew.acp.session_mcp import project_agent_spec
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
@@ -54,16 +63,72 @@ from kiro_crew.acp.types import (
 )
 from kiro_crew.agent import ForkGovernanceUnresolved
 from kiro_crew.config import paths as paths_mod
-from kiro_crew.kiro_cli import chat_sibling
+from kiro_crew.kiro_cli import chat_sibling, installed_kiro_cli_version
 from kiro_crew.mcp_gateway import session_servers as session_servers_mod
+from kiro_crew.platform.tool_names import kas_verified_releases, kas_vocabulary_drift
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["PROTOCOL_VERSION_KAS", "KasHarness", "resolve_projected_spec"]
+__all__ = [
+    "PROTOCOL_VERSION_KAS",
+    "KasHarness",
+    "resolve_projected_spec",
+    "warn_kas_vocabulary_drift",
+]
+
+#: The kiro-cli release the tool-vocabulary drift warning was last logged for in
+#: this process, ``None`` before the first. One slot, not a set: the warning is
+#: said once per release, and the release a gateway sees changes only when
+#: kiro-cli is upgraded under it, so the slot is what "once per release" needs
+#: and is bounded by its own shape.
+_DRIFT_WARNED_VERSION: tuple[int, int, int] | None = None
+
+
+def warn_kas_vocabulary_drift(version: tuple[int, int, int] | None) -> None:
+    """Say once per kiro-cli release, at KAS spawn, that the installed kiro-cli
+    is not one the KAS tool-vocabulary tables were measured on.
+
+    The mount direction fails silent on an id a different engine does not
+    recognise and the policy direction fails permissive on one the tables do
+    not know, so an operator relying on kiro-cli-spelled denies binding on KAS
+    should see the drift where sessions start, not only in a doctor command
+    they must run by hand. Same comparison as the doctor row
+    (``kas_vocabulary_drift``), on the same reading (the pinned binary's own
+    ``--version``: KAS reports no ``agentInfo.version`` on the wire). Lives on
+    this harness and nowhere shared (H13): the tables describe KAS only. An
+    unknown version is the doctor's "unknown" and says nothing.
+    """
+    global _DRIFT_WARNED_VERSION
+    drift = kas_vocabulary_drift(version)
+    if version is None or drift in ("", "unknown") or version == _DRIFT_WARNED_VERSION:
+        return
+    _DRIFT_WARNED_VERSION = version
+    logger.warning(
+        "kas backend: installed kiro-cli %s is %s the releases the KAS tool-name tables were "
+        "verified on (%s); a renamed, added or absent built-in would mount or be governed "
+        "under a name Crew does not know (kirocrew doctor reports the same; re-measure per "
+        "test/fixtures/kas_builtin_tool_ids.json and append the release to its "
+        "verified_kiro_cli_versions)",
+        ".".join(str(p) for p in version),
+        {"older": "older than", "newer": "newer than", "unverified": "not among"}[drift],
+        kas_verified_releases(),
+    )
+
 
 #: KAS numbers ACP revisions. It rejects the date-string spelling kiro-cli takes,
 #: so the TYPE here is part of the contract, not an encoding detail.
 PROTOCOL_VERSION_KAS = 1
+
+#: What a bundle spawn is logged under. The argv's program is a Node binary, which
+#: names no engine at all; this does.
+KAS_BUNDLE_SPAWN_LABEL = "kas-bundle"
+
+
+def _bundle_route_selected() -> bool:
+    """``agent.kas_bundle`` as configured. Blocking (reads config); call off the loop."""
+    from kiro_crew.config.loader import KiroCrewConfig
+
+    return bool(KiroCrewConfig.load().agent.kas_bundle)
 
 
 def _is_operator_override(binary: str, environ: Mapping[str, str]) -> bool:
@@ -114,12 +179,22 @@ def resolve_projected_spec(
 
     A project-only spec that exists but cannot be read raises
     :class:`KasAgentTranslationError`: there is no other spec of that name to run.
+    A name no spec declares at either level raises its subclass
+    :class:`~kiro_crew.acp.kas_agents.KasAgentSpecAbsent`, so a caller can say
+    what is missing rather than quote a failed file open.
     """
     if not kas_agents_mod.agent_spec_absent(agents_dir, agent):
         return kas_agents_mod.load_agent_spec(agents_dir, agent), agents_dir
     declared, project = project_agent_spec(agent, work_dir)
     if not declared:
-        return kas_agents_mod.load_agent_spec(agents_dir, agent), agents_dir
+        try:
+            return kas_agents_mod.load_agent_spec(agents_dir, agent), agents_dir
+        except KasAgentTranslationError as exc:
+            # Asked again after the read failed, so a spec that appeared meanwhile
+            # and cannot be read keeps its own reason.
+            if kas_agents_mod.agent_spec_absent(agents_dir, agent):
+                raise kas_agents_mod.KasAgentSpecAbsent(agent, agents_dir) from exc
+            raise
     if project is None:
         raise KasAgentTranslationError(
             f"agent {agent!r} is declared by {work_dir}/.kiro/agents but that spec is unreadable"
@@ -147,6 +222,34 @@ def resolve_projected_spec(
     return spec, paths_mod.project_agents_dir(work_dir)
 
 
+def _missing_agent_reason(agent: str, session_key: str) -> str:
+    """The reason a session cannot start on *agent*, which has no spec, for the user.
+
+    Names the Crew Member when *session_key* is one's DM thread, and the app the
+    agent came from when an installed app declares it (``apps.manager``). Blocking
+    file I/O, so it runs inside the projection's worker thread; it never raises,
+    because the reason replaces an error that is already being raised.
+    """
+    from kiro_crew.apps.manager import missing_agent_reason
+
+    member = ""
+    try:
+        from kiro_crew.config import KiroCrewConfig
+        from kiro_crew.members import member_identity_for_session
+
+        identity = member_identity_for_session(session_key)
+        if identity is not None:
+            row = KiroCrewConfig.load().agents.get(identity["name"])
+            member = (row.display_name if row is not None else "") or identity["name"]
+    except Exception:  # noqa: BLE001 - the member name is a label, never a gate
+        logger.debug("no member label for a missing agent %r", agent, exc_info=True)
+    try:
+        return missing_agent_reason(agent, member=member)
+    except Exception:  # noqa: BLE001 - same: fall back to the plain reason
+        logger.debug("no owner lookup for a missing agent %r", agent, exc_info=True)
+        return f'The agent "{agent}" can\'t start: its agent definition is missing.'
+
+
 class KasHarness(MembershipHarness):
     """The KAS relay host."""
 
@@ -155,19 +258,56 @@ class KasHarness(MembershipHarness):
     # ── Seam 1: spawn ──
 
     async def resolve_spawn(self, ctx: SpawnContext) -> SpawnPlan:
-        """``kiro-cli`` in relay mode, with the auth owner decided per spawn.
+        """The engine's argv, on whichever route ``agent.kas_bundle`` selects.
 
-        No ``--agent`` and no ``--model``: KAS takes custom agents over the wire
-        in ``session/new``, not from a flag.
+        No ``--agent`` and no ``--model`` on either route: KAS takes custom agents
+        over the wire in ``session/new``, not from a flag.
 
-        Crew owns the credential when its own vault holds a signed-in identity,
-        and kiro-cli owns it otherwise. Deciding that per spawn is what makes a
-        dashboard sign-in or sign-out take effect on the next process, and the
-        answer rides on the plan so the reader loop answers the engine's callback
-        only on a process that was started expecting it to.
+        **Bundle** (``agent.kas_bundle`` true): Crew's own installed engine and
+        Node runtime, spawned directly. Crew is the auth owner unconditionally --
+        there is no kiro-cli whose store could answer instead -- so the plan
+        carries ``host_auth=True`` whatever the vault holds; an empty vault is the
+        engine's own sign-in failure at prompt time, which the runtime already
+        maps to a sign-in prompt. Nothing installed is a refusal that names the
+        install command, not a fallback to the relay: the operator chose the
+        route, and silently running a different one would make a kiro-cli
+        problem look like a bundle problem (or the reverse).
+
+        **Relay** (default): ``kiro-cli`` in relay mode. Crew owns the credential
+        when its own vault holds a signed-in identity, and kiro-cli owns it
+        otherwise. Deciding that per spawn is what makes a dashboard sign-in or
+        sign-out take effect on the next process, and the answer rides on the plan
+        so the reader loop answers the engine's callback only on a process that
+        was started expecting it to.
         """
         from kiro_crew.acp.client import _resolve_kiro_bin_for_spawn, kiro_cli_not_found_message
         from kiro_crew.acp.session_handle import AcpRuntimeError
+
+        if await asyncio.to_thread(_bundle_route_selected):
+            # Imported here, not at module top: the installer module is the
+            # bundle route's alone, and this harness is imported on every KAS
+            # gateway whether or not that route is on.
+            from kiro_crew.acp import kas_bundle as kas_bundle_mod
+
+            bundle = await asyncio.to_thread(kas_bundle_mod.installed_bundle)
+            if bundle is None:
+                raise AcpRuntimeError(
+                    "agent.kas_bundle is on but no KAS engine bundle is installed under "
+                    f"{kas_bundle_mod.kas_engines_root()}. Run `kirocrew kas install`, or "
+                    "set agent.kas_bundle to false to use kiro-cli's relay."
+                )
+            logger.info(
+                "KAS auth owner=crew — spawning Crew's own engine bundle %s (node %s, agent=%s)",
+                bundle.version,
+                bundle.node_version or "?",
+                ctx.agent or "<none>",
+            )
+            return SpawnPlan(
+                argv=build_kas_bundle_argv(str(bundle.node_bin), str(bundle.acp_server)),
+                spawn_label=KAS_BUNDLE_SPAWN_LABEL,
+                stderr_label=KAS_BUNDLE_SPAWN_LABEL,
+                host_auth=True,
+            )
 
         kas_bin = await _resolve_kiro_bin_for_spawn(environ=dict(ctx.environ), home=ctx.home)
         if not kas_bin:
@@ -176,6 +316,11 @@ class KasHarness(MembershipHarness):
                     kiro_cli_not_found_message, environ=dict(ctx.environ), home=ctx.home
                 )
             )
+
+        # The vocabulary tables were measured on named releases; say so once per
+        # release when this is not one of them. Off the loop: one bounded
+        # ``--version`` spawn on the first call per binary, cached thereafter.
+        warn_kas_vocabulary_drift(await asyncio.to_thread(installed_kiro_cli_version))
 
         # Reads the vault off the loop and never raises.
         host_auth = await vault_holds_identity_off_loop()
@@ -298,7 +443,7 @@ class KasHarness(MembershipHarness):
         failed translation would leave the session on KAS's own default mode,
         which for a restricted agent is a BROADER agent than the caller asked for.
         """
-        from kiro_crew.acp.session_handle import AcpRuntimeError
+        from kiro_crew.acp.session_handle import AcpAgentUnavailable, AcpRuntimeError
 
         if not agent:
             return SessionExtras()
@@ -332,7 +477,15 @@ class KasHarness(MembershipHarness):
             if snapshot is not None and snapshot.spec is not None:
                 spec, prompt_dir = snapshot.spec, agents_dir
             else:
-                spec, prompt_dir = resolve_projected_spec(agents_dir, agent, work_dir)
+                try:
+                    spec, prompt_dir = resolve_projected_spec(agents_dir, agent, work_dir)
+                except kas_agents_mod.KasAgentSpecAbsent as exc:
+                    # Nothing defines the agent, so name what removed it (an app
+                    # switched off, usually) and the fix, rather than a file open
+                    # that failed. Still a refusal: there is no spec to run.
+                    raise AcpAgentUnavailable(
+                        _missing_agent_reason(agent, session_key), agent=agent
+                    ) from exc
             try:
                 # A session-injected server outranks an agent-declared one, so
                 # declaring both is a double registration. Only the caller holds

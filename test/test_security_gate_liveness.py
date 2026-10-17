@@ -270,7 +270,99 @@ def _url_payload_command(n: int) -> str:
 #: one chained command of that title would otherwise stop firing. No new rule, no new
 #: matching logic and no floor change: the growth is the helper's signature, the flag
 #: and its docstring.
-_PACKAGE_LINE_BUDGET = 28_906
+#:
+#: Raised again, from 28,906, for the AWS env-filter rules. grep reads the
+#: selector as text, while awk evaluates it as code and sed can delimit an
+#: address with any character, so they
+#: are two catalog rows the keystone both enforces (one row would need a top-level
+#: alternation, which leaves the linear fragment matcher); only grep's text
+#: selector lets ``aws-account-id=`` pass.
+#:
+#: Raised again, from 28,939, for the companion token-parameter URL-prefix seam in
+#: ``redaction``: pass 4 leaves a ``?token=`` value alone only when it is one
+#: unreserved/base64/percent-encoded run (plus trailing closers) directly after a
+#: ``CredentialPolicy.token_param_exempt_url_prefixes()`` member and no earlier pass
+#: claimed any of it. Costs the prefix reader with its degrade-to-empty contract, the
+#: prefix grammar, the enclosing-URL boundary scan, the preceding-destination guard
+#: (with proven earlier exempt links and their own ``<`` autolink opener blanked; any
+#: raw ``&`` or ``<`` before the prefix is a destination signal, never decoded), the
+#: value-run classes, and the match predicate. Public default is the empty set, so
+#: nothing is exempt without a companion. The context-local stream suspension and its
+#: exception-safe wrapper add the fail-closed rule for windows that cannot inspect
+#: the whole destination. Then by 128 more for the per-text scan state that keeps
+#: the two guards linear: candidates arrive left to right, so the destination guard
+#: reads each character once (a found signal is sticky, a scan resumes after the
+#: last exempt URL) and the boundary guard carries the last whitespace and the
+#: whitespace-free run an earlier matched prefix already settled. Same answers, and
+#: repeated exempt links cost one read of the text, not a rescan of the whole prefix each.
+#: Then by 20 more for replacing the variable-width scheme branch with
+#: fixed-width destination candidates and a backward scheme walk over disjoint
+#: colon-delimited runs. This removes regex retry amplification without widening
+#: the exemption or adding another scan of the message.
+#: Then by 21 more for ``redact_credentials``'s ``defer_token_param`` keyword: a
+#: streamed delta that a whole-segment run redacts again leaves pass 4 to that run
+#: while a prefix set is installed, read lazily on the first ``token=`` match as
+#: before. Every other pass still runs on the delta; the empty default and every
+#: other caller are byte-identical, and the stream suspension still wins. Then by
+#: 4 more because only a value no earlier pass touched is deferred: a partly
+#: claimed value is still redacted per delta, gaps and all.
+#:
+#: Raised again, from 29,165, for one write-protected TARGET in ``paths.py``: the microvm
+#: lane's crew records, whose rows carry the VM id ``teardown`` hands to
+#: ``launcher.terminate``. Ten lines, of which four are the comprehension and six the
+#: reason every entry in that list carries. No matching rule, no threshold and no pass
+#: moved -- a target was added to a list the gate already walks.
+#:
+#: Raised again, from 29,175, for the three ``sql`` catalog rows' descriptions,
+#: which now say the match is on the statement's text anywhere on the command line
+#: (heredoc bodies included) and name the file-editing tool for prose that mentions
+#: one. Six lines of catalog text: no pattern, matcher or floor change.
+#:
+#: Raised again, from 29,181, for the credential pre-filter's literal-led
+#: anchors: the Telegram, Discord and Authorization anchors are respelled to
+#: start with a literal ``re`` searches at memchr speed, which takes a second
+#: Authorization half and the comments that say why each spelling accepts
+#: exactly what the old one did. No credential branch, gate verdict or pass moved.
+#:
+#: Raised again, from 29,205, for ``readonly_bash.command_invokes_git``: the one
+#: pure check every read-only shell auto-approve asks so it never approves a
+#: command that runs git, which reads ``.git/config`` and so runs whatever
+#: ``core.fsmonitor`` / ``core.hooksPath`` name. About 89 lines, most of them the
+#: docstring, the runner and opener tables and the redirection and hidden-command
+#: patterns. It only narrows what auto-approves; no deny rule, threshold or pass
+#: moved.
+#:
+#: Raised again, from 29,293, for the ``engines`` leaf in ``paths.py``: the KAS
+#: engine bundle the gateway installs and later executes joins the file-tool floor
+#: beside ``playwright-cli`` -- one entry and its reason. No matcher moved.
+#:
+#: Raised again, from 29,296, for the hosts-file parse in ``argv_floor.py``
+#: telling apart the two halves of its cache key: a file that moves mid-parse is
+#: still ``"changed"``, while an own-address set the enrichment worker grows
+#: mid-parse hands the table back uncached, so a name absent from an unchanged
+#: file falls through to the DNS layer on the first ssh vet. Nineteen lines, five
+#: of them code and the rest the docstrings that say which half may move and why
+#: each answer stays fail-closed. No rule, threshold or pass moved.
+#:
+#: Raised again, from 29,315, for ``redaction_switch.code_text``: a scope inside which pass 3
+#: spares an ordered alphabet and a data URI payload, the flag it sets, the one place pass 3
+#: reads it, and the two checks that tell those shapes from a key. No credential branch, gate
+#: verdict or other pass moved.
+#:
+#: Raised again, from 29,411, for the discovery-verified OAuth consent endpoints in
+#: ``exfil.py``: the in-memory ``(host, path) -> expiry`` set with its TTL and cap,
+#: ``record_discovered_oauth_endpoint`` (which reuses the operator file's host and
+#: path validators), its ``oauth_endpoint_discovered`` SEL emitter, one lookup in
+#: ``_approved_oauth_authorization_endpoint`` and the facade export. The rationale
+#: lives in the security spec, not the package. An approved endpoint gets exactly
+#: the builtin set's exemption; no pattern, threshold or pass moved.
+#:
+#: Raised again, from 29,492, for the PEM private-key scan: a header that no END marker
+#: follows is matched without the full-block tail, which reads to the end of the text and
+#: made a text that repeats the header quadratic. 56 lines are the new ``pem_scan`` module
+#: (the spellings and the last-END-marker lookup) and 25 the choice between the two
+#: patterns in ``_credential_search``. No credential branch, match or pass moved.
+_PACKAGE_LINE_BUDGET = 29_573
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second

@@ -40,6 +40,8 @@ At spawn the gateway resolves `secret://MY_MCP_SECRET` from the vault.  If the
 named secret does not exist, the server fails to start rather than launching
 with a missing credential.
 
+### Route the server through the gateway
+
 The gateway is the only place a reference is resolved, so **route the server
 through the gateway**: in **Developer → MCP Management**, turn routing on for
 the server (this adds it to `mcp_gateway.stub_servers`). For the servers the
@@ -49,7 +51,10 @@ rather than starting it with the literal `secret://` text as its credential.
 Routing takes effect at the next gateway start, as any routing change does,
 and the server stays off until then: it counts as routed only once the running
 gateway serves it. Switching the server on in MCP Management, or **Enable
-all**, does not start it before that either. On a platform where the MCP
+all**, does not start it before that either. In the MCP servers table under
+**Customize → Connections**, its row reads Outdated and states why: the
+dashboard does not probe it, and the line names the env key that holds the
+`secret://` value. On a platform where the MCP
 gateway does not run, no reference can be resolved: put the credential in the
 server's `env` directly instead.
 An agent file you maintain by hand under `~/.kiro/agents/` is launched as
@@ -234,6 +239,55 @@ topologies and resolves the value only on the trusted side of the server spawn.
 
 ---
 
+## Non-secret environment for the agent: `agent.env`
+
+`agent.env` in `config.json` sets environment variables on every agent process
+Kiro Crew starts for a chat session, background session or subagent, on every
+backend, so shell tool calls and the MCP servers the agent starts inherit them.
+The gateway itself and MCP servers the gateway hosts do not get them. Use it for configuration, never for credentials:
+
+```bash
+kirocrew config set agent.env '{"HTTPS_PROXY": "http://proxy.example:3128", "NO_PROXY": "localhost,127.0.0.1", "NODE_EXTRA_CA_CERTS": "/etc/ssl/certs/corp.pem", "AWS_PROFILE": "dev"}'
+```
+
+- A value here wins over the same variable in the gateway's own environment;
+  the variables Kiro Crew sets for the session itself still win over it, except
+  defaults Kiro Crew only fills in when a name is unset (such as
+  `agent.child_env_defaults`), which this map overrides.
+- A name this map refuses is rejected when you save it: `kirocrew config set`
+  (and any dashboard write) fails with the key and the reason, and nothing is
+  written. A refused name that a hand edit puts in `config.json` is ignored with
+  a warning naming the key.
+- Values are stored in plaintext, so a credential-shaped name is refused: one
+  with a name segment that is, or ends in, `KEY`, `TOKEN`, `SECRET`, `PASSWORD`,
+  `PASSWD` or `CREDENTIAL` (`API_KEY`, `GITHUB_TOKEN`, `APIKEY`). A name that only
+  contains such a word, such as `GOPRIVATE` or `TOKENIZERS_PARALLELISM`, is
+  accepted. Put credentials in the vault and reference them with `secret://`.
+- Names Kiro Crew or the sandbox owns (`PATH`, `HOME`, `TMPDIR`, `KIROCREW_*`,
+  `KIRO_*`, `OPENCODE_*`, and similar) are refused. So are the names known to
+  make a shell, the dynamic loader, a language runtime or a tool the agent runs
+  execute code the command did not name: `LD_*`, `DYLD_*`, `PYTHON*`,
+  `NODE_OPTIONS`, `BASH*`, `SHELLOPTS`, `PS4`, `ZDOTDIR`, `IFS`, `SSH_*`, `GIT_*`
+  (except `GIT_TERMINAL_PROMPT` and `GIT_SSL_CAINFO`), and any name ending in
+  `PATH`, `LIB`, `OPT`, `OPTS`, `OPTIONS`, `FLAGS`, `COMMAND`, `SHELL`,
+  `EXECUTABLE`, `EDITOR`, `PAGER`, `ASKPASS` or `BROWSER`. That includes the
+  location of a config file a tool may read a program from: `KUBECONFIG`,
+  `AWS_CONFIG_FILE`, and any name ending in `CONFIG`, `CONFIG_DIR`,
+  `CONFIG_FILE` or `CONFIG_HOME` (`GH_CONFIG_DIR`, `OPENCODE_CONFIG_DIR`). This
+  is a denylist: it narrows what a write to `config.json` can attach to later
+  commands, and it cannot list every tool's variables. Choosing a toolchain
+  (`JAVA_HOME`, `CC`) is accepted. Also refused: the variables that move a
+  coding agent's sign-in directory (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
+  `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and similar) and any name the agent
+  environment scrub removes. Set a name such as `GIT_SSH_COMMAND` in the
+  gateway's own environment instead.
+- A change applies to agent processes started after it: warm pooled processes
+  and the shared background process are replaced. A session that is already
+  running, and subagents sharing its process, keep the environment that process
+  started with.
+
+---
+
 ## What NOT to do
 
 - **Do not** put secrets as plain string values inside
@@ -243,6 +297,9 @@ topologies and resolves the value only on the trusted side of the server spawn.
   agent-isolated — the gateway loads them and propagates them to all child
   processes including the agent. A warning is logged, but the key still reaches
   the process tree. Use the vault instead.
+- **Do not** use `.env` just to give the agent non-secret settings such as a
+  proxy, a CA bundle or `AWS_PROFILE`. Set them in `agent.env` instead (see
+  above): they then reach only the agent and what it runs, not the gateway.
 - **Do not** store MCP secrets in user-readable paths — a file at
   `~/.kiro/crew/mcp-secrets.env` or `~/.kiro/.env` is accessible to the agent
   via filesystem reads. A root-owned service environment file does not fix the

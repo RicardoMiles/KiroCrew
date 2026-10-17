@@ -43,6 +43,10 @@ import { usePreviewFlag } from './usePreviewFlag'
  * @returns `displayAgents` — `agents` as of the last successful load, NOT
  *   emptied on a scope switch. Display-only (the chat sidebar's agent tint and
  *   inherited row colour); never a source for a selection.
+ * @returns `displayChoices` — `choices` as of the last successful load, kept
+ *   across a scope switch like `displayAgents`. Display-only: the session list
+ *   reads it to mark a session whose agent has a same-name crewmate/custom-agent
+ *   pair with the memory it runs on.
  * @returns `error` — the catalog fetch FAILED, as distinct from an install that
  *   genuinely has one agent. The two used to be the same observation: the fetch
  *   swallowed its rejection and left `agents` empty, so every caller rendered a
@@ -137,8 +141,14 @@ export function useAgents(refreshTrigger: number, sessionKey?: string, projectDi
     () => (memberChoices ? shown : withoutCoveredCrewmates(shown)),
     [shown, memberChoices],
   )
+  // The picker's rows as of the last successful load, for display-only labels
+  // that must agree with the picker on when a same-name pair exists (#19472).
+  const displayPickerChoices = useMemo(
+    () => (memberChoices ? shownDisplay : withoutCoveredCrewmates(shownDisplay)),
+    [shownDisplay, memberChoices],
+  )
 
-  return { agents, displayAgents, choices: pickerChoices, defaultAgent, error, reload, reloading }
+  return { agents, displayAgents, choices: pickerChoices, displayChoices: displayPickerChoices, defaultAgent, error, reload, reloading }
 }
 
 /**

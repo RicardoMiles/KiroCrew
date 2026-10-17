@@ -91,7 +91,7 @@ const ALIAS_MATCH_PENALTY = 1_000_000
  * Name of the built-in default assistant, which is NOT a crewmate.
  *
  * The bare string rather than a shared constant because the page that special-cases
- * it spells it the same way inline (`MembersPage.tsx`'s `memberMemoryDisplay`); a new
+ * it spells it the same way inline (`membersPageModel.ts`'s `memberMemoryDisplay`); a new
  * shared export would be another spelling of a value the backend already fixes.
  */
 const BUILTIN_DEFAULT = 'default'

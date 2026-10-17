@@ -437,8 +437,8 @@ _KNOWN_SECOND_BOOT_CHANGES: dict[tuple[str, str], str] = {
     # behind cgroup scopes and the machine's own host names. A boot that
     # outlasts the window probes again, or a lookup started in one boot lands
     # in the next; neither is derived from the home.
-    ("kiro_crew.sandbox", "_CGROUP_SCOPE_PROBE_AT"): "host probe clock",
-    ("kiro_crew.sandbox", "_CPU_DELEGATED"): "host probe, re-read after a re-probe",
+    ("kiro_crew.sandbox_cgroup", "_CGROUP_SCOPE_PROBE_AT"): "host probe clock",
+    ("kiro_crew.sandbox_cgroup", "_CPU_DELEGATED"): "host probe, re-read after a re-probe",
     ("kiro_crew.security.argv_floor", "_OWN_HOST_NAMES_CACHE"): "host names",
     ("kiro_crew.security.argv_floor", "_OWN_HOST_RESOLVE_DONE"): "host names",
     ("kiro_crew.security.argv_floor", "_OWN_HOST_RESOLVE_IN_FLIGHT"): "host names",
@@ -501,7 +501,7 @@ _KNOWN_SECOND_BOOT_CHANGES: dict[tuple[str, str], str] = {
     ("kiro_crew.apps.builtins.auto_research.handlers", "_watchdog_task"): "reaped task handle",
     ("kiro_crew.apps.builtins.code_review_sage.backend.routes", "_TASKS"): "reaped task handles",
     ("kiro_crew.dashboard.handlers.mcp", "_mcp_probe_task"): "reaped task handle",
-    ("kiro_crew.sandbox", "_warm_thread"): "finished probe thread handle",
+    ("kiro_crew.sandbox_wrap", "_warm_thread"): "finished probe thread handle",
 }
 
 _SCALAR_TYPES = (int, float, str, bool, bytes, type(None), tuple, frozenset)
@@ -533,12 +533,21 @@ def _module_globals() -> dict[tuple[str, str], tuple[int, str]]:
 
 
 @pytest.mark.asyncio
-async def test_a_second_boot_touches_only_known_module_globals(gateway_boot) -> None:
+async def test_a_second_boot_touches_only_known_module_globals(gateway_boot, monkeypatch) -> None:
     """The generic witness behind the reset list: diff every loaded
     ``kiro_crew`` module's globals across a SECOND boot (the first warms the
     imports) and require each changed name to be either restored by the
     harness or listed in ``_KNOWN_SECOND_BOOT_CHANGES`` with its reason. A
     home-derived global that startup grows fails here by name."""
+    from kiro_crew.config import paths as config_paths
+
+    # The scratch-root override is validated once and pinned for the process by the first
+    # ``scratch_root()`` call, which a session spawn makes on an executor thread. Whether
+    # that call lands before the baseline or between the two snapshots depends on timing,
+    # not on what a boot does to the home. Settle the pin first so both snapshots hold the
+    # same value; the monkeypatch puts the old one back.
+    monkeypatch.setattr(config_paths, "_scratch_root_override_pin", config_paths._UNSET)
+    config_paths.valid_scratch_root_override()
     async with gateway_boot() as gw:
         await gw.get_json("/api/health", auth=False)
     before = _module_globals()

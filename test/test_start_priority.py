@@ -904,7 +904,14 @@ def test_an_unattended_stream_claims_nothing():
 
 
 def test_the_dashboard_runner_allocates_at_the_turns_priority():
-    tree = ast.parse((_SRC / "dashboard/chat_runner.py").read_text(encoding="utf-8"))
+    runner = _SRC / "dashboard/chat_runner.py"
+    tree = ast.parse(
+        "\n".join(
+            turn_file.read_text(encoding="utf-8")
+            for turn_file in [*sorted(runner.with_name("chat_turn").glob("*.py")), runner]
+            if turn_file.name != "__init__.py"
+        )
+    )
     run_chat = next(
         n for n in ast.walk(tree) if isinstance(n, ast.AsyncFunctionDef) and n.name == "_run_chat"
     )
@@ -926,8 +933,8 @@ def test_the_dashboard_runner_allocates_at_the_turns_priority():
 @pytest.mark.parametrize(
     ("path", "function"),
     [
-        ("dashboard/chat_handlers.py", "api_chat_slot_create"),
-        ("dashboard/chat_handlers.py", "api_chat_slot_project"),
+        ("dashboard/chat_api/slot_create.py", "api_chat_slot_create"),
+        ("dashboard/chat_api/session_relaunch.py", "api_chat_slot_project"),
     ],
 )
 def test_an_owner_slot_action_arms_its_eager_spawn_by_who_asked(path, function):
@@ -942,7 +949,7 @@ def test_the_agent_switch_arms_its_eager_spawn_by_who_asked():
     # rather than a request. The route derives that bit from the same owner gate
     # ``owner_start_priority`` reads; a turn's command never claims it.
     assert _priority_args(
-        "dashboard/chat_handlers.py", "switch_slot_agent", "schedule_eager_spawn"
+        "dashboard/chat_api/agent_switch.py", "switch_slot_agent", "schedule_eager_spawn"
     ) == ["person_priority(caller.owner)"]
 
 
@@ -972,7 +979,7 @@ def test_a_slot_action_arms_its_eager_spawn_by_who_asked(request_fields, expecte
     ("path", "function"),
     [
         ("dashboard/ws.py", "_handle_slot_focused"),
-        ("dashboard/chat_handlers.py", "reload_slot_session"),
+        ("dashboard/chat_api/session_relaunch.py", "reload_slot_session"),
     ],
 )
 def test_the_focus_prefetch_and_reload_arm_background_eager_spawns(path, function):
@@ -1030,7 +1037,7 @@ def test_every_transport_marks_what_it_receives_as_a_persons(transport):
         ("wecom/transport_dispatch.py", "ChannelTurn", 1),
         ("whatsapp/transport_dispatch.py", "ChannelTurn", 1),
         ("discord/transport_dispatch.py", "Asker", 1),
-        ("telegram/transport_dispatch.py", "get_or_create", 1),
+        ("telegram/dispatch/turn_engine.py", "get_or_create", 1),
     ],
 )
 def test_a_channel_dispatcher_starts_a_turn_at_the_inbounds_origin(path, callee, count):
@@ -1054,7 +1061,13 @@ def test_slack_automation_paths_name_no_priority():
     """The gateway's own Slack wakes (auto-nudge, monitor) and its completion
     injections take the BACKGROUND default; only the event and interaction paths,
     which carry a person's message, claim one."""
-    source = (_SRC / "slack/gateway.py").read_text(encoding="utf-8")
+    source = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (
+            _SRC / "slack/gateway.py",
+            *sorted((_SRC / "slack/gateway_runtime").glob("*.py")),
+        )
+    )
     assert "start_priority" not in source
     events = (_SRC / "slack/events.py").read_text(encoding="utf-8")
     assert events.count("start_priority=person_priority(not ") == 4
@@ -1109,13 +1122,12 @@ def test_the_background_respawn_and_the_provider_path_take_the_same_priority():
         and n.func.value.id == "replacement"
     ]
     assert spawns == [["start_priority"], ["start_priority"]]
-    # The implementation, not the Protocol stub of the same name.
+    # The body that takes the cold-start permit, behind the single-flight
+    # wrapper ``_ensure_background``.
     ensure = next(
         n
         for n in ast.walk(tree)
-        if isinstance(n, ast.AsyncFunctionDef)
-        and n.name == "_ensure_background"
-        and "_start_sem" in ast.unparse(n)
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "_ensure_background_single"
     )
     acquires = [
         ast.unparse(a)

@@ -44,6 +44,7 @@ from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
     ACP_BACKEND_KIRO,
     ACP_BACKEND_OPENCODE,
+    ACP_BACKEND_PI,
     ACP_BACKENDS_MEMBER_DISPATCH,
     ACP_BACKENDS_SESSION_MCP_ARRAY,
 )
@@ -143,6 +144,7 @@ class TestCapabilitySet:
                 ACP_BACKEND_OPENCODE,
                 ACP_BACKEND_GOOSE,
                 ACP_BACKEND_DEEPSEEK,
+                ACP_BACKEND_PI,
             }
         )
         assert ACP_BACKEND_KIRO not in ACP_BACKENDS_MEMBER_DISPATCH
@@ -830,7 +832,7 @@ class TestDisabledServerIsNeverMounted:
 
     Scope worth stating, since these parametrize over backends: they pin the CLIENT
     path, which is opencode's. The other composer is pinned beside its own code, in
-    ``test_acp_runtime.py::TestRuntimeMemberDispatchDisabled`` -- both of
+    ``test_acp_runtime_load_session.py::TestRuntimeMemberDispatchDisabled`` -- both of
     ``AcpRuntime``'s paths, create and resume.
     """
 

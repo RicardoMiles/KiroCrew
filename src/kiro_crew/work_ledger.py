@@ -251,6 +251,12 @@ MAX_RECORD_BYTES = 1_000_000
 #: passes its own window.
 DEFAULT_STALE_WINDOW_SECS = 900.0
 
+#: How long one item's acceptance may read ``pending`` on end before
+#: :func:`is_pending_overdue` flags it. Per item, and wall-clock rather than patrol
+#: cycles, because the conductor picks its own interval. A day is far past any CI run
+#: that is only slow.
+PENDING_BUDGET_SECS = 24 * 60 * 60.0
+
 # --------------------------------------------------------------------------- #
 # Error codes. Named for the HTTP-facing vocabulary Phase 2 maps them onto, so the
 # mapping is a lookup rather than a re-classification.
@@ -459,7 +465,8 @@ class WorkItem:
     ``worker_session_key``, ``round``, ``fails``.
     Worker-owned: ``status``, ``reason``, ``summary``, ``artifacts``, ``pr``,
     ``last_report_at``.
-    Server-owned: ``item_id``, ``created_at``, ``closed_at``, ``decided_at``.
+    Server-owned: ``item_id``, ``created_at``, ``closed_at``, ``decided_at``,
+    ``pending_since``.
 
     ``orphaned`` and ``stale`` are NOT fields. They are derived at read time by
     :func:`is_orphaned` and :func:`is_stale`, because a stamped flag would need
@@ -490,6 +497,10 @@ class WorkItem:
     #: newer than the last report hands a ``blocked`` / ``question`` item back to the
     #: worker; see :func:`is_stale`.
     decided_at: str | None = None
+    #: When the item's current run of ``pending`` verdicts began, or ``None``. The
+    #: first ``pending`` verdict stamps it; any other verdict, or a new bar from
+    #: ``accept``, clears it. See :func:`is_pending_overdue`.
+    pending_since: str | None = None
     schema: int = SCHEMA_VERSION
     #: When the crew log first held this item whole (its recorded create, or the
     #: baseline its first recorded mutation carried). Empty until then: the write
@@ -521,6 +532,7 @@ class WorkItem:
             "created_at": self.created_at,
             "closed_at": self.closed_at,
             "decided_at": self.decided_at,
+            "pending_since": self.pending_since,
             "recorded_at": self.recorded_at,
         }
 
@@ -558,6 +570,7 @@ class WorkItem:
             created_at=_as_str(raw.get("created_at")),
             closed_at=_as_opt_str(raw.get("closed_at")),
             decided_at=_as_opt_str(raw.get("decided_at")),
+            pending_since=_as_opt_str(raw.get("pending_since")),
             recorded_at=_as_str(raw.get("recorded_at")),
             schema=_as_int(raw.get("schema"), SCHEMA_VERSION),
         )
@@ -1621,6 +1634,33 @@ def _decided_after_report(item: WorkItem) -> str | None:
         return None
 
 
+def is_pending_overdue(item: WorkItem, *, now: datetime | None = None) -> bool:
+    """Whether *item*'s acceptance has read ``pending`` for longer than the budget.
+
+    ``accept_eval.py`` keeps no state between cycles, so a check that never reports (no
+    free runner, a deleted required check, a fork run nobody approves) answers
+    ``pending`` on every cycle, and polling it never ends. ``pending_since`` is when the
+    current run of ``pending`` verdicts began; past :data:`PENDING_BUDGET_SECS` the
+    conductor stops evaluating the item and asks the user. Derived at read time, like
+    :func:`is_stale`.
+
+    Never for a terminal item, nor for a ``human_approval`` bar: that one is ``pending``
+    until a person answers, and the conductor settles it by asking, not by polling. No
+    ``pending_since`` (no run yet, or a record from before the field) is not overdue. An
+    unparseable stamp is, because the run keeps it and the alternative is an item that
+    can never be flagged.
+    """
+    if item.is_terminal or item.verdict != "pending" or not item.pending_since:
+        return False
+    if item.acceptance.get("kind") == "human_approval":
+        return False
+    started = parse_stamp(item.pending_since)
+    if started is None:
+        return True
+    moment = now or datetime.now().astimezone()
+    return moment - started > timedelta(seconds=PENDING_BUDGET_SECS)
+
+
 def is_acceptance_concrete(acceptance: Any) -> bool:
     """Whether *acceptance* names a bar ``accept_eval.py`` can actually evaluate.
 
@@ -2338,6 +2378,10 @@ def _write_item_action(
             item.verdict = checked_verdict
             if checked_fails is not None:
                 item.fails = checked_fails
+            if checked_verdict != "pending":
+                item.pending_since = None
+            elif not item.pending_since:
+                item.pending_since = _now_iso()
             event = _commit_item_locked(slot_key, item, "verdict", checked_verdict)
         else:
             assert checked_state is not None
@@ -2522,6 +2566,8 @@ def apply_acceptance_update(
         if item.is_terminal:
             raise WorkLedgerError(f"item {checked_id!r} is {item.state}", code=CODE_ITEM_CLOSED)
         item.acceptance = checked_acceptance
+        # A pending run belongs to the bar it measured; the new bar starts its own.
+        item.pending_since = None
         event = _commit_item_locked(
             slot_key, item, "decision", "acceptance promoted by the conductor"
         )

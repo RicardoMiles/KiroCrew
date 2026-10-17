@@ -1232,7 +1232,7 @@ _REGISTERED_CALL_SITES: dict[str, str] = {
         "which from_env reads above its own cache so a warm-pool rekey stays "
         "visible"
     ),
-    "mcp_core.py": (
+    "mcp_core_parts/identity.py": (
         "stale-file cleanup glob only (assumes HOST pids) — its lenient "
         "resolver no longer carries a walk of its own and delegates to "
         "mcp_caller.resolve_own_identity; the STRICT path delegates to "
@@ -1248,10 +1248,10 @@ _REGISTERED_CALL_SITES: dict[str, str] = {
         "plus the host ancestor chain (gatewayd indexes the chain for "
         "claim-push matching); .txt reads via "
         "session_pid_sig.read_session_pid_txt (hardened, unsigned). Consumed "
-        "by gatewayd (stub register) and dashboard/token_auth (unix-socket "
+        "by gatewayd (stub register) and dashboard/token_auth_callers (unix-socket "
         "peer verification)"
     ),
-    "dashboard/token_auth.py": (
+    "dashboard/token_auth_callers.py": (
         "reader (via peer_resolve.resolve_peer_identity, no inline walk): "
         "kernel-attests internal-API requests arriving on the dashboard's "
         "AF_UNIX socket — SO_PEERCRED peer pid → host-namespace ancestry walk "
@@ -1389,10 +1389,10 @@ def test_reflexive_tools_route_through_the_strict_gate() -> None:
         if _REFLEXIVE_GATE_CALL.search(text):
             gated.add(rel)
 
-    # 1. The gate is the ONLY caller of the strict resolver. mcp_core.py hosts
-    #    both, plus the resolver's own internal consumers (diagnosis, the
+    # 1. The gate is the ONLY caller of the strict resolver. mcp_core_parts/identity.py
+    #    hosts both, plus the resolver's own internal consumers (diagnosis, the
     #    Slack identity classifier), so it is the single permitted file.
-    direct -= {"mcp_core.py"}
+    direct -= {"mcp_core_parts/identity.py"}
     assert not direct, (
         f"Direct _resolve_session_key_strict() call(s) outside mcp_core: "
         f"{sorted(direct)}.\n"
@@ -1404,7 +1404,7 @@ def test_reflexive_tools_route_through_the_strict_gate() -> None:
 
     # 2. Every module calling the gate is registered as reflexive, and every
     #    registered module still calls it — the set is data, not lore.
-    gated -= {"mcp_core.py"}
+    gated -= {"mcp_core_parts/identity.py", "mcp_core_parts/governance.py"}
     registered = set(REFLEXIVE_TOOL_MODULES)
     unregistered = gated - registered
     stale = registered - gated

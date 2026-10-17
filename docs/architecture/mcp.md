@@ -89,8 +89,16 @@ kirocrew`). Onto that base:
    instead of losing to the value the first rebuild froze. Every other key on the
    entry is the user's and survives by omission, `autoApprove` included.
    Reconciling retires the name, so a lower-priority scope cannot reconcile it
-   again. `command`/`url` and the fields dependent on them (`args`, `env`,
-   `headers`) are NOT reconciled — see the fallback's as-a-unit rule below.
+   again. `command`/`url` and `headers` are NOT reconciled — see the fallback's
+   as-a-unit rule below. `args` and `env` ARE, but only onto an entry whose
+   command names the same program the source declares (the discovery module's
+   `_commands_diverged`, which reads the entry's resolved `/…/bin/npx` as the
+   source's bare `npx`): the two are written for one program, so a source that
+   kept its command and added an `env` variable or an argument later must reach
+   the server it already runs, while a source that switched programs keeps the
+   entry's old command/args/env pairing whole rather than lending its new env to
+   the old command. The unit is projected, not merged: a key the source dropped
+   is removed.
 3. **Seam-contributed provider globals**, so they can only fill gaps the Kiro
    global did not: a name step 1 or step 2 already claimed in this pass has been
    retired, so it is left alone. Empty in this build.
@@ -924,17 +932,17 @@ command and environment identity again immediately before the fork, so revoking
 an approval while it waits prevents the process from starting. A stub with no
 recorded approval needs one in **Developer → MCP Management** before it pools. Cached recommendation
 seeding may add a stub route, but it grants no launch approval; the seeded
-row stays on the session-sandboxed path until the operator reviews it.
+row stays on the session-sandboxed path until the operator approves it.
 
 The MCP Management toggle resolves the launch at the time of the operator's
-choice. Every `stub: true` is a compare-and-set on a displayed launch, the first
-approval of a name included: the UI reads
+choice. Every `stub: true` is a compare-and-set on the launch read at that
+moment (`expected_launch`), the first approval of a name included: the UI reads
 `GET /api/mcp-gateway/servers/launch?name=<name>`, which returns `name`,
-`commands`, `envs`, `complete` and, only when the display is complete,
-`expected_launch`. This display-safe, bounded GET follows the other dashboard
+`commands`, `envs`, `complete` and, only when the resolution is complete,
+`expected_launch`. This scrubbed, bounded GET follows the other dashboard
 read routes and does not require owner identity; the POST that records the choice
 remains owner-only. `POST /api/mcp-gateway/servers/stub` refuses a missing token
-with 409 `expected_launch_required`, a truncated display with 409
+with 409 `expected_launch_required`, a truncated resolution with 409
 `launch_display_incomplete`, and a token that no longer matches the resolution
 with 409 `launch_changed_since_display`. A batch `stub: true` returns 400
 `batch_stub_requires_individual`; batch `stub: false` is accepted. Turning a stub
@@ -942,13 +950,16 @@ off revokes the approval first, and restores it when the config write does not
 commit. The approval also stores the redacted, bounded display of the approved
 launch, so a `changed_needs_reapproval` refusal carries `approved_commands` and
 `approved_envs` beside the new `commands` and `envs`; an approval recorded
-without a display omits both fields. A refused row exposes each display-only command argv with its redacted
-declared environment. Both displays are scrubbed and bounded before they enter
-the refusal record, and status polling only reads that record; it does not rebuild
-or resolve agent specs. Every identity serialized into `expected_launch` has
-exactly one displayed command and one displayed environment, so an approval
-covers only launch content the operator saw. Selecting re-approve sends back the
-stored command/effective-environment pair for the row. The handler compares it
+without a display omits both fields. The refusal record carries each command argv
+with its redacted declared environment, scrubbed and bounded before they enter it,
+but the dashboard does not display them: the page shows only that a server needs
+approval, not the command it would run. Status polling only reads that record; it
+does not rebuild or resolve agent specs. Every identity serialized into
+`expected_launch` has exactly one command and one environment behind it, so an
+approval covers the exact launch the gateway resolved, pinned by `expected_launch`,
+whether or not any command was shown. One click on the row -- or a confirm in the
+bulk review -- approves the launch read at that moment, sending back the stored
+command/effective-environment pair for the row. The handler compares it
 with both the stored refusal and a fresh resolution before any write; a changed
 launch returns 409 and preserves both stores. A matching launch replaces the
 fingerprint and clears the refusal. A changed command, arguments, or declared
@@ -1499,6 +1510,19 @@ The third layer is defense in depth for hosts that ignore `disabledTools`. When 
 policy cannot be read, what it does depends on WHY, because the reasons differ in
 kind and its two consumers carry different risk.
 
+It runs only in Kiro Crew's own servers. `mcp_shared.serves_managed_tools` checks
+where the loop's `tools/call` handler is defined: under the `kiro_crew` package (the
+control plane and the builtin apps) the policy applies; anywhere else -- a
+user-installed app that serves its own tools through `run_mcp_stdio_loop` -- the
+loop answers "nothing excluded" without a read. The policy names managed tools,
+so it has nothing to say about an app's own, and on the shared ACP runtime such a
+server is never handed a session token (identity rides only the
+control plane), so the read could only refuse every call. The app's tools stay gated
+by its spec's `tools` / `allowedTools` and kiro-cli's `disabledTools`. The check runs
+inside the server's own process and is not a boundary against the app; what it must
+not do is let a Kiro Crew server out, so a handler whose code location cannot be read
+keeps the policy.
+
 `tools/call` fails **closed** on the four reasons in `_UNRESOLVED_REFUSES_CALL`
 (`mcp_shared.py`): `policy_unreadable`, `identity_unattested`, `identity_unattestable`
 and `resolution_failed`. Each means "an operator exclusion may exist and this process
@@ -1667,15 +1691,15 @@ Managed servers, registered by `agent._MANAGED_MCP_SERVERS` and installed into
 | Server | Process | Tools |
 |--------|---------|-------|
 | `kirocrew-cron` | `kirocrew mcp-cron` (`mcp_cron.py`) | `cron_add`, `cron_list`, `cron_update`, `cron_remove`, `cron_remove_all`, `cron_pause`, `cron_resume`, `cron_trigger`, `cron_secret_request` |
-| `kirocrew-core` | `kirocrew mcp-core` (`mcp_core.py` + `mcp_tools/`) | spawn/subagent, learn, task, messaging, artifact, workflow, knowledge and session-directive tools (see below) |
+| `kirocrew-core` | `kirocrew mcp-core` (`mcp_core.py` + `mcp_core_parts/` + `mcp_tools/`) | spawn/subagent, learn, task, messaging, artifact, workflow, knowledge and session-directive tools (see below) |
 | `kirocrew-computer` | `kirocrew mcp-computer` (`mcp_computer.py`) | `computer_list_apps`, `computer_launch_app`, `computer_get_state`, `computer_click`, `computer_drag`, `computer_type_text`, `computer_press_key`, `computer_set_value`, `computer_scroll`, `computer_perform_action`, `computer_end_turn` |
-| `kirocrew-dashboard` | `kirocrew mcp-dashboard` (`mcp_dashboard.py`) | `chat_folder_tree`, `chat_folder_create`, `chat_folder_move`, `chat_folder_update`, `chat_folder_move_session`, `chat_folder_delete`, `chat_folder_file_self`, `chat_tag_list`, `chat_tag_create`, `chat_tag_update`, `chat_tag_assign`, `chat_tag_column_list`, `chat_tag_column_create`, `chat_tag_column_move`, `session_move_to_column`, `chat_session_pin`, `session_create`, `session_fork`, `session_stop`, `session_end_wait`, `session_retry`, `session_continue`, `session_set_model`, `session_reload`, `session_rename`, `session_generate_title`, `session_close`, `session_revive`, `session_send`, `session_broadcast`, `session_status`, `session_adopt`, `session_release`, `session_read_message`, `session_summary` |
+| `kirocrew-dashboard` | `kirocrew mcp-dashboard` (`mcp_dashboard.py`) | `chat_folder_tree`, `chat_folder_create`, `chat_folder_move`, `chat_folder_update`, `chat_folder_move_session`, `chat_folder_delete`, `chat_folder_file_self`, `chat_tag_list`, `chat_tag_create`, `chat_tag_update`, `chat_tag_assign`, `chat_tag_column_list`, `chat_tag_column_create`, `chat_tag_column_move`, `session_move_to_column`, `chat_session_pin`, `session_create`, `session_fork`, `session_stop`, `session_end_wait`, `session_retry`, `session_continue`, `session_set_model`, `session_reload`, `session_rename`, `session_generate_title`, `session_close`, `session_revive`, `session_history_list`, `session_send`, `session_broadcast`, `session_status`, `session_adopt`, `session_release`, `session_read_message`, `session_summary` |
 | `kirocrew-work` | `kirocrew mcp-work` (`mcp_work.py`) | `work_brief`, `work_report`, `work_ledger_read`, `work_ledger_rebuild`, `work_ledger_record` |
 | `kirocrew-crew-log` | `kirocrew mcp-crew-log` (`mcp_crew_log.py`) | `crew_log_list`, `crew_log_read`, `crew_log_projection` |
 | `kirocrew-debug` | `kirocrew mcp-debug` (`mcp_debug.py`) | `debug_gateway`, `debug_refusals`, `debug_threads`, `debug_processes`, `debug_snapshots` |
 | `kirocrew-panel` | `kirocrew mcp-panel` (`mcp_panel.py`) | `panel_publish`, `panel_templates`, `dashboard_fields`, `dashboard_types`, `dashboard_write`, `dashboard_templates`, `dashboard_preview`, `dashboard_apply`, `dashboard_rollback` |
 | `kirocrew-guide` | `kirocrew mcp-guide` (`mcp_guide.py`) | `guide_list_actions`, `guide_start`, `guide_status`, `guide_cancel`, `list_change_kinds`, `find_setting`, `get_member_capabilities`, `diagnose_settings`, `propose_change`, `get_change_status`, `search_docs`, `find_ui` |
-| `kirocrew-mate` | `kirocrew mcp-mate` (`mcp_mate.py`) | `update_self`, `set_model`, `set_approval_mode`, `request_capabilities` |
+| `kirocrew-mate` | `kirocrew mcp-mate` (`mcp_mate.py`) | `update_self`, `set_model`, `set_approval_mode`, `request_capabilities`, `goal_read`, `set_goal`, `set_key_results`, `key_result_progress`, `save_goal_report` |
 
 `kirocrew-guide` is a platform capability: it is always emitted (not `opt_in`),
 so the default `kirocrew` template, every crewmate built from it, the worker
@@ -1740,6 +1764,30 @@ turn, as every card outcome does. A `set_approval_mode` for the mode the thread
 already runs in (a record pinning none opens in
 `MEMBER_APPROVAL_MODE_UNSET_EFFECTIVE`) is refused `no_change` rather than
 drawn as a card from an empty value.
+The crewmate's goal (`member_goals.py`, `trust/member-goals/<slug>.json`, never
+`member-rules/`) splits the same way. `set_goal` and `set_key_results` are card
+asks (`crewmate.goal`, `crewmate.key_results`, applied and undone through
+`PUT /api/members/{slug}/goals/long-term|key-results` with an `expected`
+compare-and-set; a goal card adds a goal, or replaces one by `goal_id`, and the
+Undo of an added goal removes exactly that one). `goal_read`, `key_result_progress` and `save_goal_report`
+are direct reads and writes through `/api/member/self/goals/*`
+(`dashboard/handlers/member_goals.py`). `save_goal_report` files a weekly
+report or monthly review as a Markdown artifact under `Crewmates/<name>/Reports`
+and sends one notification linking it. These goal operations are deliberately
+NOT in `_USER_TURN_OPERATIONS`: the check-in turns of
+`dashboard/goal_reminder.py` are gateway-authored hidden turns in the
+crewmate's own thread, and recording readings and filing reports is what they
+are for. Every other admission check below still applies. Three card asks
+are admitted without a turn the user sent: any turn in the crewmate's own
+pinned thread (a check-in, a sub-agent's result coming back, the goal-setup
+nudge of `dashboard/goal_setup.py`) may call `set_goal`, `set_key_results` and
+`set_check_ins`. `_resolve_agent_caller(..., own_goal=True)` (passed only by
+`member.propose_self`) admits such a turn when the slot is a crewmate DM thread
+and marks the request `REQ_OWN_GOAL_TURN`; a channel turn is still refused. The
+route then refuses every other request (`model`, `approval_mode`,
+`capabilities`) with `not_user_turn`. Each is a card: nothing changes until the
+user presses it, so the crewmate may raise its own goal, milestones and
+check-ins whenever its work calls for it.
 The workspace, memory store, member id, key and template are not the
 crewmate's to change or to ask for.
 Its guide and card tools, and every `kirocrew-mate` tool, work only for a turn
@@ -2024,7 +2072,9 @@ innermost middleware, active only on `change_card_catalog.HOOKED_ROUTES`) refuse
 any caller that is not the dashboard owner (internal-secret, app and agent callers
 included), requires method, path and canonical body to equal the step (a
 `user` fill such as a secret's value is never read or stored; a `step` fill must
-equal what an earlier step's real response returned), re-reads the state before
+equal what an earlier step's real response returned, and one marked `in: path`
+replaces its placeholder segment in the path only with a plain identifier,
+`change_card_catalog.PATH_FILL_VALUE`), re-reads the state before
 the first write (`409 changed_since_preview`; `changed_since_apply` for undo),
 runs the handler unchanged and records the step only from its own 2xx. A card
 applies once; undo restores the state before the change, and is refused once the
@@ -2431,6 +2481,21 @@ that rebinds one (`patch("kiro_crew.mcp_core._post")`, `setattr(mcp_core, "sel",
 silently escape every such patch. `mcp_core._HANDLER_SURFACE` names the bindings
 that exist only for this purpose, so an import cleanup cannot quietly delete one.
 
+`mcp_core.py` keeps the server itself — `tools/list`, the call path and its call
+context, directive capture, the knowledge cache, `_send` and the five verbs — and is a
+mirror facade (`kiro_crew._facade_mirror`) over the owners in `mcp_core_parts/`, so
+every name they define still reads and patches as `mcp_core.<name>`. New plumbing goes
+to the owner of its responsibility:
+
+| Owner | Owns |
+|---|---|
+| `identity` | which session is calling: the lenient and strict resolvers, `require_strict_session_key` and its diagnosis, `REFLEXIVE_TOOL_MODULES`, the Slack identity classification |
+| `gateway` | where a call goes: the port, base URL and unix-socket caches, one request's target, the refused-target replay and re-verification, the internal secret, the identity headers, and `_send`'s retry schedule, failure text and error body |
+| `governance` | channel-agent containment and the messaging, browse, channel and memory-write vets |
+| `crew` | Crew Mode's `route_crew` and `select_crew` bodies |
+| `history` | the chat-history search tools' scoping, redaction and snippet helpers |
+| `radar_crew` | the Issue Radar crew tools' identity, ledger view and write scrubbing |
+
 The remaining upward dependency is known: the plumbing could move to a module the
 handlers own, which would make `mcp_tools` a leaf. That is a separate change —
 it has to retarget every patch site, which is mechanical but touches far more
@@ -2812,7 +2877,7 @@ primitive in `components/ui`, so a disclosure's owner is the shared
 `open:<id>` scope the generator compiles for every registered `kind:
 disclosure` (Older Sessions in `ChatSidebar`). A container that IS its own owner
 reports through `useGuideRevealScope(id, open)`.
-Wired today: the sessions sidebar and drawer (`ChatPage`), the chat side panel
+Wired today: the sessions sidebar and drawer (`SessionsSidebarChrome`), the chat side panel
 (`ChatPage`), the message box (`composer.box`, `ChatInput`), the navigation
 rail (`shell.nav-rail`, `RailBrandToggle`), the docked terminal panel
 (`shell.terminal-panel`, `BottomTerminalPanel`), the phone menu
@@ -3937,13 +4002,14 @@ Three failure modes follow.
 **1. Identity is not the process, it is the call.** `KIROCREW_SESSION_KEY` and
 `os.getppid()` identify the *process*, which is wrong by construction in a shared
 backend: the warm pool spawns with an empty key, and a sub-agent inherits its
-parent's tree. `mcp_core.py` offers two resolvers:
+parent's tree. `mcp_core.py` offers two resolvers (both defined in
+`mcp_core_parts/identity.py`):
 
 - `_resolve_session_key_strict` for **anything that mutates or targets a
   specific session** (post to a slot, change its state, deliver a callback) —
   reached ONLY through `require_strict_session_key()`, the shared fail-closed
   gate every reflexive tool module routes through (`REFLEXIVE_TOOL_MODULES`
-  enumerates them; a ratchet test rejects direct calls outside `mcp_core`). It
+  enumerates them; a ratchet test rejects direct calls outside `mcp_core_parts/identity.py`). It
   accepts only the gateway-injected caller context (`mcp_caller.current_caller()`,
   which gatewayd stamps on every forwarded frame after stripping any
   client-forged `kirocrew.caller` block), the signed per-session token
@@ -4765,6 +4831,16 @@ frame as unattributable.
   a `mcp_shared.DeferredTool` from its handler and does the waiting in short
   `step()`s. A synchronous handler bounds every call it makes well under
   `PROGRESS_WEDGE_CEILING_SECS`, or the pooled backend is recycled under it.
+- A clear never depends on an empty list or object arriving. Kiro CLI rebuilds
+  a call's arguments and drops every container that holds no scalar, plus a
+  top-level `null`, so `tags: []` reaches the server as an omitted `tags`. Give
+  each clear a spelling that arrives unchanged, a boolean or a list of at least
+  one name, keep the empty spelling working beside it, and say which to use in
+  the description: `cron_update` `clear_skip_dates: true`, `cron_secret_request`
+  `withdraw: true`, `monitor_update` `judge: {"wake_when": "", "quiet_when": ""}`,
+  `propose_change` `clear: true` (`folder.steering`) and `clear: [<field>]`
+  (`template.update`), `artifact_update` `clear_tags: true`,
+  `issue_radar_crew_record` `clear: ["labels_applied"]`.
 
 ## Troubleshooting
 

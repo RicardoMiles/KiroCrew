@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useTranslation } from 'react-i18next'
+import { Trans, useTranslation } from 'react-i18next'
 import { ApiError } from '../../api/apiError'
 import { capabilityKey, crewCapabilitiesApi, crewCapabilitiesKey, type CapabilityBackendWarning, type CapabilityDraft, type CapabilityOperation, type CapabilityPreview, type CapabilityRef, type CapabilityRow, type CapabilitySection } from '../../api/crewCapabilities'
 import { Badge, Btn, Checkbox, Input, PanelSectionHeader, SendBtn } from '../ui'
@@ -29,10 +29,26 @@ const isStaleCode = (code: string) => code.startsWith('stale_') || code.endsWith
 
 /** The member's own agent file an `unreviewable_drift` refusal names: a
  * basename Crew chose, never a path or a value from the file. */
-function refusedFile(body: string | undefined): string {
+const DETACH_BLOCKED_COPY = {
+  detach_tool_limits_unkept: 'crewCapabilities.detachToolLimits',
+  detach_removal_unkept: 'crewCapabilities.detachRemoval',
+} as const
+
+/** Why a reviewed approval will not land, one line per backend reason. */
+const WITHHELD_REASON_COPY = {
+  governed: 'crewCapabilities.withheldGoverned',
+  not_connected: 'crewCapabilities.withheldNotConnected',
+  managed: 'crewCapabilities.withheldManaged',
+  unexplained: 'crewCapabilities.withheldUnexplained',
+} as const
+
+/** A string field a refusal body carries: `file` (the agent file an
+ * `unreviewable_drift` names) or `ref` (the draft entry an
+ * `invalid_approval_ref` names). Empty when absent or unparsable. */
+function refusalField(body: string | undefined, key: 'file' | 'ref'): string {
   try {
-    const parsed = JSON.parse(body || '{}') as { file?: unknown }
-    return typeof parsed.file === 'string' ? parsed.file : ''
+    const value = (JSON.parse(body || '{}') as Record<string, unknown>)[key]
+    return typeof value === 'string' ? value : ''
   } catch {
     return ''
   }
@@ -93,6 +109,7 @@ export default function CrewCapabilitiesPane({ member, members = [], hidden, onD
   const qc = useQueryClient()
   const query = useQuery({ queryKey: crewCapabilitiesKey(member), queryFn: () => crewCapabilitiesApi.get(member), retry: false })
   const [discardOpen, setDiscardOpen] = useState(false)
+  const [detachOpen, setDetachOpen] = useState(false)
   const [draft, setDraft] = useState<CapabilityDraft | null>(null)
   const [preview, setPreview] = useState<CapabilityPreview | null>(null)
   const [category, setCategory] = useState<Category>('mcpServers')
@@ -117,7 +134,24 @@ export default function CrewCapabilitiesPane({ member, members = [], hidden, onD
     },
     onError: () => { setPreview(null); setReviewedRequest(null) },
   })
-  const busy = prepare.isPending || save.isPending
+  // Stop following the Parent. Nothing is recomputed: the member keeps the
+  // saved bytes it runs today as its own copy, so it is offered only on a
+  // clean pane (no draft to lose) and refreshes the same views a save does.
+  const detach = useMutation({
+    mutationFn: (revision: string) => crewCapabilitiesApi.detach(member, revision, !!view?.detach_mcp_json_loss),
+    onSuccess: async view => {
+      qc.setQueryData(crewCapabilitiesKey(member), view)
+      setDetachOpen(false)
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ['agentDetail'] }),
+        qc.invalidateQueries({ queryKey: ['agents-installed'] }),
+        qc.invalidateQueries({ queryKey: ['kirocrew-agents'] }),
+      ])
+      onSaved()
+    },
+    onError: () => setDetachOpen(false),
+  })
+  const busy = prepare.isPending || save.isPending || detach.isPending
   // Closing reads these in the parent. Publish before paint so paste followed
   // by Escape cannot reach a close handler that still considers the pane clean.
   useLayoutEffect(() => { onDirtyChange(dirty) }, [dirty, onDirtyChange])
@@ -132,11 +166,11 @@ export default function CrewCapabilitiesPane({ member, members = [], hidden, onD
   const emptyDraft = (): CapabilityDraft => ({ revision: view!.revision, enroll: false, operations: [], accept_parent: [], accept_members: [] })
   const edit = (change: (current: CapabilityDraft) => CapabilityDraft) => {
     setDraft(current => change(current ?? emptyDraft()))
-    setPreview(null); setReviewedRequest(null); prepare.reset(); save.reset()
+    setPreview(null); setReviewedRequest(null); prepare.reset(); save.reset(); detach.reset()
   }
   const changeRow = (operation: CapabilityOperation) => edit(current => ({ ...current, operations: [...current.operations.filter(op => capabilityKey(op) !== capabilityKey(operation)), operation] }))
-  const discard = () => { setDraft(null); setPreview(null); setReviewedRequest(null); setReference(''); setConnectionName(''); prepare.reset(); save.reset() }
-  const error = query.error || prepare.error || save.error
+  const discard = () => { setDraft(null); setPreview(null); setReviewedRequest(null); setReference(''); setConnectionName(''); prepare.reset(); save.reset(); detach.reset() }
+  const error = query.error || prepare.error || save.error || detach.error
   // Save refuses a drifted file whose change sits in a setting this page cannot
   // show. The refusal shares the stale save's 409, so it is told apart by the
   // body code, not the status.
@@ -149,13 +183,34 @@ export default function CrewCapabilitiesPane({ member, members = [], hidden, onD
   // (a missing parent, a shadowed template) when there may be no draft at all,
   // so those keep the load copy rather than the draft-refusal copy.
   const draftConflict = conflict && !query.error
+  // Stop following is refused with no draft open, so its refusals name the save
+  // that clears them instead of the draft advice a save refusal gets.
+  const detachFailed = !!detach.error && error === detach.error
+  const detachRefusal = detachFailed && errorCode && errorCode in DETACH_BLOCKED_COPY
+    ? DETACH_BLOCKED_COPY[errorCode as keyof typeof DETACH_BLOCKED_COPY]
+    : null
   const errorMessage = refused && error instanceof ApiError
-    ? t('crewCapabilities.unreviewableDrift', { member, file: refusedFile(error.body) })
-    : draftConflict && errorCode === 'alternate_permissions_require_review'
-      ? t('crewCapabilities.permissionsReview', { member })
-      : draftConflict && errorCode && !isStaleCode(errorCode)
-        ? t('crewCapabilities.refused', { code: errorCode })
-        : t(conflict ? 'crewCapabilities.stale' : error instanceof ApiError && [404, 405, 501].includes(error.status) ? 'crewCapabilities.unsupported' : 'crewCapabilities.failed')
+    ? t('crewCapabilities.unreviewableDrift', { member, file: refusalField(error.body, 'file') })
+    : detachRefusal
+      ? t(detachRefusal, { name: member })
+      : detachFailed && draftConflict && errorCode
+        ? t('crewCapabilities.detachRefused')
+      : draftConflict && errorCode === 'alternate_permissions_require_review'
+        ? t('crewCapabilities.permissionsReview', { member })
+        : draftConflict && errorCode && !isStaleCode(errorCode)
+          ? t('crewCapabilities.refused', { code: errorCode })
+          // A 400 is a refusal of the draft's own shape, which a Reload repeats.
+          // Name the code (and the fix for the one owners type by hand) rather
+          // than the generic "retry" copy, which loops.
+          : !query.error && error instanceof ApiError && error.status === 400 && errorCode
+            ? errorCode === 'invalid_approval_ref'
+              // The refusal names the entry it rejected; with none, the generic
+              // refusal copy still names the code.
+              ? refusalField(error.body, 'ref')
+                ? t('crewCapabilities.invalidApprovalRef', { ref: refusalField(error.body, 'ref') })
+                : t('crewCapabilities.refused', { code: errorCode })
+              : t('crewCapabilities.refused', { code: errorCode })
+          : t(conflict ? 'crewCapabilities.stale' : error instanceof ApiError && [404, 405, 501].includes(error.status) ? 'crewCapabilities.unsupported' : 'crewCapabilities.failed')
   const enabled = !!view && view.schema_version === 1 && view.template.available && !query.isError && (view.mode === 'inherited' || draft?.enroll === true)
   // The member's agent file changed outside this page, so new chats refuse to
   // start. An empty draft rebuilds the file from the saved setup; Review shows
@@ -212,7 +267,7 @@ export default function CrewCapabilitiesPane({ member, members = [], hidden, onD
         {/* No hand-off: capability drafts and signed previews are not saved. */}
         {error && !refused && <ErrorNotice message={errorMessage} variant="inline" />}
         {/* Reload clears a refusal too: its copy sends the user here once the file is fixed. */}
-        <Btn disabled={busy || query.isFetching} onClick={() => { setPreview(null); setReviewedRequest(null); prepare.reset(); save.reset(); void query.refetch() }}>{t('crewCapabilities.reload')}</Btn>
+        <Btn disabled={busy || query.isFetching} onClick={() => { setPreview(null); setReviewedRequest(null); prepare.reset(); save.reset(); detach.reset(); void query.refetch() }}>{t('crewCapabilities.reload')}</Btn>
         {query.isLoading && <p className="text-muted">{t('components.agentTemplateDetail.loading')}</p>}
         {view && view.schema_version !== 1 && <p className="text-muted">{t('crewCapabilities.unsupported')}</p>}
         {view?.schema_version === 1 && <>
@@ -235,6 +290,21 @@ export default function CrewCapabilitiesPane({ member, members = [], hidden, onD
             <p className="mt-1 text-muted">{t('crewCapabilities.newRuntime')}</p>
             {/* The preview carries its own copy for the reviewed draft. */}
             {!preview && <BackendWarning warning={view.backend_warning} member={member} onOpenTab={() => setCategory('mcpServers')} />}
+            {view.mode === 'inherited' && <div className="mt-3">
+              <Dialog open={detachOpen} onOpenChange={setDetachOpen}>
+                <DialogTrigger asChild><Btn disabled={dirty || busy || !!view.detach_blocked || !!detachRefusal} aria-describedby={detachRefusal ? undefined : 'crew-capabilities-detach-help'} data-testid="capability-detach">{t('crewCapabilities.detach')}</Btn></DialogTrigger>
+                <DialogContent maxWidth={440} className="z-[110]">
+                  <DialogHeader><DialogTitle className="whitespace-normal">{t('crewCapabilities.detachTitle', { name: member })}</DialogTitle></DialogHeader>
+                  <DialogBody><p className="m-0 break-words text-sm text-text">{t('crewCapabilities.detachBody', { name: member, parent: view.template.name, pane: t('pages.kiroCrewAgentsPage.built_from') })}</p>{view.detach_mcp_json_loss && <p className="mt-2 mb-0 break-words text-sm text-text" data-testid="capability-detach-mcp-json">{t('crewCapabilities.detachMcpJson', { name: member })}</p>}</DialogBody>
+                  <DialogFooter className="flex-wrap">
+                    <Btn onClick={() => setDetachOpen(false)}>{t('crewCapabilities.detachCancel')}</Btn>
+                    {/* Primary, not danger: stopping is undoable (follow again any time) and drops nothing. */}
+                    <Btn primary disabled={busy} data-testid="capability-detach-confirm" onClick={() => detach.mutate(view.revision)}>{t('crewCapabilities.detachConfirm')}</Btn>
+                  </DialogFooter>
+                </DialogContent>
+              </Dialog>
+              {!detachRefusal && <p id="crew-capabilities-detach-help" className="mt-1 text-[12px] text-muted">{t(dirty ? 'crewCapabilities.detachDirty' : view.detach_blocked ? DETACH_BLOCKED_COPY[view.detach_blocked] : 'crewCapabilities.detachHelp', { name: member })}</p>}
+            </div>}
             {view.mode !== 'inherited' && <div className="mt-3">
               <label htmlFor="crew-capabilities-enroll" className="flex items-start gap-2"><Checkbox id="crew-capabilities-enroll" aria-labelledby="crew-capabilities-enroll-label" aria-describedby="crew-capabilities-enroll-guarantee crew-capabilities-enroll-help" checked={draft?.enroll ?? false} disabled={busy || !view.template.available} onChange={e => edit(current => ({ ...current, enroll: e.target.checked }))} /><span className="min-w-0 break-words"><span id="crew-capabilities-enroll-label">{t('crewCapabilities.enroll')}</span><span id="crew-capabilities-enroll-guarantee" className="mt-1 block text-text">{t('crewCapabilities.enrollGuarantee')}</span></span></label>
               <p id="crew-capabilities-enroll-help" className="mt-1 text-[12px] text-muted" data-testid={enrollmentBlocksEditing ? 'capability-enroll-to-edit' : undefined}>{t('crewCapabilities.enrollHelp')}</p>
@@ -242,7 +312,7 @@ export default function CrewCapabilitiesPane({ member, members = [], hidden, onD
           </div>
           <div className="shrink-0 overflow-x-auto border-b border-border pb-2"><Tablist tabs={CATEGORIES.map(key => ({ key, label: t(CATEGORY_KEYS[key]) }))} value={category} onChange={setCategory} ariaLabel={t('crewCapabilities.title')} /></div>
           <fieldset disabled={!enabled || busy} className="min-w-0">
-            {category === 'mcpServers' && <SearchableSelect aria-label={t('crewCapabilities.connection')} triggerFallback={t('crewCapabilities.connection')} value="" disabled={!enabled || busy} options={view.connections.map(item => ({ value: item.id, label: item.label, disabled: item.managed, sublabel: item.managed ? t('crewCapabilities.managed') : undefined }))} onChange={id => changeRow({ section: 'mcpServers', id, action: 'set', connection_id: id })} />}
+            {category === 'mcpServers' && <SearchableSelect aria-label={t('crewCapabilities.connection')} triggerFallback={t('crewCapabilities.connection')} value="" disabled={!enabled || busy} options={view.connections.map(item => ({ value: item.id, label: item.label, disabled: item.managed, sublabel: item.managed ? t('crewCapabilities.managed') : undefined }))} onChange={id => changeRow({ section: 'mcpServers', id, action: 'set', connection_id: id })} modal />}
             {category === 'mcpServers' && <div className="mt-3 flex flex-col gap-2">
               <label className="text-[13px]">{t('crewCapabilityEditing.connectionName')}<Input value={connectionName} onChange={e => { setConnectionName(e.target.value); setPreview(null); setReviewedRequest(null) }} /></label>
               <Btn disabled={!connectionName.trim() || rows.some(row => row.section === 'mcpServers' && row.id === connectionName.trim())} onClick={() => {
@@ -250,7 +320,7 @@ export default function CrewCapabilitiesPane({ member, members = [], hidden, onD
                 setConnectionName('')
               }}>{t('crewCapabilityEditing.customConnection')}</Btn>
             </div>}
-            {category === 'skills' && <SearchableSelect aria-label={t('crewCapabilities.skill')} triggerFallback={t('crewCapabilities.skill')} value="" disabled={!enabled || busy} options={view.skills.map(item => ({ value: item.id, label: item.label }))} onChange={id => changeRow({ section: 'skills', id, action: 'set', value: true })} />}
+            {category === 'skills' && <SearchableSelect aria-label={t('crewCapabilities.skill')} triggerFallback={t('crewCapabilities.skill')} value="" disabled={!enabled || busy} options={view.skills.map(item => ({ value: item.id, label: item.label }))} onChange={id => changeRow({ section: 'skills', id, action: 'set', value: true })} modal />}
             {(category === 'tools' || category === 'autoApprove') && <div className="flex flex-col gap-2">
               <p className="text-[12px] text-muted">{t(category === 'tools' ? 'crewCapabilities.exposureHint' : 'crewCapabilities.approvalHint')}</p>
               {category === 'autoApprove' && <>
@@ -312,10 +382,22 @@ export default function CrewCapabilitiesPane({ member, members = [], hidden, onD
           {draft && draft.revision !== view.revision && <Btn disabled={busy} onClick={() => edit(current => ({ ...current, revision: view.revision }))}>{t('crewCapabilities.rebase')}</Btn>}
           {preview && <section className="rounded border border-border bg-bg-accent p-3 text-[13px]" aria-label={t('crewCapabilities.previewHeading')}>
             <PanelSectionHeader label={t('crewCapabilities.previewHeading')} />
+            {/* First, so the owner reads why before the per-member summary. A
+                member whose whole draft is withheld gets a summary line that says
+                so, instead of a bare "no effective value changes". The member
+                name renders as code so a name like `default` reads as a name. */}
+            {(preview.withheld_approvals ?? []).length > 0 && <div role="note" className="mb-2 break-words text-[13px] text-warn" data-testid="capability-preview-withheld">
+              <p><Trans i18nKey="crewCapabilities.withheldIntro" values={{ name: member }} components={[<code key="n" translate="no" />]} /></p>
+              <ul className="mt-1 list-disc pl-5">{(preview.withheld_approvals ?? []).map(item => <li key={capabilityKey(item)}>
+                <code className="break-all" translate="no">{item.id}</code>: <Trans i18nKey={WITHHELD_REASON_COPY[item.reason]} values={{ name: member }} components={[<code key="n" translate="no" />]} />
+              </li>)}</ul>
+              {/* The not-connected fix lives on this page; open its tab like BackendWarning does. */}
+              {(preview.withheld_approvals ?? []).some(item => item.reason === 'not_connected') && <Btn className="mt-2" onClick={() => setCategory('mcpServers')} data-testid="capability-withheld-open-tab">{t('crewCapabilities.withheldOpenTab')}</Btn>}
+            </div>}
             <ul className="mb-2 space-y-1" data-testid="capability-preview-members">{previewMembers.map(name => {
               const count = preview.impact.filter(item => item.member === name).length
               return <li key={name} className="break-words">
-                {count > 0 ? t('crewCapabilities.memberChanged', { name, count }) : t('crewCapabilities.memberUnchanged', { name })}
+                {count > 0 ? t('crewCapabilities.memberChanged', { name, count }) : name === member && (preview.withheld_approvals ?? []).length > 0 ? <Trans i18nKey="crewCapabilities.memberWithheldOnly" values={{ name }} components={[<code key="n" translate="no" />]} /> : t('crewCapabilities.memberUnchanged', { name })}
                 {name === member && keptRows.length > 0 && <>
                   <span className="mt-1 block">{t('crewCapabilities.memberKeptRows', { name })}</span>
                   <ul className="mt-1 list-disc pl-5" data-testid="capability-preview-kept-rows">{keptRows.map(row => <li key={capabilityKey(row)}><code className="break-all" translate="no">{row.section}: {row.id}</code> <Badge variant="muted">{t(row.state === 'removed' ? 'crewCapabilities.staysRemoved' : capabilityLabels.state[row.state])}</Badge></li>)}</ul>

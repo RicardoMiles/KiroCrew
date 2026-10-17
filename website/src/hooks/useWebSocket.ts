@@ -53,9 +53,10 @@ import {
   handleThreadReply,
   invalidateRefreshQueries,
 } from './websocket/serverState'
+import { DASHBOARD_FIELDS_FRAME, handleDashboardFields } from './websocket/dashboardFields'
 import { useChatStream } from './websocket/chatStream'
 import { useTurnCompletion } from './websocket/turnCompletion'
-import { attachFocusRelay } from './websocket/attention'
+import { attachFocusRelay, focusedSlotForCurrentSurface } from './websocket/attention'
 import { emitAppReload, emitChannelEvent, emitComputerUseFrame, emitCronHistory } from './websocket/browserEvents'
 import { runFirstConnect, runReconnectCatchUp } from './websocket/reconnectCatchUp'
 
@@ -75,6 +76,7 @@ export { __resetRedactionHealForTests, healRedactionSwitchAfterReconnect } from 
 // invalidate the same key the handler invalidates: a second spelling of that
 // prefix would let a refresh reach a different cache entry from the frame.
 export { MEMBER_DASHBOARD_QUERY_PREFIX, SESSION_DASHBOARD_QUERY_PREFIX, handleDashboardMoved } from './websocket/serverState'
+export { DASHBOARD_FIELDS_FRAME, subscribeDashboardFields } from './websocket/dashboardFields'
 export { identityOf, askIdsOf, reconcileQuestions, staleAskIds } from './websocket/composerCards'
 export { resolvedSince } from './websocket/retiredIds'
 export { UPDATE_RESTART_LATCH_KEY, UPDATE_RESTART_LATCH_TTL_MS, consumeUpdateRestartLatch } from './websocket/bundleReload'
@@ -194,6 +196,7 @@ export function useWebSocket() {
         syncPendingApprovals,
         syncPendingQuestions: cards.syncPendingQuestions,
         syncWorkflowRuns,
+        focusedSlot: focusedSlotForCurrentSurface,
       }
       if (socket.wasConnectedRef.current) {
         // No frame could arrive while the socket was down (a gateway restart is
@@ -343,6 +346,13 @@ export function useWebSocket() {
             // ownership digest must not reach a client, and the refetch re-asks
             // the server, which re-checks ownership.
             handleDashboardMoved(queryClient, data)
+            break
+          case DASHBOARD_FIELDS_FRAME:
+            // The fields that MOVED, pushed rather than refetched. Handed to the
+            // dashboard showing that crewmate, which posts it into its iframe; a
+            // query invalidation would re-read the whole page and throw away the
+            // page's own state on every value change.
+            handleDashboardFields(data)
             break
           case 'dashboard_value_written':
           case 'dashboard_instance_changed':
@@ -506,7 +516,7 @@ export function useWebSocket() {
             chatStream.onToolCall(data)
             break
           case 'tool_result':
-            dispatch(sseToolResult(data as { slot: string; output: string; tool_call_id?: string }))
+            dispatch(sseToolResult(data as { slot: string; output: string; tool_call_id?: string; final?: boolean }))
             break
           case 'mcp_app_render':
             // MCP App (SEP-1865) render payload from the gateway. Stored by

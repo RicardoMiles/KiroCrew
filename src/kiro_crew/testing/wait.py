@@ -48,6 +48,7 @@ __all__ = [
     "await_until",
     "default_timeout",
     "drained_progress",
+    "finished",
     "runner_timeout_secs",
     "until_parked",
     "wait_until",
@@ -532,6 +533,22 @@ async def await_until(
     if signal in done:
         return signal.result()
     raise _signal_failure(what or "the future", _monotonic() - start, budget, "it is still pending")
+
+
+async def finished(coro: Awaitable[_T], what: str, *, timeout: float | None = None) -> _T:
+    """Run *coro* to its end under the lost-run bound, failing by name (D8).
+
+    :func:`await_until` takes a future the test already holds; a coroutine the test
+    itself calls is wrapped in a task here so a hang is a named failure instead of
+    the runner's kill. The task is cancelled on every early exit -- the bound
+    expiring, or an enclosing wait cancelling this one -- as ``wait_for`` did.
+    """
+    task = asyncio.ensure_future(coro)
+    try:
+        return await await_until(task, what=what, timeout=timeout)
+    finally:
+        if not task.done():
+            task.cancel()
 
 
 class LoopHop:

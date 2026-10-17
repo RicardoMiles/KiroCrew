@@ -27,19 +27,25 @@ export interface SlotActivityOptions {
   running: boolean
   /** Only workers run; the crewmate's own turn is idle. */
   delegatedOnly?: boolean
+  /** The slots frame's `stopping` flag for the slot (a Stop from another tab
+   *  or on a background slot reaches a host only this way). */
+  stopping?: boolean
 }
 
 export function useSlotActivity(slotKey: string, opts: SlotActivityOptions): PillActivity {
-  const { running, delegatedOnly = false } = opts
+  const { running, delegatedOnly = false, stopping = false } = opts
   const streamState = useAppSelector((s) => (slotKey ? selectSlotStreamState(s, slotKey) : 'idle'))
   const detail = useAppSelector((s) => (slotKey ? s.chat.slotStatusDetail[slotKey] : undefined))
   // Matched by the call's own id, so parallel calls cannot be confused, and
-  // tested with `!== undefined`: an empty output is still a return.
+  // tested with `!== undefined`: an empty output is still a return. A
+  // mid-stream frame (`output_partial`, a shell's streamed stdout) is NOT a
+  // return: the command is still running, and reading it as one flipped the
+  // crewmate's line to "Thinking" for the whole of a long build.
   const toolReturned = useAppSelector((s) => {
     const d = slotKey ? s.chat.slotStatusDetail[slotKey] : undefined
     if (d?.kind !== 'tool' || !d.toolCallId) return false
     const entry = selectSlotToolLog(s, slotKey).findLast((e) => e.type === 'tool' && e.tool_call_id === d.toolCallId)
-    return entry !== undefined && entry.output !== undefined
+    return entry !== undefined && entry.output !== undefined && !entry.output_partial
   })
   // The `nothing_to_do` call (#16429) never names itself on ANY surface: the
   // quiet end it asks for must look quiet from its first frame, so the open
@@ -58,7 +64,7 @@ export function useSlotActivity(slotKey: string, opts: SlotActivityOptions): Pil
     [simplified, uiLang],
   )
   return useMemo(
-    () => resolvePillActivity({ streamState, detail, toolReturned: toolReturned || quietEnd, running, delegatedOnly, labelOf }),
-    [streamState, detail, toolReturned, quietEnd, running, delegatedOnly, labelOf],
+    () => resolvePillActivity({ streamState, detail, toolReturned: toolReturned || quietEnd, running, delegatedOnly, stopping, labelOf }),
+    [streamState, detail, toolReturned, quietEnd, running, delegatedOnly, stopping, labelOf],
   )
 }
