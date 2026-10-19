@@ -29,6 +29,7 @@ from kiro_crew.coder.remote_worker import (
 from kiro_crew.platform_compat import file_lock
 from kiro_crew.session_environment import (
     SessionEnvironmentUnavailable,
+    report_start_stage,
     session_environments_enabled,
 )
 
@@ -391,6 +392,8 @@ class CoderSessionEnvironments:
             if workspace is not None:
                 # Names are reusable: verify before start, and again after.
                 verify_workspace(workspace)
+            if workspace is None or workspace.status != _RUNNING:
+                report_start_stage(session_key, "provisioning")
             if workspace is None:
                 if binding.workspace_uuid:
                     # Had a workspace and it is gone: never recreate silently.
@@ -468,6 +471,8 @@ async def prepare_for_session(
     if resolved is None:
         return None
     profile_id, owner_key = resolved
+    # Cleared by the caller when the start ends (providers/acp.py).
+    report_start_stage(session_key, "checking")
     if before_compute is not None:
         # Refuse an unsupported runtime before any workspace starts.
         before_compute()

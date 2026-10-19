@@ -122,6 +122,10 @@ class _TerminalSession:
     # forwarded byte-for-byte.
     ready_marker: bytes | None = None
     ready_probe: bytearray = field(default_factory=bytearray)
+    # True for a shell in a remote Session Environment workspace (the provider
+    # CLI's login shell). This gateway cannot see that shell's directory or
+    # files, so path and command completion answer nothing for it.
+    remote: bool = False
     # Serializes concurrent WS writes (reader loop + title poller + pong);
     # aiohttp's WebSocket writer is not safe for concurrent sends.
     send_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
