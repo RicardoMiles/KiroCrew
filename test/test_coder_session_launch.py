@@ -343,6 +343,60 @@ async def test_login_runner_discards_stderr_and_bounds_stdout(
     assert spawn.call_args.kwargs["cwd"] == str(tmp_path)
 
 
+def test_start_progress_reports_stage_and_total_elapsed_then_clears():
+    se.clear_start_stage("sess-p")
+    assert se.start_progress("sess-p") is None
+    se.report_start_stage("sess-p", "checking")
+    se.report_start_stage("sess-p", "bogus")  # unknown stages are ignored
+    se.report_start_stage("", "checking")  # keyless reports are ignored
+    assert se.start_progress("sess-p")["stage"] == "checking"
+    se.report_start_stage("sess-p", "provisioning")
+    progress = se.start_progress("sess-p")
+    assert progress["stage"] == "provisioning"
+    assert progress["elapsed_s"] >= progress["stage_elapsed_s"] >= 0
+    se.clear_start_stage("sess-p")
+    assert se.start_progress("sess-p") is None
+
+
+def test_start_progress_lists_every_stage_entered_even_between_polls():
+    """A stage can finish between polls; a skipped stage is one never entered."""
+    key = "sess-entered"
+    se.clear_start_stage(key)
+    try:
+        for stage in ("checking", "connecting", "connecting", "starting_agent"):
+            se.report_start_stage(key, stage)
+        progress = se.start_progress(key)
+        assert progress["stage"] == "starting_agent"
+        # In order, once each; provisioning never ran.
+        assert progress["entered"] == ["checking", "connecting", "starting_agent"]
+    finally:
+        se.clear_start_stage(key)
+    # A new start begins a new list.
+    se.report_start_stage(key, "checking")
+    try:
+        assert se.start_progress(key)["entered"] == ["checking"]
+    finally:
+        se.clear_start_stage(key)
+
+
+def test_a_start_for_a_session_already_attached_here_is_a_reconnect():
+    key = "sess-reconnect"
+    se.clear_start_stage(key)
+    se.forget_remote_workspace(key)
+    try:
+        se.report_start_stage(key, "checking")
+        assert se.start_progress(key)["reconnect"] is False  # first connection
+        se.remember_remote_workspace(key, "Dev", "/w")  # attached mid-start
+        se.report_start_stage(key, "starting_agent")
+        assert se.start_progress(key)["reconnect"] is False  # decided at start
+        se.clear_start_stage(key)
+        se.report_start_stage(key, "checking")  # a later restart reconnects
+        assert se.start_progress(key)["reconnect"] is True
+    finally:
+        se.clear_start_stage(key)
+        se.forget_remote_workspace(key)
+
+
 def test_a_live_parents_placement_outlasts_the_runtimes_that_end_around_it(monkeypatch):
     # Admission reads a parent's placement from this bounded table; each entry
     # leaves when its own runtime ends, so ended runtimes never evict a live one.
@@ -361,6 +415,28 @@ def test_a_live_parents_placement_outlasts_the_runtimes_that_end_around_it(monke
     assert se.remote_workspace_for("dash:parent") == ("Dev", "/w")
     se.forget_remote_workspace("dash:parent", owner=replacement)
     assert se.remote_workspace_for("dash:parent") is None
+
+
+def test_start_progress_is_bounded():
+    for i in range(se._START_PROGRESS_MAX + 10):
+        se.report_start_stage(f"leak-{i}", "checking")
+    try:
+        assert len(se._start_progress) <= se._START_PROGRESS_MAX
+    finally:
+        for i in range(se._START_PROGRESS_MAX + 10):
+            se.clear_start_stage(f"leak-{i}")
+
+
+@sync
+async def test_prepare_reports_provisioning_only_when_compute_must_start(tmp_path, monkeypatch):
+    fake = FakeCoder()
+    seen: list[str] = []
+    monkeypatch.setattr(session_launch, "report_start_stage", lambda key, stage: seen.append(stage))
+    await _envs(tmp_path, fake).prepare("sess-q", "dev")  # creates
+    assert seen == ["provisioning"]
+    seen.clear()
+    await _envs(tmp_path, fake).prepare("sess-q", "dev")  # already running
+    assert seen == []
 
 
 def test_subagent_inherits_the_root_owner_and_a_local_parent_writes_nothing(tmp_path):
@@ -502,20 +578,55 @@ async def test_an_inherited_session_prepares_its_owners_workspace(tmp_path, monk
     assert await session_launch.prepare_for_session("sub-10") is None
 
 
-def test_browse_is_read_only(tmp_path):
+def test_browse_is_read_only_and_root_confined(tmp_path):
     root = tmp_path / "root"
     (root / "src").mkdir(parents=True)
     (root / "src" / "a.py").write_bytes(b"print(1)\n")
     ws = wt.Workspace(str(root))
+    listing = wt.browse(ws, {"op": "list", "path": "."})
+    assert listing["entries"] == [{"name": "src", "dir": True}] and listing["path"] == "."
+    read = wt.browse(ws, {"op": "read", "path": "src/a.py"})
+    assert read["content"] == "print(1)\n" and read["binary"] is False
+    assert "outside the workspace" in wt.browse(ws, {"op": "read", "path": "../x"})["error"]
     # No write/run op exists on this entry point, whatever is asked.
-    for op in ("write", "write_file", "run_command", "edit_file", "list", "read"):
+    for op in ("write", "write_file", "run_command", "edit_file"):
         assert wt.browse(ws, {"op": op, "path": "src/a.py", "content": "x"})["error"]
     assert (root / "src" / "a.py").read_text() == "print(1)\n"
 
 
-def test_the_guest_has_no_write_mode(tmp_path):
-    with pytest.raises(SystemExit):
-        wt.main(["--root", str(tmp_path), "--write"])
+@sync
+async def test_browse_session_runs_the_guest_browse_through_coder(tmp_path, monkeypatch):
+    await _remote(tmp_path, monkeypatch, "dashboard:remote")
+    with pytest.raises(session_browse.NotRemote):
+        await session_browse.browse_session("dashboard:local", "list", ".")
+    seen = {}
+
+    async def fake_run(argv, stdin, env, **limits):
+        seen.update(argv=argv, stdin=stdin, limits=limits)
+        return b'{"root": "/workspace/app", "path": ".", "entries": []}'
+
+    monkeypatch.setattr(session_browse, "run_collect", fake_run)
+    out = await session_browse.browse_session("dashboard:remote", "list", "src/../x; rm -rf /")
+    assert out["entries"] == []
+    assert seen["argv"][:5] == ["coder", "--url", URL, "ssh", "--disable-autostart"]
+    # The path rides stdin as JSON, never the command line.
+    assert "rm -rf" not in " ".join(seen["argv"]) and b"rm -rf" in seen["stdin"]
+    assert "--browse" in seen["argv"][-1] and "/workspace/app" in seen["argv"][-1]
+    with pytest.raises(ValueError):
+        await session_browse.browse_session("dashboard:remote", "write", ".")
+
+
+def test_write_request_saves_refuses_stale_and_stays_in_root(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "a.txt").write_bytes(b"one\n")
+    ws = wt.Workspace(str(root))
+    assert wt.write_request(ws, {"path": "a.txt", "content": "two\n", "expected": "one\n"})["ok"]
+    assert (root / "a.txt").read_text() == "two\n"
+    stale = wt.write_request(ws, {"path": "a.txt", "content": "three\n", "expected": "one\n"})
+    assert stale["conflict"] is True and (root / "a.txt").read_text() == "two\n"
+    assert "outside" in wt.write_request(ws, {"path": "../x", "content": "x"})["error"]
+    assert wt.write_request(ws, {"path": "new/b.txt", "content": "b"})["ok"]
 
 
 def test_git_views_are_read_only_and_handle_non_repos(tmp_path):
@@ -539,9 +650,18 @@ def test_git_views_are_read_only_and_handle_non_repos(tmp_path):
     assert status["git"] is True and "?? f.txt" in status["output"]
 
 
+@sync
+async def test_remote_terminal_argv_is_coder_ssh_without_autostart(tmp_path, monkeypatch):
+    workspace = await _remote(tmp_path, monkeypatch, "dashboard:t")
+    with pytest.raises(session_browse.NotRemote):
+        await session_browse.remote_terminal_argv("dashboard:local")
+    argv = await session_browse.remote_terminal_argv("dashboard:t")
+    assert argv == ["coder", "--url", URL, "ssh", "--disable-autostart", workspace]
+
+
 def test_the_browse_mode_has_no_metrics_op(tmp_path):
     assert wt.browse(wt.Workspace(str(tmp_path)), {"op": "stats"}) == {
-        "error": "op must be git_status"
+        "error": "op must be list, read or git_status"
     }
 
 
