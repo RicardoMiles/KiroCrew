@@ -523,8 +523,9 @@ session confined (`AcpClient._claude_session_meta`):
 
 In `default` mode Claude Code runs Read, Grep and Glob inside the work dir
 without asking; the `ask` rules above override that, so each such call reaches
-the gate and gets an SEL row (captured on claude-agent-acp 0.93.0,
-`test/fixtures/claude_side_read_ask`). A call under a denied path is refused
+the gate and gets an SEL row (captured on claude-agent-acp 0.94.0,
+`test/fixtures/acp_frames/claude/side-read-ask-live.jsonl` and
+`side-read-no-ask-live.jsonl`). A call under a denied path is refused
 by claude before it asks. A call that reaches the gate is proven read-only by `harness_builtin_tool`: the kiro-cli
 built-in that the tool name claude-agent-acp stamped on the call's `tool_call`
 frame (`_meta.claudeCode.toolName`) maps to, never the title or the permission

@@ -816,7 +816,7 @@ def build_permission_event(
         _harness_builtin_tool = CLAUDE_READ_ONLY_BUILTINS.get(
             harness_tool_name_cache.get(_ck, ""), ""
         )
-        # claude states ``search`` for Grep and Glob (captured live, 0.93.0),
+        # claude states ``search`` for Grep and Glob (captured live, 0.94.0),
         # a kind the READ_ONLY gate does not take. The stamped name proves the
         # call is that search, so the kind is read as ``read`` for those two
         # alone; every other kind is kept as stated.

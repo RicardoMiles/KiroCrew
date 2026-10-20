@@ -418,12 +418,14 @@ EXPECTED_AGENT_NAMES: dict[str, frozenset[str]] = {
 # the base ref fails, and an entry whose member now passes fails until removed.
 X_CAPTURE_ALLOWLIST: dict[tuple[str, str], str] = {
     ("ACP_BACKENDS_STEER", "kiro"): "kiro-cli _session/steer turn",
-    ("ACP_BACKENDS_STEERING_REQUEST", "claude"): "claude _session/steering turn",
+    ("ACP_BACKENDS_STEERING_REQUEST", "claude"): (
+        "live 0.94.0 steer during Bash ends the turn early and starts an unowned turn; "
+        "under investigation"
+    ),
     ("ACP_BACKENDS_STEERING_REQUEST", "codex"): "codex _session/steering turn",
     ("ACP_BACKENDS_STEERING_REQUEST", "goose"): "goose _goose/unstable/session/steer turn",
     ("ACP_BACKENDS_STEER_CONCURRENT_PROMPT", "opencode"): "opencode second session/prompt",
     ("ACP_BACKENDS_SIDE_READONLY", "kiro"): "kiro-cli side session read-only turn",
-    ("ACP_BACKENDS_SIDE_READONLY", "claude"): "claude side session read-only turn",
     ("ACP_BACKENDS_SIDE_READONLY", "deepseek"): "cite deepseek/side-read-only-live.jsonl",
     ("ACP_BACKENDS_SIDE_READONLY", "goose"): "goose side session read-only turn",
     ("ACP_BACKENDS_MEMBER_CAPABILITIES", "kiro"): "kiro-cli saved member spec session",
