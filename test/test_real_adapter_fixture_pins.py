@@ -29,7 +29,12 @@ from pathlib import Path
 
 import pytest
 from acp_frame_replay_harness import CORPUS, read_fixture
-from real_adapter_gate import CODEX_ACP_PACKAGE, OPENCODE_PACKAGE, pinned_version
+from real_adapter_gate import (
+    CLAUDE_AGENT_ACP_PACKAGE,
+    CODEX_ACP_PACKAGE,
+    OPENCODE_PACKAGE,
+    pinned_version,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -38,6 +43,7 @@ ROOT = Path(__file__).resolve().parent.parent
 #: the pin: a capture of some other agent in the same directory is not measured
 #: against this package's version.
 PINNED_FIXTURE_ADAPTERS: dict[str, tuple[str, str]] = {
+    "claude": (CLAUDE_AGENT_ACP_PACKAGE, "@agentclientprotocol/claude-agent-acp"),
     "codex": (CODEX_ACP_PACKAGE, "@agentclientprotocol/codex-acp"),
     "opencode": (OPENCODE_PACKAGE, "OpenCode"),
 }

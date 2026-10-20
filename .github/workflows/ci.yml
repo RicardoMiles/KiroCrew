@@ -2137,7 +2137,13 @@ jobs:
           assert opencode == gate.MEASURED_OPENCODE_VERSION, (
               f"opencode {opencode!r} installed, {gate.MEASURED_OPENCODE_VERSION} pinned"
           )
-          print(f"codex-acp {codex}, opencode {opencode}: both the pinned release")
+          manifest = modules / gate.CLAUDE_AGENT_ACP_PACKAGE / "package.json"
+          claude = json.loads(manifest.read_text(encoding="utf-8"))["version"]
+          assert claude == gate.MEASURED_CLAUDE_AGENT_ACP_VERSION, (
+              f"claude-agent-acp {claude} installed, "
+              f"{gate.MEASURED_CLAUDE_AGENT_ACP_VERSION} pinned"
+          )
+          print(f"codex-acp {codex}, opencode {opencode}, claude-agent-acp {claude}: all pinned")
           PY
 
       - uses: ./.github/actions/run-as-runner

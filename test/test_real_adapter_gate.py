@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 from real_adapter_gate import (
+    CLAUDE_AGENT_ACP_PACKAGE,
     CODEX_ACP_PACKAGE,
     LOCKFILE,
     MANIFEST,
@@ -247,7 +248,11 @@ def test_the_manifest_is_not_the_product_s_and_dependabot_refreshes_it():
     assert "website" not in MANIFEST.parts
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
     assert manifest.get("private") is True
-    assert set(manifest["dependencies"]) == {CODEX_ACP_PACKAGE, OPENCODE_PACKAGE}
+    assert set(manifest["dependencies"]) == {
+        CLAUDE_AGENT_ACP_PACKAGE,
+        CODEX_ACP_PACKAGE,
+        OPENCODE_PACKAGE,
+    }
 
     dependabot = (ROOT / ".github/dependabot.yml").read_text(encoding="utf-8")
     assert 'package-ecosystem: "npm"' in dependabot

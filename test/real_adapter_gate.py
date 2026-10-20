@@ -70,6 +70,10 @@ LOCKFILE = MANIFEST_DIR / "package-lock.json"
 #: The npm package each guarded file's adapter ships as.
 CODEX_ACP_PACKAGE = "@agentclientprotocol/codex-acp"
 OPENCODE_PACKAGE = "opencode-ai"
+#: No contract test drives claude-agent-acp in the lane yet. It is pinned so the
+#: live captures under ``test/fixtures/acp_frames/claude/`` are held to a release
+#: (``test_real_adapter_fixture_pins.py``), and a Dependabot bump reds there.
+CLAUDE_AGENT_ACP_PACKAGE = "@agentclientprotocol/claude-agent-acp"
 
 
 def pinned_version(package: str) -> str:
@@ -94,6 +98,10 @@ MEASURED_CODEX_ACP_VERSION = pinned_version(CODEX_ACP_PACKAGE)
 #: The ``opencode-ai`` release the live measurements in
 #: ``test_opencode_session_mcp.py`` were taken against.
 MEASURED_OPENCODE_VERSION = pinned_version(OPENCODE_PACKAGE)
+
+#: The ``@agentclientprotocol/claude-agent-acp`` release the claude live captures
+#: were taken against.
+MEASURED_CLAUDE_AGENT_ACP_VERSION = pinned_version(CLAUDE_AGENT_ACP_PACKAGE)
 
 
 def real_adapters_required() -> bool:
