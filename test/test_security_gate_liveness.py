@@ -463,7 +463,25 @@ def _url_payload_command(n: int) -> str:
 #: exemption. No pass widened, no threshold moved, and the exfil URL scan is unchanged.
 #: Six more for its ``keep_sri_digests=False`` switch: a streamed segment whose delta
 #: boundary split an SRI value saves main's verdict on the digest, not the notice.
-_PACKAGE_LINE_BUDGET = 32_188
+#:
+#: Raised by 344, from 32,188, for the redaction tiers' rules: signing names as
+#: labels and order-free key-ID pairing (``redaction_labels``), the normalised view
+#: read only around changed characters (``changed_windows``), the stream's hold
+#: table of declared triggers (``_hold_start``, ``_label_still_arriving``,
+#: ``_wrapped_block_start``), the vendor catalog's keyword index
+#: (``_keyword_index``, ``catalog_keyword_start``) and the decode keyword gate.
+#: The shared value predicate lives outside the package (``credential_values``).
+#: Blocking reads one predicate on the text and its normalised view
+#: (``blocking_context``, ``_view_blocks``), a view window grows to the end of a
+#: match it cuts (``_view_spans``), and the hold on a multi-word label still
+#: arriving is built from the label word table (``_PARTIAL_LABEL_RE``), and one base64
+#: scanner serves redaction and blocking (``_decoded_runs``); a ``name``/``value``
+#: pair takes its rule from its name (``_name_rule``). Every decoded layer is read,
+#: not only the last (``normalised_views``, ``view_texts``), and a digit-led URI
+#: password needs a plain host after its ``@`` (``_URI_PLAIN_HOST``). It is new
+#: rule logic, not glue. The SRI digest exemption above goes with the bare-secret
+#: pass it exempted from.
+_PACKAGE_LINE_BUDGET = 32_532
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second
