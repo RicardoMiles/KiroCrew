@@ -38,6 +38,7 @@ from kiro_crew.acp_backends import (
 )
 from kiro_crew.providers.acp import AcpProvider
 from kiro_crew.session_compaction import _compact_unsupported_backend, _harness_managed_backend
+from kiro_crew.testing.wait import finished
 
 _REQ_ID = 11
 
@@ -115,6 +116,20 @@ async def _prompt(handle: AcpSessionHandle, text: str) -> list:
 
 def _statuses(events: list) -> list[tuple[str, str]]:
     return [(e.text, e.title) for e in events if e.kind == EVENT_COMPACTION_STATUS]
+
+
+def _forbid_queue_reads(handle: AcpSessionHandle, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make any read of the session queue fail the test.
+
+    Both the status drain and the post-compaction metadata grace read the queue,
+    so a wait that answers from the cache without opening either never calls
+    ``get``; a wait that does is caught at the read, not by a clock.
+    """
+
+    def _read_forbidden(*_args, **_kwargs):
+        raise AssertionError("wait_for_compaction read the queue instead of the cached outcome")
+
+    monkeypatch.setattr(handle._queue, "get", _read_forbidden)
 
 
 # ── The route ────────────────────────────────────────────────────────────────
@@ -202,21 +217,23 @@ async def test_a_refusal_reports_failed_with_a_reason() -> None:
 
 
 @pytest.mark.asyncio
-async def test_compact_then_wait_returns_the_turns_outcome() -> None:
+async def test_compact_then_wait_returns_the_turns_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
     """``compact()`` caches the status from inside the turn, so the wait every
     channel pairs with it returns at once: no status wait, and no 5s grace for a
     ``_kiro.dev/metadata`` frame KAS never sends."""
     handle, _ = _make(result={"success": True}, updates=[_summarization_completed("done")])
     await handle.compact()
-    result = await asyncio.wait_for(handle.wait_for_compaction(timeout=30.0), timeout=2.0)
+    _forbid_queue_reads(handle, monkeypatch)
+    result = await finished(handle.wait_for_compaction(timeout=30.0), "cached compaction outcome")
     assert result == {"type": "completed", "summary": "done"}
 
 
 @pytest.mark.asyncio
-async def test_compact_then_wait_returns_a_refusal() -> None:
+async def test_compact_then_wait_returns_a_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
     handle, _ = _make(result={"success": False})
     await handle.compact()
-    result = await asyncio.wait_for(handle.wait_for_compaction(timeout=30.0), timeout=2.0)
+    _forbid_queue_reads(handle, monkeypatch)
+    result = await finished(handle.wait_for_compaction(timeout=30.0), "cached compaction outcome")
     assert result["type"] == "failed"
 
 
@@ -229,7 +246,9 @@ async def test_compact_then_wait_returns_a_refusal() -> None:
         {"_meta": {"kiro": {"extensionMethods": "_kiro/session/compact"}}},
     ],
 )
-async def test_an_engine_without_the_verb_fails_without_sending(caps) -> None:
+async def test_an_engine_without_the_verb_fails_without_sending(
+    caps, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """No verb in ``extensionMethods``: nothing is sent, and the turn reports a
     failed compaction instead of a JSON-RPC error or a fake prompt."""
     handle, rt = _make(result={"success": True})
@@ -241,7 +260,8 @@ async def test_an_engine_without_the_verb_fails_without_sending(caps) -> None:
     assert "no compaction command" in statuses[0][1]
     assert events[-1].kind == EVENT_COMPLETE
     await handle.compact()
-    result = await asyncio.wait_for(handle.wait_for_compaction(timeout=30.0), timeout=2.0)
+    _forbid_queue_reads(handle, monkeypatch)
+    result = await finished(handle.wait_for_compaction(timeout=30.0), "cached compaction outcome")
     assert result["type"] == "failed"
 
 

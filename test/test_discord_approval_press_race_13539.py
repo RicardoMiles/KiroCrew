@@ -22,6 +22,7 @@ import pytest
 from kiro_crew.discord import renderer as discord_renderer
 from kiro_crew.discord.renderer import DiscordApprovalDecider, DiscordRenderer
 from kiro_crew.discord.transport import DISCORD_CAPABILITIES
+from kiro_crew.testing.wait import finished
 
 
 class _SendCapture:
@@ -224,8 +225,9 @@ class TestPromptThatNeverWentOut:
         cli.fail_sends = True
         await _renderer(cli).on_prompt_choice([], "r11", tool_title="shell")
         decider = DiscordApprovalDecider(session_key="sk")
-        # No timeout patch: a window that is waited out would hang this test.
-        assert await asyncio.wait_for(decider(SimpleNamespace(request_id="r11")), 1) is False
+        # No timeout patch: a window that is waited out fails here by name.
+        decided = await finished(decider(SimpleNamespace(request_id="r11")), "adopted refusal")
+        assert decided is False
         key = DiscordApprovalDecider.key("sk", "r11")
         assert key not in DiscordApprovalDecider._REGISTRY
         assert key not in DiscordApprovalDecider._NONCES
@@ -238,7 +240,8 @@ class TestPromptThatNeverWentOut:
         assert DiscordApprovalDecider.resolve_global(key, True, nonce=nonce) is True
         DiscordApprovalDecider.refuse_undelivered(key)
         decider = DiscordApprovalDecider(session_key="sk")
-        assert await asyncio.wait_for(decider(SimpleNamespace(request_id="r12")), 1) is True
+        decided = await finished(decider(SimpleNamespace(request_id="r12")), "recorded decision")
+        assert decided is True
 
     @pytest.mark.asyncio
     async def test_no_press_still_denies_when_the_window_elapses(
@@ -289,4 +292,5 @@ class TestTurnTeardown:
         assert DiscordApprovalDecider.resolve_global(key, True, nonce=nonce) is True
         DiscordApprovalDecider.discard_session("sk")
         decider = DiscordApprovalDecider(session_key="sk")
-        assert await asyncio.wait_for(decider(SimpleNamespace(request_id="r15")), 1) is True
+        decided = await finished(decider(SimpleNamespace(request_id="r15")), "recorded decision")
+        assert decided is True
