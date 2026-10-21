@@ -77,6 +77,47 @@ _BASH_EXFIL_RES: list[tuple[re.Pattern[str], str]] = [
     # `-T`: curl's upload flag is uppercase, so this does NOT match lowercase long
     # options such as `--trace-time`. `-T` must begin at a word boundary.
     (re.compile(r"\bcurl\b.*(?:^|\s)-T\s*\S"), "curl -T upload"),
+    # /dev/tcp//dev/udp reverse shell spliced with a shell EXPANSION. The deny
+    # view stops before expansion, so the literal `/dev/tcp/` substring (matched
+    # by the `/dev/tcp/` pattern above) is absent while bash still forms the
+    # pseudo-device at run time: `/dev/tc$(printf p)/host/port`, `/dev/tc${X}p/…`,
+    # even `/dev/tcp$(printf /)…` (the trailing slash expanded). A benign
+    # `/dev/null`, `/dev/stdin` or `/dev/fd/N` never splices one into the device
+    # name, and a quote-only split (`/dev/tc"p"/`) carries no substitution so it
+    # stays the deny tier's job. Only the unexpanded command text is matched -- no
+    # expanded bytes are logged.
+    #
+    # Two anchors keep this to the real pseudo-device and off ordinary paths:
+    #   1. ABSOLUTE position. bash's magic fires only for a leading `/dev/tcp`, so
+    #      `/dev/` must BEGIN a shell word: start of command, right after whitespace
+    #      or a `> < & | ; (` operator, OR right after a quote that itself opens a
+    #      word (`>& "/dev/tcp/..."`, a leading `"/dev/...`) -- bash expands and
+    #      strips the quotes and still opens the socket. A `/dev/tc` substring inside
+    #      a home, relative or drive-rooted path -- `~/dev/tcl${V}`, `./dev/tc${x}`,
+    #      `$(pwd)/dev/udp-tools${V}`, `${WORKSPACE}/dev/tcl${V}`, `C:/dev/tcl${V}`,
+    #      `build//dev/tcl$((8+1))` -- is preceded by `~ . / } ) :` and the like,
+    #      none of which open a word; a CLOSING quote (`"$X"/dev/tcl...`, the `"` is
+    #      preceded by a non-word char) is not a word start either.
+    #   2. DEVICE prefix + expansion. The literal letters after `/dev/` and BEFORE
+    #      the first `$`/backtick must be a non-empty prefix of `tcp` or `udp`
+    #      (`t`/`tc`/`tcp`/`u`/`ud`/`udp`), immediately followed by a `$` or a
+    #      backtick -- so `/dev/tc$P/`, `/dev/tc$(printf p)/`, `/dev/tc${X}p/`,
+    #      ``/dev/tc`printf p`/`` and `/dev/tcp$(printf /)...` all match. Any form of
+    #      expansion counts (no bracket matching); the letters just have to be able
+    #      to complete to `tcp`/`udp`. A longer literal device (`/dev/tcl…`,
+    #      `/dev/tcpdump…`, `/dev/udmabuf…`) has a non-prefix letter before the
+    #      expansion and a device that is wholly an expansion (`/dev/${TTY}`,
+    #      `/dev/$X`) has no literal `t`/`u` prefix, so neither matches. This
+    #      DELIBERATELY also blocks `/dev/ud$(printf ma)buf0` (literal `ud` + an
+    #      expansion), accepted to keep the rule a single-character expansion test;
+    #      an agent never needs to splice an expansion into a real `/dev/ud*` device.
+    (
+        re.compile(
+            r"(?:^|^[\"']|(?<=[\s>&<|;(])|(?<=[\s>&<|;(][\"']))"
+            r"/dev/(?:tcp|tc|t|udp|ud|u)(?:\$|`)"
+        ),
+        "/dev/tcp via shell expansion",
+    ),
 ]
 
 
@@ -110,6 +151,7 @@ _BASH_EXFIL_RULE_BY_LABEL: dict[str, tuple[str, ...]] = {
     "nc/ncat file redirect": ("data-exfil-nc-file-redirect",),
     "nc/ncat reverse shell": ("reverse-shell-nc", "reverse-shell-ncat"),
     "curl -T upload": ("data-exfil-curl-upload",),
+    "/dev/tcp via shell expansion": ("reverse-shell-devtcp",),
 }
 
 #: For a label whose regex spans several catalog rows, the token that identifies
