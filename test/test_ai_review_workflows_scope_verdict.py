@@ -551,10 +551,10 @@ class TestTheForkLaneNamesARemedyThatClearsAForkPullRequest:
 
     def test_the_fork_lane_offers_it_where_a_row_was_redacted(self) -> None:
         fork = _workflow("fork-security-scope-review.yml")
-        assert "/ai-review override scope <sha>: <reason>" in _step_script(
+        assert "/ai-review override scope <sha> <class>: <reason>" in _step_script(
             fork, "Fold the reports into one verdict"
         )
-        assert "/ai-review override scope $HEAD: <reason>" in _step_script(
+        assert "/ai-review override scope $HEAD <class>: <reason>" in _step_script(
             fork, "Assemble the comment body"
         )
 

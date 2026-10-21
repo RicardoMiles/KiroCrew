@@ -908,7 +908,7 @@ jobs:
               ;;
             11)
               echo "refusal=corpus-credential" >> "$GITHUB_OUTPUT"
-              echo "::error::a candidate operation carries a credential shape (an access-key id, an ARN, an account id or a credential-bearing URL) in a field the classifier reads. The candidate set travels as a public artifact and must stay byte-faithful for the classifier, so that field can be neither published nor rewritten -- and dropping the row would silently remove the boundary it probes. Re-run so the reviewer proposes the operation without the embedded credential, or record a human override for this head with /ai-review override scope <sha>: <reason>, which skips this lane whole."
+              echo "::error::a candidate operation carries a credential shape (an access-key id, an ARN, an account id or a credential-bearing URL) in a field the classifier reads. The candidate set travels as a public artifact and must stay byte-faithful for the classifier, so that field can be neither published nor rewritten -- and dropping the row would silently remove the boundary it probes. Re-run so the reviewer proposes the operation without the embedded credential, or record a human override for this head with /ai-review override scope <sha> <class>: <reason>, which skips this lane whole."
               exit 1
               ;;
             *)
@@ -1885,7 +1885,7 @@ jobs:
                 echo "$MARKER"
                 echo "## Security Scope Review -- 🔴 could not complete (fails closed)"
                 echo
-                echo "_No scope verdict for \`$HEAD\` ($cause). This lane fails CLOSED: an unmeasured tightening must not read as \"nothing newly refused\". See the job logs, then re-run -- or record \`/ai-review override scope $HEAD: <reason>\` if a human has judged the scope by hand._"
+                echo "_No scope verdict for \`$HEAD\` ($cause). This lane fails CLOSED: an unmeasured tightening must not read as \"nothing newly refused\". See the job logs, then re-run -- or record \`/ai-review override scope $HEAD <class>: <reason>\` if a human has judged the scope by hand._"
               } > "$OUT"
               # Whatever the classifier DID reach still belongs in the comment.
               # A leg that reported NO VERDICT, or rows folded before the model

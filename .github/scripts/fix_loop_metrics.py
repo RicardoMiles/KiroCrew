@@ -214,7 +214,7 @@ OVERRIDE_MARKER_RE = re.compile(
 )
 OVERRIDE_CLASS_RE = re.compile(
     r"\A[^\n]*\n<!-- ai-review-override-record class=([a-z-]+) issue=([0-9]+|none)"
-    r" author_is_actor=(true|false)(?: anchors=([a-z0-9/,-]+))? -->"
+    r" author_is_actor=(true|false) -->"
 )
 OWNER_DECISION_LISTED = 25
 

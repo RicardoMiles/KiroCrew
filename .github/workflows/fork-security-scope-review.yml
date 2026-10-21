@@ -1555,7 +1555,7 @@ jobs:
           if [ "$rows_redacted" = "10" ] \
             || { [ -s "$ROWS" ] && grep -q '\[REDACTED-' "$ROWS"; }; then
             echo "rc=rows-redacted" >> "$GITHUB_OUTPUT"
-            echo "::error::a confirmed row carried a credential shape and was redacted, so it no longer names the operation that was refused. Every surface this lane writes is scrubbed, so reproduce the rows with scripts/deny_diff.py against this head. Narrow the rule at the tier the rows name and push -- this lane re-runs on the new head -- or record a human override for this head with /ai-review override scope <sha>: <reason>."
+            echo "::error::a confirmed row carried a credential shape and was redacted, so it no longer names the operation that was refused. Every surface this lane writes is scrubbed, so reproduce the rows with scripts/deny_diff.py against this head. Narrow the rule at the tier the rows name and push -- this lane re-runs on the new head -- or record a human override for this head with /ai-review override scope <sha> <class>: <reason>."
             exit 0
           fi
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
@@ -1901,7 +1901,7 @@ jobs:
             {
               echo "---"
               echo
-              echo "_A confirmed row carried a credential shape, so it was redacted -- and a redacted row no longer names the operation that was refused. The rows are withheld rather than published as this head's finding. Reproduce them with \`scripts/deny_diff.py\` against \`$HEAD\`, then narrow the rule at the tier they name and push -- this lane re-runs on the new head. A scope a repository writer judged acceptable by hand clears with \`/ai-review override scope $HEAD: <reason>\` on this head._"
+              echo "_A confirmed row carried a credential shape, so it was redacted -- and a redacted row no longer names the operation that was refused. The rows are withheld rather than published as this head's finding. Reproduce them with \`scripts/deny_diff.py\` against \`$HEAD\`, then narrow the rule at the tier they name and push -- this lane re-runs on the new head. A scope a repository writer judged acceptable by hand clears with \`/ai-review override scope $HEAD <class>: <reason>\` on this head._"
             } >> "$OUT"
           # The deterministic body always follows the model's, so a reader who
           # distrusts the prose can read the script's verdict on its own.

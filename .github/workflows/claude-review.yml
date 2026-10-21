@@ -729,7 +729,7 @@ jobs:
             fi
             echo
             echo "False positive or not applicable? A repository writer can comment:"
-            echo "\`/ai-review override fable $HEAD: <one-sentence reason>\`"
+            echo "\`/ai-review override fable $HEAD false-positive: <reason, 20 to 500 characters>\`"
           } > /tmp/claude-summary.md
           # ONE publication primitive for every marker-comment write in this
           # lane; test_ai_review_workflows_comment_writes.py pins it byte-identical across all

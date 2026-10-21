@@ -3008,8 +3008,12 @@ silently (zero jobs, nothing on the PR) when any expression-bearing string excee
 `ai-review-human-override.yml` lets a repository **writer** record a judgment with:
 
 ```
-/ai-review override <fable|gpt|design|ux|first-principles|scope|all> <current-head-sha>: <one-sentence reason>
+/ai-review override <fable|gpt|design|ux|first-principles|scope|all> <current-head-sha> <class>[ #N]: <reason, 20 to 500 characters>
 ```
+
+`<class>` says why the finding left the PR, and each class has a requirement the handler
+checks. The table and what the handler records are in
+[Risk release records](#risk-release-records).
 
 A writer's agent running the `kirocrew-prepare-pr` loop may post this command for
 a finding it judged a false positive or over-engineering, and must report it
@@ -3035,9 +3039,9 @@ reviewer disappear from the check instead of answering for it.
 
 `issue_comment` workflows execute from the trusted default branch, never from the PR
 head. The handler validates the command shape, a 7-to-40-hex SHA that must be the
-**current** head, writer-or-above permission, and a non-empty reason under 500
-characters, then posts a **bot-authored** marker comment that the reviewer workflows
-trust. Raw PR comments can never turn a gate green directly; only that marker can.
+**current** head, writer-or-above permission, a release class with its requirement,
+and a reason of 20 to 500 characters, then posts a **bot-authored** marker comment
+that the reviewer workflows trust. Raw PR comments can never turn a gate green directly; only that marker can.
 The scope is **this commit only**, so a new push needs a new judgment. The workflow
 then re-runs the affected reviewer, cancelling an in-flight run first so its stale
 verdict cannot race the human decision. The re-run's `Resolve human override` step
@@ -3095,6 +3099,58 @@ runs each fork lane's resolve step against
 every failing condition and a failed read, and
 `TestOverrideHandlerReRunsTheBoundForkLaneRun` (`test/test_ai_review_workflows_human_override.py`)
 runs the handler's fork re-run against a stubbed API.
+
+### Risk release records
+
+A raised risk leaves a PR fixed or on a record. The override command is the record for a
+lane's BLOCK, so it names a class and the handler checks what that class needs. The record
+is the audit trail: `pr_status.py` prints it and the GPT ledger carries it.
+
+| Class | Use it when | The handler also requires |
+|---|---|---|
+| `false-positive` | the finding is wrong | nothing beyond the reason |
+| `not-applicable` | the rule does not cover this change | nothing beyond the reason |
+| `pre-existing` | the problem is not caused by this diff | `#N`, or a commit sha in the reason that shows it on `main` |
+| `evidence-supplied` | a UX evidence gap is closed | a URL in the reason |
+| `infra-failure` | the lane failed, not the PR | the failed run's URL (`https://github.com/<owner>/<repo>/actions/runs/<id>`) in the reason |
+| `reissue` | the same ruling, for a new head | the earlier record's comment link (`...#issuecomment-<id>`) or `source=<id>` in the reason |
+| `deferred` | the risk is real and is fixed later | `#N`, an issue that is open, labelled `deferred-finding`, assigned, and dated (`Due: YYYY-MM-DD` in its body, or a milestone with a due date) |
+| `owner-decision` | a named person accepted the risk | a link to that person's decision comment (`https://github.com/<owner>/<repo>/pull/<n>#issuecomment-<id>`) in the reason; a bare `source=<id>` is not one |
+
+`#N` is accepted on `deferred` and `pre-existing` only. The reason is 20 to 500 characters.
+An unknown class, a missing requirement or a reason out of bounds is refused with the usage
+text, and nothing is recorded.
+
+**`deferred` is checked in the same run.** The handler reads issue `#N` and applies
+`issue_problems()` from `.github/scripts/release_record.py`, the same four tests the
+deferral check (`disposition-deferral-check.yml`) applies to an `accepted-and-deferred` disposition.
+If the issue fails a test, the refusal lists each one. If GitHub does not answer after three
+attempts the refusal says the issue could not be READ and to re-issue the command; it does
+not call the issue invalid. HTTP 404 is the only answer that means "no such issue".
+
+**What is recorded.** The bot comment keeps the marker as its first line, byte for byte as
+before, so every lane and `OVERRIDE_MARKER_RE` read it unchanged. A second hidden line
+follows:
+
+```
+<!-- ai-review-override-record class=deferred issue=1234 author_is_actor=false -->
+```
+
+`issue` is `none` when the class takes none. `author_is_actor` is `true` when the actor is
+also the PR author. A record made before classes existed has
+no second line and reads as `unclassified`. `parse_override_class()` in
+`_review_contract.py` reads the line, and only from a record that already passes
+`parse_override_record()`: a person's comment with the same bytes has no class.
+
+**The old command.** `/ai-review override <lane> <sha>: <reason>` is accepted until
+`LEGACY_CUTOVER` in `release_record.py` (2026-12-09). It is recorded as class `legacy` and
+the handler posts a notice with the new form. From that date it is refused.
+
+**What `owner-decision` is today.** The class and its comment link are required. The rules
+that make it independent (a CODEOWNERS member, a wait of 24 hours, a writer other than the
+PR author for the sensitive anchors) are not enforced yet. The design leaves open whether
+the owner who records an `owner-decision` may also be the PR author, and this change does
+not forbid it: the record says `author_is_actor=true`.
 
 ## `Security Scope Review`: what a tightening newly refuses
 
@@ -3217,7 +3273,7 @@ override scope <sha>` remains that lane's escape either way.
 Read the lane's comment. Each row is an operation the classifier confirms `<sha>`
 newly refuses, with the tier that refused it and the refusal text. Narrow the rule
 so it no longer catches the row. A human who has judged the scope acceptable by
-hand records `/ai-review override scope <current-sha>: <reason>`, on a fork PR as on
+hand records `/ai-review override scope <current-sha> <class>: <reason>`, on a fork PR as on
 a same-repo one.
 
 A fork-lane run whose `validate` job refuses the corpus posts no comment, so there
@@ -4119,18 +4175,18 @@ exact-match exception behavior without network access.
 
 ## AI-review human overrides: the authorization rules
 
-The command grammar and the marker contract are in [Human override](#human-override); this section states the authorization and freshness rules the handler enforces.
+The command grammar and the marker contract are in [Human override](#human-override), and the classes are in [Risk release records](#risk-release-records); this section states the authorization and freshness rules the handler enforces.
 
 Human judgment is the final authority over the Opus 5.5 and GPT 6.1
 AI-review results. A repository member with `write`, `maintain`, or `admin`
-permission can record a false-positive, not-applicable, or accepted-risk
-decision with the command below. A writer's agent may post it on that writer's
+permission can record a release decision, named by a class, with the command
+below. A writer's agent may post it on that writer's
 behalf only under the [Human override](#human-override) rule: never for a
 security, data-loss, corruption, crash or removed-guard finding, always with an
 `agent:` reason, and the writer whose account posted it stays accountable.
 
 ```text
-/ai-review override <fable|gpt|design|ux|first-principles|scope|all> <current-sha>: <reason>
+/ai-review override <fable|gpt|design|ux|first-principles|scope|all> <current-sha> <class>[ #N]: <reason>
 ```
 
 The decision is intentionally explicit and commit-scoped. The handler resolves
@@ -4142,13 +4198,16 @@ invalidates the decision and causes normal AI review on the new commit.
 `issue_comment`, so GitHub loads it from the default branch. It never checks out
 or executes PR-controlled code. Before changing a result it requires:
 
-1. The exact command shape above and a non-empty, at-most-500-character reason.
+1. The exact command shape above, a class from the table in
+   [Risk release records](#risk-release-records) with that class's requirement
+   met, and a reason of 20 to 500 characters.
 2. A current-head SHA match.
 3. The commenter to have `write`, `maintain`, or `admin` collaborator
    permission. PR authors receive no exemption.
 
 After validation it posts a `github-actions[bot]` comment whose hidden marker
-binds `{target, full head SHA, actor, source comment id}`. Reviewer workflows
+binds `{target, full head SHA, actor, source comment id}`, and a second hidden line
+records the class. Reviewer workflows
 trust only this bot-authored marker; a raw author or third-party comment cannot
 turn a gate green. The handler has only review-control permissions
 (`actions:write`, `checks:write`, `pull-requests:write`, and

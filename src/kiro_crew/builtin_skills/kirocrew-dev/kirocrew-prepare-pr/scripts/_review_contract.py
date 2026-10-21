@@ -177,6 +177,16 @@ OVERRIDE_MARKER_RE = re.compile(
     r"\A<!-- ai-review-human-override target=([a-z0-9-]+) head=([0-9a-fA-F]{7,40})"
     r" actor=(\S+) source=([0-9]+) -->"
 )
+# The class record: line 2 of the same bot comment, written by the same handler
+# (`.github/scripts/release_record.py render_record`). Line 1 alone is the
+# authority a lane clears on; line 2 only says WHICH release this was, for
+# `pr_status.py`, the ledger and the weekly audit. A record from before classes
+# has no line 2 and reads as `unclassified`, never as an error.
+OVERRIDE_CLASS_RE = re.compile(
+    r"\A[^\n]*\n<!-- ai-review-override-record class=([a-z-]+) issue=([0-9]+|none)"
+    r" author_is_actor=(true|false) -->"
+)
+OVERRIDE_CLASS_UNCLASSIFIED = "unclassified"
 OVERRIDE_TARGET_ALL = "all"
 # The command's target spellings, mapped to each lane's WORKFLOW-AUTHORED
 # comment key rather than straight to a reviewer name. Reviewer identity then
@@ -253,6 +263,31 @@ def parse_override_record(comment, authors=DEFAULT_MARKER_AUTHORS):
     return target.lower(), head.lower(), actor
 
 
+def parse_override_class(comment, authors=DEFAULT_MARKER_AUTHORS):
+    """Return ``{class, issue, author_is_actor}`` for a trusted record, else None.
+
+    Trust is ``parse_override_record``'s: a comment that is not a bot-authored
+    override record has no class. A trusted record without the class line (made
+    before classes existed) is ``unclassified`` with ``author_is_actor`` None,
+    which a counter can tell apart from a record that says ``false``.
+    """
+    if parse_override_record(comment, authors) is None:
+        return None
+    match = OVERRIDE_CLASS_RE.match(comment.get("body") or "")
+    if not match:
+        return {
+            "class": OVERRIDE_CLASS_UNCLASSIFIED,
+            "issue": "",
+            "author_is_actor": None,
+        }
+    klass, issue, author_is_actor = match.groups()
+    return {
+        "class": klass,
+        "issue": "" if issue == "none" else issue,
+        "author_is_actor": author_is_actor == "true",
+    }
+
+
 def override_reviewer_names(target, bindings, keys=DEFAULT_OVERRIDE_TARGET_KEYS):
     """Reviewer names one override target answers for, resolved via ``bindings``."""
     if target == OVERRIDE_TARGET_ALL:
@@ -306,6 +341,24 @@ def human_override_actors(comments, head_sha, bindings, authors=DEFAULT_MARKER_A
             continue
         for name in override_reviewer_names(target, bindings):
             named[name] = actor
+    return named, blanket
+
+
+def human_override_classes(comments, head_sha, bindings, authors=DEFAULT_MARKER_AUTHORS):
+    """Return ``(named, blanket)`` -- the class record of each accepted override.
+
+    The same records, in the same shape, as ``human_override_actors``, with the
+    ``parse_override_class`` dict in place of the actor.
+    """
+    named: dict = {}
+    blanket: dict = {}
+    for target, _actor, comment in _accepted_overrides(comments, head_sha, authors):
+        info = parse_override_class(comment, authors)
+        if target == OVERRIDE_TARGET_ALL:
+            blanket = info or {}
+            continue
+        for name in override_reviewer_names(target, bindings):
+            named[name] = info or {}
     return named, blanket
 
 

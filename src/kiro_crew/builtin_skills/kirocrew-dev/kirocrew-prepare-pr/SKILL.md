@@ -196,8 +196,11 @@ A **writer** of the repository may record a judgment that turns a lane green for
 one head:
 
 ```
-/ai-review override <fable|gpt|design|ux|first-principles|scope|all> <current-head-sha>: <one-sentence reason>
+/ai-review override <fable|gpt|design|ux|first-principles|scope|all> <current-head-sha> <class>[ #N]: <reason, 20 to 500 characters>
 ```
+
+Use `false-positive` or `not-applicable` for what follows; the other classes need an
+issue or a link ([Risk release records](docs/ci/ci-and-reviews.md#risk-release-records)).
 
 `fable` is the Opus lane; `scope` is Security Scope Review. Decide it yourself —
 do not ask — when all four hold:
