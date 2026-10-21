@@ -62,6 +62,7 @@ Exit:   0 printed / body passes | 20 unaccounted area(s) | 21 What changed too l
 """
 
 import argparse
+import importlib.machinery
 import importlib.util
 import os
 import re
@@ -267,12 +268,40 @@ def unaccounted_areas(paths, body):
     return missing
 
 
+class _NoBytecodeSourceLoader(importlib.machinery.SourceFileLoader):
+    """Load shipped source normally while suppressing cache writes."""
+
+    def get_code(self, fullname):
+        path = self.get_filename(fullname)
+        return self.source_to_code(self.get_data(path), path)
+
+    def set_data(self, path, data, *, _mode=0o666):
+        return None
+
+
+_CONTRACT: dict = {}
+
+
+def _review_contract():
+    """The shared contract module beside this script (the one fence reader), loaded once."""
+    if "module" not in _CONTRACT:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_review_contract.py")
+        loader = _NoBytecodeSourceLoader("_prepare_pr_diff_signals_contract", path)
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        if spec is None:  # pragma: no cover - defensive
+            raise RuntimeError("cannot import kirocrew-prepare-pr sibling: " + path)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        _CONTRACT["module"] = module
+    return _CONTRACT["module"]
+
+
 def _what_changed_unfenced(body):
     """The ``## What changed`` section with fenced blocks removed, or None if absent."""
     m = re.search(r"^## +What changed[^\n]*\n(.*?)(?=^## |\Z)", body, re.MULTILINE | re.DOTALL)
     if not m:
         return None
-    return re.sub(r"^```.*?^```[ \t]*$", "", m.group(1), flags=re.MULTILINE | re.DOTALL)
+    return _review_contract().drop_fenced_blocks(m.group(1))
 
 
 _TABLE_SEPARATOR = re.compile(r"^\|?[ \t]*:?-+:?[ \t]*(\|[ \t]*:?-+:?[ \t]*)*\|?[ \t]*$")

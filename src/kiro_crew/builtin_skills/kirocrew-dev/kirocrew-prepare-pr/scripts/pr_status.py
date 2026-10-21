@@ -248,30 +248,12 @@ _BARE_REF_RE = re.compile(
 # each of which closes its block so the next indented line IS code. The bound in
 # ``_CLOSING_KW_RE`` covers every one of those shapes without consulting block
 # state, so the state machine is not needed and is not here.
-_FENCE_OPEN_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
-
-
-def _fence_opening(line):
-    match = _FENCE_OPEN_RE.match(line)
-    if not match:
-        return None
-    fence = match.group("fence")
-    if fence[0] == "`" and "`" in match.group("info"):
-        return None
-    return fence[0], len(fence)
-
-
-def _is_closing_fence(line, fence_char, opening_length):
-    candidate = line[:-1] if line.endswith("\r") else line
-    indent = 0
-    while indent < len(candidate) and candidate[indent] == " ":
-        indent += 1
-    if indent > 3:
-        return False
-    end = indent
-    while end < len(candidate) and candidate[end] == fence_char:
-        end += 1
-    return end - indent >= opening_length and not candidate[end:].strip(" \t")
+#
+# The fence rules live in _review_contract.py, the one reader every prepare-pr
+# script uses (pr_findings.py, diff_signals.py and sweep_check.py too).
+_FENCE_OPEN_RE = _review_contract.FENCE_OPEN_RE
+_fence_opening = _review_contract.fence_opening
+_is_closing_fence = _review_contract.is_closing_fence
 
 
 def _mask_html_comments(line, in_comment):
