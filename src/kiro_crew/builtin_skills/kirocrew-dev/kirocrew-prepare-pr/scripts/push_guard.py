@@ -37,7 +37,9 @@ someone else staged (references/rationale.md):
                                onto the branch by one compare-and-swap.
 --require-single-on-base [-- PATH...]
                                after the fetch: HEAD's only parent is
-                               origin/<base>, and check 5 holds.
+                               origin/<base>, and check 5 holds. Then
+                               sweep_check.py checks the class sweep file
+                               (warns first; refuses once it is switched on).
 --check-index                  report what is staged here, and why.
 
 A PATH is relative to this directory, or ``:(top,literal)PATH`` from the top
@@ -57,6 +59,8 @@ from __future__ import annotations
 
 import argparse
 import collections
+import importlib.machinery
+import importlib.util
 import os
 import posixpath
 import re
@@ -241,20 +245,26 @@ def child_env(probe=True, extra=None):
 _CMD_META = '^&|<>%!"\r\n'
 
 
-def _which_git():
-    """git from PATH's absolute entries only.
+def _which(name):
+    """An executable from PATH's absolute entries only, or None.
 
     A bare name is searched in the current directory first on Windows (and a
     relative PATH entry resolves against it everywhere), and that directory is
     the checkout under guard.  Naming each directory makes shutil.which look
-    there alone, with PATHEXT still applied.
+    there alone, with PATHEXT still applied.  Shared with sweep_check.py, which
+    runs git and gh the same way.
     """
     for entry in os.environ.get("PATH", "").split(os.pathsep):
         if entry and os.path.isabs(entry):
-            found = shutil.which(os.path.join(entry, "git"))
+            found = shutil.which(os.path.join(entry, name))
             if found:
                 return found
     return None
+
+
+def _which_git():
+    """git from PATH's absolute entries only."""
+    return _which("git")
 
 
 def _git_argv(args):
@@ -268,6 +278,20 @@ def _git_argv(args):
         missing = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "git-not-on-PATH")
         return [resolved or missing] + list(args[1:])
     return list(args)
+
+
+def tool_argv(args):
+    """argv for git or gh, each resolved from PATH's absolute entries only (shared with sweep_check.py).
+
+    With no such executable the argv names a missing file, so the launch fails
+    as a missing executable instead of letting the OS search the checkout.
+    """
+    if args and args[0] == "gh":
+        missing = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "gh-not-on-PATH")
+        return [_which("gh") or missing] + list(args[1:])
+    if args and args[0] == "git":
+        return _git_argv(args)
+    raise ValueError("only git and gh are run, not {!r}".format(args[0] if args else ""))
 
 
 def _taskkill():
@@ -351,7 +375,7 @@ def _wait(proc, timeout, stall, out, errf):
             return True
 
 
-def run_child(argv, env, timeout=None, input=None, stall=None, interactive=False):
+def run_child(argv, env, timeout=None, input=None, stall=None, interactive=False, cwd=None):
     """Spawn ``argv`` and wait for it; return a ChildResult (shared by both scripts).
 
     stdout and stderr are temporary FILES, not pipes: a hook can background a
@@ -387,7 +411,12 @@ def run_child(argv, env, timeout=None, input=None, stall=None, interactive=False
         try:
             try:
                 proc = subprocess.Popen(
-                    argv, stdin=stdin, stdout=out, stderr=None if interactive else errf, env=env
+                    argv,
+                    stdin=stdin,
+                    stdout=out,
+                    stderr=None if interactive else errf,
+                    env=env,
+                    cwd=cwd,
                 )
             except OSError as exc:
                 return ChildResult(127, b"", "{}: {}".format(argv[0], exc).encode(), False)
@@ -999,6 +1028,37 @@ def _refuse_unrecorded(paths, what, git_dir, base, mode, max_ahead=DEFAULT_MAX_A
         )
     )
     raise Refused()
+
+
+class _NoBytecodeSourceLoader(importlib.machinery.SourceFileLoader):
+    """Load a shipped sibling's source without writing a cache file next to it."""
+
+    def get_code(self, fullname):
+        path = self.get_filename(fullname)
+        return self.source_to_code(self.get_data(path), path)
+
+    def set_data(self, path, data, *, _mode=0o666):
+        return None
+
+
+def _sweep_check(base, git_dir):
+    """Run sweep_check.py on the class-sweep file; 0 or EXIT_REFUSED.
+
+    The check is advisory in its warn period and refuses once it is switched on.
+    A check that cannot run says so and lets the push through: it never asks a person.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sweep_check.py")
+    try:
+        loader = _NoBytecodeSourceLoader("_prepare_pr_sweep_check", path)
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        if spec is None:
+            raise ImportError("no loader spec for " + path)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        return EXIT_REFUSED if module.run(base, git_dir) == module.EXIT_REFUSED else 0
+    except (OSError, ImportError, SyntaxError, AttributeError, TypeError, ValueError) as exc:
+        err("WARNING: the class-sweep check could not run ({}); not blocking the push.".format(exc))
+        return 0
 
 
 def _check_single_on_base(base, git_dir, vouched=()):
@@ -2144,6 +2204,8 @@ def _main(args):
 
     if args.require_single_on_base:
         _check_single_on_base(base, git_dir, vouched)
+        if _sweep_check(base, git_dir):
+            return EXIT_REFUSED
         print("STATUS: SAFE TO PUSH (single commit on base)")
         return 0
     head, pinned, ahead = _check_pre_squash(base, args.max_ahead)
