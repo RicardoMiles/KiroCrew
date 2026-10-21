@@ -479,7 +479,20 @@ def _url_payload_command(n: int) -> str:
 #: than left to the literal regex. Text that runs nothing (comments, quoted
 #: newlines, message heredocs, single-quoted substitutions, known option values) is
 #: not read as a command. It only ADDS refusals; no row, pattern or pass moved.
-_PACKAGE_LINE_BUDGET = 33_457
+#:
+#: Raised again, from 33,457, for the argv row floor reading a heredoc by what reads
+#: it: a text that is one bare stdin-interpreter heredoc (``python3 -``, ``node``)
+#: is code in that language, not shell. The 111 lines are the interpreter opener
+#: test, the whole-text check (top-level text, a plain quoted delimiter, plain ASCII,
+#: no line continuation) that no other command can rebind the name, and the opener's
+#: fourth field. No row or pattern moved.
+#:
+#: Raised again, from 33,568, by 44 lines for three heredoc-reading fixes in the
+#: same floor: a bash-correct delimiter decoder (a quoted backslash stays in the
+#: closing word), the git alias hint test for an unprefixed data program, and
+#: ``.`` read as a directory only as a ``-C`` operand in the data command's own
+#: words. No row or pattern moved.
+_PACKAGE_LINE_BUDGET = 33_612
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second
