@@ -5475,6 +5475,12 @@
     "agentLabel": {
       "builtin_conductor": "지휘자"
     },
+    "warmBriefCard": {
+      "asked": "요청하신 일",
+      "label": "진행 요약",
+      "needs_you": "확인이 필요해요",
+      "next": "다음 단계"
+    },
     "voicePlaybackNotice": {
       "failed": "‘{{speak}}’를 실행하지 못했습니다. 텍스트 음성 변환 설정을 확인하고 다시 시도하세요.",
       "consent_required": "‘{{speak}}’에서 이 AWS 프로필과 리전의 Amazon Polly 사용을 확인해야 합니다. 텍스트 음성 변환 설정에서 확인한 다음 다시 시도하세요.",

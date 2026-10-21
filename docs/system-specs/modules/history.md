@@ -431,8 +431,11 @@ mode, so a restricted transcript is cached and paged like any other.
 A return-triggered task summary stores one hidden `notice` claim followed by
 ordinary `assistant` rows. `warm_task_brief_claim` contains only the fingerprint
 and is suppressed by transcript renderers. The deterministic opener row and
-the model-written result carry normal mate message roles and classes; the
-result is one short first-person prose message, with no headings or lists.
+the model-written result carry normal mate message roles and classes. The
+result row's `meta.brief` holds the validated, redacted fields (`asked`, `now`,
+`needs_you`, `next`) that the transcript draws as a fixed plain-text card; its
+`content` is the same brief as plain text, for export and any reader without
+the card.
 Their metadata marks them only for fingerprint and model-input
 exclusion. They remain ordinary visible chat messages but are excluded from
 model replay, session-summary extraction, and their own task fingerprint. The

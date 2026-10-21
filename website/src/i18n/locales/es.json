@@ -5677,6 +5677,12 @@
     "agentLabel": {
       "builtin_conductor": "Conductor"
     },
+    "warmBriefCard": {
+      "asked": "Pediste",
+      "label": "Puesta al día",
+      "needs_you": "Te necesita",
+      "next": "Siguiente"
+    },
     "voicePlaybackNotice": {
       "failed": "No se pudo usar «{{speak}}». Revisa los ajustes de texto a voz e inténtalo de nuevo.",
       "consent_required": "«{{speak}}» necesita que confirmes Amazon Polly para este perfil de AWS y esta región. Confírmalo en los ajustes de texto a voz y vuelve a intentarlo.",

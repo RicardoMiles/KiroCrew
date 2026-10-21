@@ -5677,6 +5677,12 @@
     "agentLabel": {
       "builtin_conductor": "Maestro"
     },
+    "warmBriefCard": {
+      "asked": "Você pediu",
+      "label": "Resumo",
+      "needs_you": "Precisa de você",
+      "next": "Próximos passos"
+    },
     "voicePlaybackNotice": {
       "failed": "Não foi possível usar “{{speak}}”. Verifique as configurações de texto para fala e tente novamente.",
       "consent_required": "“{{speak}}” precisa que você confirme o Amazon Polly para este perfil da AWS e esta região. Confirme nas configurações de texto para fala e tente novamente.",

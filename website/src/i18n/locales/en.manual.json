@@ -1543,6 +1543,12 @@
     "agentLabel": {
       "builtin_conductor": "Conductor"
     },
+    "warmBriefCard": {
+      "asked": "You asked",
+      "label": "Catch-up",
+      "needs_you": "Needs you",
+      "next": "Next"
+    },
     "filePathMenu": {
       "open_in_side_panel": "Open in side panel",
       "show_folder_in_side_panel": "Show folder in side panel"

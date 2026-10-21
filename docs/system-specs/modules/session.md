@@ -161,9 +161,16 @@ short fixed mate opener ("Welcome back, let me catch you up on where we
 are."), picked by the script of the user's request. It starts
 one tool-free background model call. The fingerprint covers the original
 genuine user request, conversation task rows, session ledger, and work ledger.
-The model result is a second ordinary mate message in first-person prose:
-what the user asked for, where it stands, and one to three suggestions, with no
-headings or lists. These generated rows
+The model returns one JSON object: `asked` (at most 160 characters), `now`
+(240), and `needs_you` and `next` (at most three items of 120 each). The prompt
+words it to the user's `dashboard.verbosity` level. `now` is required; an older
+`{"message"}` reply is read as `now`, and a missing `asked` falls back to the
+quoted original request. Each field is redacted before and after whitespace is
+collapsed and `**` dropped, then capped. The result is a second mate
+message: `meta.brief` holds the fields and `content` holds the same brief as
+labelled plain text. The transcript draws `meta.brief` as a fixed card
+(`WarmBriefCard`) that renders every field as a plain text node; a row without a
+valid `meta.brief` keeps the ordinary bubble. These generated rows
 are excluded from the task fingerprint. A new user turn, a new away episode,
 slot replacement, reset, close, and a finished task drop a stale result
 unposted. Patrol turns, `[work-ledger wake]` rows, and worker reports change

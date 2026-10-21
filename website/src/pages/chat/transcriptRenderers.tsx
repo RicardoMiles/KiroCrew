@@ -54,6 +54,7 @@ import { FileCard } from '../../components/FileCard'
 import { parseFileRecord } from '../../lib/fileRecord'
 import UserMessage from './UserMessage'
 import CrewmateMessage, { type CrewmateIdentity } from './CrewmateMessage'
+import WarmBriefCard, { warmBriefOf } from '../../components/chat/WarmBriefCard'
 import { crewmateBubbleClass, crewmateCornerClass, crewmateRunPosition } from '../../components/chat/crewmateBubbles'
 import { CardCornersContext } from '../../cards/cardCorners'
 import { CardAuthorContext } from '../../cards/cardAuthor'
@@ -597,6 +598,22 @@ export function createTranscriptRenderers(
     // the pane's filter has already dropped both for a crewmate anyway.
     ...(crewmate
       ? [{
+          // Replaces the SDK's card entry (same id) so the catch-up card sits in
+          // the crewmate's run as one more filled bubble. Content is the same
+          // fixed plain-text card.
+          id: 'warm_task_brief_result',
+          roles: ['*'],
+          match: (m: ChatMessage) => warmBriefOf(m) !== null,
+          render: (m: ChatMessage, ctx: MessageRenderContext) => {
+            const pos = crewmateRunPosition(ctx.messages, ctx.index, crewmateTranscriptOf())
+            return ctx.row(
+              <CrewmateMessage pos={pos} author={crewmate.label || crewmate.name}>
+                <WarmBriefCard brief={warmBriefOf(m)!} className={`${crewmateBubbleClass(pos)} py-2`} />
+              </CrewmateMessage>,
+              true,
+            )
+          },
+        } satisfies MessageRenderer, {
           id: 'assistant',
           roles: ['assistant', 'streaming'],
           render: (m: ChatMessage, ctx: MessageRenderContext) => {
