@@ -133,7 +133,9 @@ class TestEnvDumpGrepAwsNarrowing:
         "env | grep '[^AWS-x]'",
         "env | grep '[^]AWS-x]'",
         # A POSIX subexpression's ``]`` -- ``[:digit:]``, ``[=a=]``, ``[.ch.]`` --
-        # does not close the enclosing class, and neither does ``\]`` under -P.
+        # does not close the enclosing class, and neither does a leading ``\]``
+        # under -P. A ``[`` after a backslash inside a class is a member too, and
+        # the ``[`` itself is an opener.
         "env | grep '[[:digit:]AWS-x]'",
         "env | grep -E '[[:digit:]AWS-z]'",
         "env | grep '[0-9[:punct:]AWS-z]'",
@@ -143,6 +145,8 @@ class TestEnvDumpGrepAwsNarrowing:
         "env | grep '[[.ch.]AWS-x]'",
         "env | grep '[[.].]AWS-x]'",
         "env | grep -P '[\\]AWS-x]'",
+        "env | grep -P '[^\\]AWS-x]'",
+        "env | grep '[\\[AWS-x]'",
         # The selecting stage is not the first stage after the dump.
         "env | grep -v PATH | grep AWS_SECRET",
         "env | tr ' ' '\\n' | grep AWS_SECRET",
@@ -292,6 +296,12 @@ class TestEnvDumpGrepAwsNarrowing:
         "env | grep '^APP_CONFIG=\\['; echo 'aws-vault profile ready'",
         "env | grep 'x[a' && echo aws-vault",
         "env | grep 'x[a' | grep aws-vault",
+        # Escaped brackets OUTSIDE a class are literals, not a class: a later ``\]``
+        # is not an opener (Security Scope Review on 06d7267d9; ``set-context``
+        # reads as the ``set`` dump verb).
+        "kubectl config set-context --current --namespace=dev"
+        " && kubectl logs deploy/api | grep -n '\\[ERROR\\].*aws-sdk'",
+        "env | grep '\\[WARN\\] aws-vault'",
         "env | grep -q KIROCREW_ && [ -x /usr/local/bin/aws-vault ]",
         "env | grep -q '^AWS_VAULT=' && [ -x \"$(command -v aws-vault)\" ]",
         'printenv | grep -q AWS_PROFILE || [ -f "$HOME/.config/aws-sso-util/config" ]',

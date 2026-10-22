@@ -181,12 +181,14 @@ _ENV_DUMP_AWK_SED_AWS_PATTERN = (
 #   ``echo '[aws-vault]'`` on the next line) is not read as a range over the dump.
 # * Still open: what lies between the opener and ``AWS`` holds no ``]``, no ``[``
 #   and no separator (so an unclosed ``\[`` cannot reach an ``aws`` in a later
-#   ``; echo`` command). The opener is a ``[`` (with an optional ``^`` and a leading literal
-#   ``]``, both class members), or a ``]`` that does NOT close the class: the end
-#   of a POSIX subexpression (``[:digit:]``, ``[=a=]``, ``[.ch.]``) or an escaped
-#   ``\]`` (a member under ``grep -P``). Excluding ``[`` costs nothing -- a later
-#   ``[`` is itself an opener -- and is what keeps every opener's scan disjoint, so
-#   the match stays linear in the input.
+#   ``; echo`` command). The opener is a ``[`` (with an optional ``^`` and a leading
+#   ``]`` or ``\]``, all class members), or a ``]`` that does NOT close the class:
+#   the end of a POSIX subexpression (``[:digit:]``, ``[=a=]``, ``[.ch.]``). A
+#   ``\]`` later in the operand is NOT an opener, because outside a class it is just
+#   an escaped literal (``\[ERROR\].*aws-sdk`` names no class at all); the cost is
+#   that ``[a\]AWS-x]`` under ``grep -P`` is not caught. Excluding ``[`` costs
+#   nothing -- a later ``[`` is itself an opener -- and is what keeps every
+#   opener's scan disjoint, so the match stays linear in the input.
 # * A CLOSED class before ``AWS`` (``^[A-Z_]*AWS_REGION=``, ``[0-9]aws-vault``)
 #   is left to the literal selector, which judges the name that follows it.
 #
@@ -196,7 +198,7 @@ _ENV_DUMP_AWK_SED_AWS_PATTERN = (
 # multi-line ``grep -E`` pattern, or one with a ``|``, ``&`` or ``;`` class member
 # before ``AWS`` (``[|AWS-x]``). The separator and newline stops are what scope the
 # scan to grep's operand.
-_AWS_BRACKET_RANGE_SELECTOR = r"[^|&;\n]*(?:\[\^?\]?|[:=.\\]\])[^\[\]|&;\n]*AWS"
+_AWS_BRACKET_RANGE_SELECTOR = r"[^|&;\n]*(?:\[\^?\\?\]?|[:=.]\])[^\[\]|&;\n]*AWS"
 _ENV_DUMP_GREP_AWS_BRACKET_PATTERN = (
     rf"(?<![\w-]){_ENV_DUMP_VERBS}(?!\w)"
     + r".*\|.*"
