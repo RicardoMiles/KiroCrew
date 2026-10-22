@@ -74,6 +74,10 @@ def symlinked_home(tmp_path, monkeypatch):
 
     monkeypatch.setattr(sb.Path, "home", staticmethod(lambda: link))
     monkeypatch.setattr(sb, "config_dir", lambda: data_home)
+    # The link stands for a home alias in a directory this user cannot write (an
+    # automounted /home, say). One this user could rename refuses the spawn, which
+    # test_sandbox_readonly_parent_pin covers.
+    monkeypatch.setattr(sb, "_renameable_symlink_ancestors", lambda _paths: ())
     return link, data_home
 
 
@@ -108,6 +112,8 @@ class TestTheSpellingSet:
         assert not (home / ".kiro").exists(), "this case needs the other prefix absent"
         monkeypatch.setattr(sb.Path, "home", staticmethod(lambda: home))
         monkeypatch.setattr(sb, "config_dir", lambda: data_home)
+        # The home link stands for one this user cannot rename (see the fixture above).
+        monkeypatch.setattr(sb, "_renameable_symlink_ancestors", lambda _paths: ())
         staged = data_home / _STAGING_LEAF / "drive-preview-abc123"
 
         spellings = sb.crew_home_visible_spellings(str(staged))

@@ -59,6 +59,10 @@ def symlinked_home(tmp_path, monkeypatch):
     monkeypatch.setattr(sb.Path, "home", classmethod(lambda _cls: link_home))
     monkeypatch.setattr(sb, "config_dir", lambda: data_home)
     monkeypatch.setattr(sb, "_backend", "namespace")
+    # On a real host the ``/home`` link sits in root-owned ``/``, which this user cannot
+    # write; under tmp_path it would be renameable and refuse the spawn, which
+    # test_sandbox_readonly_parent_pin covers on its own.
+    monkeypatch.setattr(sb, "_renameable_symlink_ancestors", lambda _paths: ())
     return link_home, data_home
 
 
@@ -506,6 +510,9 @@ def test_a_legacy_link_canonical_under_a_symlinked_home_spawns(tmp_path, monkeyp
     monkeypatch.setattr(sb.Path, "home", classmethod(lambda _cls: link_home))
     monkeypatch.setattr(sb, "config_dir", lambda: legacy)
     monkeypatch.setattr(sb, "_backend", "namespace")
+    # Both links stand for ones in directories this user cannot write; a renameable one
+    # refuses the spawn (test_sandbox_readonly_parent_pin).
+    monkeypatch.setattr(sb, "_renameable_symlink_ancestors", lambda _paths: ())
 
     pairs = sb._crew_home_alias_roots()
     assert [(a, c) for a, c, _d, _i in pairs] == [(str(link_home / ".kirocrew"), str(legacy))]

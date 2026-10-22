@@ -368,6 +368,9 @@ class TestWritableCarveouts:
         lexical_home = tmp_path / "linked-home"
         os.symlink(real_home, lexical_home)
         monkeypatch.setattr(sandbox_mod, "config_dir", lambda: lexical_home)
+        # The link stands for one in a directory this user cannot write; a renameable
+        # one refuses the spawn (test_sandbox_readonly_parent_pin).
+        monkeypatch.setattr(sandbox_mod, "_renameable_symlink_ancestors", lambda _paths: ())
         probe = lexical_home / "run" / "mcp-tmp" / "probe-x"
         probe.mkdir(parents=True)
         lexical = os.path.normpath(str(probe))

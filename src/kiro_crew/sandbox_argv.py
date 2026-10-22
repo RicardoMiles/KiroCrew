@@ -79,6 +79,8 @@ from kiro_crew.sandbox_tiers import (
 )
 from kiro_crew.sandbox_workspace import (
     _literal_ancestor_guards,
+    _renameable_ancestor_guards,
+    _renameable_symlink_ancestors,
     _voice_runtime_ancestor_guards,
     _voice_runtime_parent_paths,
     _voice_runtime_sandbox_paths,
@@ -340,12 +342,101 @@ def _live_plan_host(request: sandbox_plan.SandboxRequest) -> sandbox_plan.PlanHo
     relocated_crew_readonly = tuple(_relocated_crew_targets(_CREW_READONLY_LEAVES))
     kiro_agents_targets = tuple(_resolved_kiro_agents_targets())
     install_root_targets = tuple(_resolved_install_root_targets())
-    # The namespace launcher binds the package directory itself, so a renamed parent
-    # carries the read-only mount with it; Seatbelt matches paths and needs the guards.
-    install_root_ancestor_guards = (
-        ()
+    # A read-only seal holds only while every directory on its path stays put. The
+    # namespace launcher binds the sealed target over itself, and a renamed PARENT
+    # carries that mount with it (renaming a directory that merely CONTAINS a mountpoint
+    # succeeds; only a directory that IS one refuses with EBUSY), freeing the sealed name
+    # for a planted replacement the unsandboxed gateway then reads. Seatbelt matches
+    # paths, so a renamed parent frees the name the same way. Both backends therefore get
+    # the ancestors of EVERY read-only seal -- the kiro agents tree (fork-governance
+    # specs), the crew-home ceilings in every spelling, and the packaged install tree --
+    # that this uid could rename: Seatbelt write-denies each one literally, and the
+    # namespace launcher binds each one over itself so it becomes a mountpoint.
+    #
+    # Each seal's chain is walked to the filesystem root on its own and filtered by
+    # whether this uid could rename the directory, never cut at a shared ceiling: seals
+    # under different roots (``$HOME``, a relocated ``KIROCREW_HOME``, a ``KIRO_HOME``
+    # placed in an operator-owned folder under ``/private/tmp``) have different chains,
+    # and a renameable folder can sit above the seal's own root. Seatbelt keeps its
+    # unconditional literal walk of the install tree as before.
+    #
+    # Both spellings of every seal are walked. A symlinked ancestor (``~/.kiro`` ->
+    # ``~/agent-store/current``) makes the lexical chain miss the directories the seal
+    # really sits under, and renaming one of those (``~/agent-store``) carries the seal
+    # away while the symlink keeps resolving to whatever is recreated there. On the
+    # namespace backend the link entry itself cannot be held in place this way (a
+    # symlink cannot be made a mountpoint, so a pin lands on its target), so a seal whose
+    # lexical path runs through a link this uid could rename refuses the spawn below.
+    # Seatbelt matches paths, and its literal write-deny on the link's own spelling (in
+    # ``readonly_ancestor_guards``) is what holds the link there, so it does not refuse.
+    # The scan covers
+    # the seals the gateway re-reads BY NAME -- the agents tree and the crew-home
+    # ceilings, including a ``KIRO_HOME`` / ``KIROCREW_HOME`` override in the spelling
+    # the operator wrote, since both resolvers follow links before this code sees them.
+    # The install tree is left out: the gateway imported it once at start, and its real
+    # directories are pinned through the ``realpath`` spelling above, while a venv's own
+    # ``lib64 -> lib`` link would otherwise refuse every spawn.
+    _sealed_targets = (
+        *kiro_agents_targets,
+        *(os.path.join(home, rel) for rel in _CREW_READONLY_TARGETS),
+        *relocated_crew_readonly,
+        *install_root_targets,
+    )
+    _symlinked_ancestors = _renameable_symlink_ancestors(
+        (
+            *(
+                os.path.dirname(os.path.normpath(t))
+                for t in (
+                    *kiro_agents_targets,
+                    *(os.path.join(home, rel) for rel in _CREW_READONLY_TARGETS),
+                    *relocated_crew_readonly,
+                )
+            ),
+            # The override as written: ``kiro_home()`` and ``config_dir()`` resolve it,
+            # so an alias such as ``KIRO_HOME=~/agent-current`` is otherwise unseen.
+            *(
+                os.path.normpath(os.path.abspath(os.path.expanduser(value)))
+                for value in (os.environ.get("KIRO_HOME"), os.environ.get("KIROCREW_HOME"))
+                if value
+            ),
+        )
+    )
+    if namespace and _symlinked_ancestors:
+        link, link_target = (safe_terminal_line(p) for p in _symlinked_ancestors[0])
+        raise SandboxCeilingUnsealable(
+            f"refusing to start a sandboxed agent: {link} is a symlink to {link_target}, "
+            "and this user can rename it. The sandbox seals the agent specs and governance "
+            "files beneath it read-only, but a symlink entry cannot be held in place, so a "
+            "sandboxed process could rename the link and put a real directory with forged "
+            f"agent specs at its name for the gateway to read. To fix it, replace {link} "
+            f"with a real directory (move the contents of {link_target} into it), or move "
+            "the link into a directory this user cannot write."
+        )
+    _sealed_parents = tuple(
+        dict.fromkeys(
+            os.path.dirname(spelling)
+            for target in _sealed_targets
+            for spelling in (os.path.normpath(target), os.path.realpath(target))
+        )
+    )
+    renameable_seal_ancestors = _renameable_ancestor_guards(_sealed_parents)
+    readonly_ancestor_guards = (
+        renameable_seal_ancestors
         if namespace
-        else _literal_ancestor_guards(tuple(os.path.dirname(t) for t in install_root_targets))
+        else tuple(
+            dict.fromkeys(
+                (
+                    *_literal_ancestor_guards(
+                        tuple(os.path.dirname(t) for t in install_root_targets)
+                    ),
+                    *renameable_seal_ancestors,
+                    # Every renameable link on a seal's path, the override spelling
+                    # included, is write-denied by its own name: on this backend that
+                    # rule is what holds the link in place.
+                    *(link for link, _target in _symlinked_ancestors),
+                )
+            )
+        )
     )
     carveout_probes = tuple(_carveout_probes(sandbox_plan.carveout_candidates(request)).values())
     host_paths = [
@@ -360,7 +451,7 @@ def _live_plan_host(request: sandbox_plan.SandboxRequest) -> sandbox_plan.PlanHo
         *voice_runtime_ancestor_guards,
         *kiro_agents_targets,
         *install_root_targets,
-        *install_root_ancestor_guards,
+        *readonly_ancestor_guards,
     ]
     return sandbox_plan.PlanHost(
         home=home,
@@ -386,7 +477,7 @@ def _live_plan_host(request: sandbox_plan.SandboxRequest) -> sandbox_plan.PlanHo
         voice_runtime_ancestor_guards=voice_runtime_ancestor_guards,
         kiro_agents_targets=kiro_agents_targets,
         install_root_targets=install_root_targets,
-        install_root_ancestor_guards=install_root_ancestor_guards,
+        readonly_ancestor_guards=readonly_ancestor_guards,
         carveout_probes=carveout_probes,
         uid=uid,
         gid=gid,
