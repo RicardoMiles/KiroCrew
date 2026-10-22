@@ -287,6 +287,11 @@ class TestEnvDumpGrepAwsNarrowing:
         # index, ``[tag]`` echo text after a separator or on the next line -- is not
         # a grep range over the dump.
         "env | grep KIRO\necho '[aws-vault]'",
+        # An UNCLOSED bracket in grep's operand does not reach an ``aws`` in a later
+        # command: the scan after the opener stops at a separator too.
+        "env | grep '^APP_CONFIG=\\['; echo 'aws-vault profile ready'",
+        "env | grep 'x[a' && echo aws-vault",
+        "env | grep 'x[a' | grep aws-vault",
         "env | grep -q KIROCREW_ && [ -x /usr/local/bin/aws-vault ]",
         "env | grep -q '^AWS_VAULT=' && [ -x \"$(command -v aws-vault)\" ]",
         'printenv | grep -q AWS_PROFILE || [ -f "$HOME/.config/aws-sso-util/config" ]',

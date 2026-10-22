@@ -179,8 +179,9 @@ _ENV_DUMP_AWK_SED_AWS_PATTERN = (
 #   prefix but stops at a pipe, a statement separator or a newline, so a ``[`` in a
 #   later command (a ``[ -x ... ]`` test, a jq ``["aws-dev"]`` index, an
 #   ``echo '[aws-vault]'`` on the next line) is not read as a range over the dump.
-# * Still open: what lies between the opener and ``AWS`` holds no ``]`` and no
-#   ``[``. The opener is a ``[`` (with an optional ``^`` and a leading literal
+# * Still open: what lies between the opener and ``AWS`` holds no ``]``, no ``[``
+#   and no separator (so an unclosed ``\[`` cannot reach an ``aws`` in a later
+#   ``; echo`` command). The opener is a ``[`` (with an optional ``^`` and a leading literal
 #   ``]``, both class members), or a ``]`` that does NOT close the class: the end
 #   of a POSIX subexpression (``[:digit:]``, ``[=a=]``, ``[.ch.]``) or an escaped
 #   ``\]`` (a member under ``grep -P``). Excluding ``[`` costs nothing -- a later
@@ -191,10 +192,11 @@ _ENV_DUMP_AWK_SED_AWS_PATTERN = (
 #
 # A separate row rather than an alternation inside the grep rule: a group holding
 # ``.*`` is not split into fragments, and that is what made the combined form
-# quadratic. A bracket selector on a SECOND line of a multi-line ``grep -E``
-# pattern is not caught here (the newline stop is what scopes the operand); main
-# never refused it either.
-_AWS_BRACKET_RANGE_SELECTOR = r"[^|&;\n]*(?:\[\^?\]?|[:=.\\]\])[^\[\]\n]*AWS"
+# quadratic. Not caught here, as on main: a bracket selector on a SECOND line of a
+# multi-line ``grep -E`` pattern, or one with a ``|``, ``&`` or ``;`` class member
+# before ``AWS`` (``[|AWS-x]``). The separator and newline stops are what scope the
+# scan to grep's operand.
+_AWS_BRACKET_RANGE_SELECTOR = r"[^|&;\n]*(?:\[\^?\]?|[:=.\\]\])[^\[\]|&;\n]*AWS"
 _ENV_DUMP_GREP_AWS_BRACKET_PATTERN = (
     rf"(?<![\w-]){_ENV_DUMP_VERBS}(?!\w)"
     + r".*\|.*"

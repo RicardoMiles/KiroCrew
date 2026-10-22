@@ -55,7 +55,7 @@
   },
   {
     "id": "credential-exfil-env-grep-aws-bracket",
-    "pattern": "(?<![\\w-])(?:environ|printenv|typeset|export\\s+-p|env|set)(?!\\w).*\\|.*(?<![\\w-])[a-z0-9]{0,5}grep(?!\\w)[^|&;\\n]*(?:\\[\\^?\\]?|[:=.\\\\]\\])[^\\[\\]\\n]*AWS",
+    "pattern": "(?<![\\w-])(?:environ|printenv|typeset|export\\s+-p|env|set)(?!\\w).*\\|.*(?<![\\w-])[a-z0-9]{0,5}grep(?!\\w)[^|&;\\n]*(?:\\[\\^?\\]?|[:=.\\\\]\\])[^\\[\\]|&;\\n]*AWS",
     "category": "credential-exfil",
     "description": "Blocks piping an environment dump through grep when `AWS` sits inside an open bracket expression in grep's own pattern, such as `[AWS-x]`: there the `-` is a range, so the class selects the AWS credential variables. A closed class before a named non-secret variable (`^[A-Z_]*AWS_REGION=`) is allowed."
   },

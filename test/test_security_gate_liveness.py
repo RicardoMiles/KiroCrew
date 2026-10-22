@@ -469,7 +469,7 @@ def _url_payload_command(n: int) -> str:
 #: like the exempt hyphenated token. One selector regex, one pattern, one catalog row,
 #: its id in the keystone tuple, and the comment explaining the operand scope and why
 #: it is a separate row. The literal grep selector is unchanged.
-_PACKAGE_LINE_BUDGET = 32_236
+_PACKAGE_LINE_BUDGET = 32_238
 
 #: Ceiling on any ONE file in the package. This is what the bound is really for --
 #: a package total says nothing about a single file growing back into a second
