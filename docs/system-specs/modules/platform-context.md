@@ -1087,6 +1087,10 @@ is byte-identical) with no `CONTRACT_VERSION` bump.
   winner's identity. Merged at the
   consumption sites, never inside `KiroCrewConfig`, so a config save can never
   persist an edition default into the operator's file. Default `[]`.
+  A row may carry `allowDefaultInstall: true`, which lets that registry's index
+  mark apps `defaultInstall` for a one-time install and trust grant on first
+  boot. Honoured only for a pinned row in force at the `owner` tier; contract in
+  [app-kit-platform](app-kit-platform.md) §15.1.
 - `TelemetryProvider.otlp_destinations(cfg) -> Sequence[OtlpDestination]` — the
   OTLP collectors this edition sends telemetry to. Read by
   `metrics/provider.py::_otlp_destinations` once per recorder build (through
