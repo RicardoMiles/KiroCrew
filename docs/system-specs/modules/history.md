@@ -430,7 +430,8 @@ mode, so a restricted transcript is cached and paged like any other.
 
 A return-triggered task summary stores one hidden `notice` claim followed by
 ordinary `assistant` rows. `warm_task_brief_claim` contains only the fingerprint
-and is suppressed by transcript renderers. The deterministic opener row and
+and is suppressed by transcript renderers. Its `ts` also counts as owner
+presence when the next return measures time away. The deterministic opener row and
 the model-written result carry normal mate message roles and classes; the
 result is one short first-person prose message, with no headings or lists.
 Their metadata marks them only for fingerprint and model-input

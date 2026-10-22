@@ -574,8 +574,8 @@ async def _close_slot(
     from kiro_crew.dashboard.warm_task_brief import cancel_warm_task_brief
 
     cancel_warm_task_brief(state, name)
-    state._warm_task_brief_away.pop(name, None)
-    state._warm_task_brief_slot_generation.pop(name, None)
+    state._warm_task_brief_not_before.pop(name, None)
+    state._warm_task_brief_last_seen.pop(name, None)
     # Synchronous tombstone, BEFORE any await: a channel-slot reconcile pass
     # whose snapshot predates this close reads these after its last await, so
     # it cannot re-surface the tab this handler is dismissing (see
