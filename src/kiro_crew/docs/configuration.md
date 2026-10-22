@@ -454,10 +454,10 @@ still present, so there is nothing you have to remove by hand.
 ### Voice replies
 
 Spoken replies live in the `voice_reply` block of `config.json`: `enabled`,
-`auto_speak`, `provider` (`system`, the default host speech engine, `polly`, or
-`piper`), `voice_id`, `engine`, `rate`, `pitch`, `aws_profile`, `region`,
-`piper_binary`, `piper_model`, `piper_model_config`, `piper_length_scale` and
-`system_voice`. **Settings > Voice** is the writer for this block. It is not in
+`auto_speak`, `provider` (`system`, the default host speech engine, or `polly`),
+`voice_id`, `engine`, `rate`, `pitch`, `aws_profile`, `region` and `system_voice`.
+The `piper` provider was removed; a saved `piper` value speaks with `system` and
+logs one warning, and its `piper_*` keys are ignored. **Settings > Voice** is the writer for this block. It is not in
 the config schema, so `kirocrew config set voice_reply.<key>` answers
 `Unknown key`.
 
@@ -493,7 +493,7 @@ request is a grant an automated caller can take.
 
 Both local defaults (`system` for TTS, `local` for STT) need no AWS account and no
 confirmation. `system` additionally needs nothing installed on macOS and Windows,
-which is why it is the TTS default rather than `piper`.
+which is why it is the TTS default.
 
 ### An AWS profile per project
 

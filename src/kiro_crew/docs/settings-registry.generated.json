@@ -1658,20 +1658,6 @@
       "configKey": "stt.model"
     },
     {
-      "id": "voice.piper-binary",
-      "label": "Piper Binary",
-      "tab": "voice",
-      "route": "/settings/voice?highlight=voice.piper-binary",
-      "description": "Path to the piper executable. Leave blank to auto-detect on PATH or in a ~/piper-venv install"
-    },
-    {
-      "id": "voice.piper-model",
-      "label": "Piper Model",
-      "tab": "voice",
-      "route": "/settings/voice?highlight=voice.piper-model",
-      "description": "Path to the Piper voice model (.onnx). Required — download from huggingface.co/rhasspy/piper-voices"
-    },
-    {
       "id": "voice.provider",
       "label": "Provider",
       "tab": "voice",
@@ -1684,7 +1670,7 @@
       "label": "Provider",
       "tab": "voice",
       "route": "/settings/voice?highlight=voice.provider-2",
-      "description": "The built-in engine needs no setup; Piper is offline with better quality; Amazon Polly uses AWS credentials + network"
+      "description": "The built-in engine needs no setup; Amazon Polly uses AWS credentials + network"
     },
     {
       "id": "voice.send-when-i-stop-recording",
@@ -1713,13 +1699,6 @@
       "tab": "voice",
       "route": "/settings/voice?highlight=voice.speed-2",
       "hint": "Speech rate for spoken replies (Amazon Polly)"
-    },
-    {
-      "id": "voice.speed-3",
-      "label": "Speed",
-      "tab": "voice",
-      "route": "/settings/voice?highlight=voice.speed-3",
-      "hint": "Piper speech speed (length scale)"
     },
     {
       "id": "voice.streaming",

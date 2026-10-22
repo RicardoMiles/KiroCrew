@@ -32,14 +32,11 @@ from kiro_crew.config.loader import (
 from kiro_crew.dashboard.chat_utils import run_config_write
 from kiro_crew.dashboard.handlers._shared import read_bounded_json
 from kiro_crew.dashboard.state import DashboardState
-from kiro_crew.piper_runtime import PiperRuntime
 from kiro_crew.sandbox import SandboxUnavailableError, without_python_env
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.slack.handler import _vc
 from kiro_crew.voice_reply import (
-    PROVIDER_PIPER,
     PROVIDER_POLLY,
-    PROVIDER_SYSTEM,
     VALID_ENGINES,
     VALID_PROVIDERS,
     SystemVoiceProbeError,
@@ -47,15 +44,12 @@ from kiro_crew.voice_reply import (
     _validate_pitch,
     _validate_rate,
     list_system_voices,
-    pcm_to_wav,
     resolve_polly_cli,
     resolve_system_tts_async,
     stitch_mp3s,
-    streaming_piper_reply,
     streaming_voice_reply,
     strip_markdown,
     synthesize_speech,
-    validate_length_scale,
     validated_config_bool,
     validated_config_string,
 )
@@ -80,10 +74,6 @@ _VOICE_ATTR_TO_CONFIG_KEY: dict[str, str] = {
     "default_pitch": "pitch",
     "aws_profile": "aws_profile",
     "region": "region",
-    "piper_binary": "piper_binary",
-    "piper_model": "piper_model",
-    "piper_model_config": "piper_model_config",
-    "piper_length_scale": "piper_length_scale",
     "system_voice": "system_voice",
 }
 _MAX_CANCELLED_REQUESTS = 128
@@ -93,7 +83,6 @@ _MAX_CANCELLED_REQUESTS = 128
 class _VoiceRequests:
     tasks: dict[tuple[str, str], asyncio.Task] = field(default_factory=dict)
     cancelled: dict[tuple[str, str], float] = field(default_factory=dict)
-    piper: PiperRuntime = field(default_factory=PiperRuntime)
 
     def prune(self) -> None:
         cutoff = time.monotonic() - _CANCELLED_REQUEST_TTL
@@ -112,7 +101,6 @@ def register_voice_lifecycle(app: web.Application) -> None:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        await app[_VOICE_REQUESTS].piper.close()
 
     app.on_shutdown.append(shutdown)
 
@@ -143,7 +131,7 @@ async def api_voice_cancel(request: web.Request) -> web.Response:
 
 
 # Synthesized audio is read and written WHOLE, and its size scales with the
-# length of the reply being spoken — a Piper clip is uncompressed WAV, so a
+# length of the reply being spoken — a system-engine clip is uncompressed WAV, so a
 # minute of speech is megabytes. AUTOSDE `no-blocking-call-on-event-loop` names
 # "large synchronous file IO" as something that must not run on the gateway's
 # single loop, where it stalls every other session — and the heartbeat — for the
@@ -243,10 +231,6 @@ async def api_voice_config(request: web.Request) -> web.Response:
                 "autoSpeak": _vc.auto_speak,
                 "aws_profile": _vc.aws_profile,
                 "region": _vc.region,
-                "piper_binary": _vc.piper_binary,
-                "piper_model": _vc.piper_model,
-                "piper_model_config": _vc.piper_model_config,
-                "piper_length_scale": _vc.piper_length_scale,
                 "system_voice": _vc.system_voice,
             }
         )
@@ -310,9 +294,6 @@ async def api_voice_config(request: web.Request) -> web.Response:
     for _field, _attr in (
         ("aws_profile", "aws_profile"),
         ("region", "region"),
-        ("piper_binary", "piper_binary"),
-        ("piper_model", "piper_model"),
-        ("piper_model_config", "piper_model_config"),
         ("system_voice", "system_voice"),
     ):
         if _field in body:
@@ -323,12 +304,6 @@ async def api_voice_config(request: web.Request) -> web.Response:
                     status=400,
                 )
             pending[_attr] = _value
-    if "piper_length_scale" in body:
-        # Coerce to finite/positive via the shared validator (rejects non-numeric,
-        # inf/NaN, and <=0) so a bad value can't reach synthesis or be persisted
-        # as unserializable JSON that breaks the browser's config GET.
-        pending["piper_length_scale"] = validate_length_scale(body["piper_length_scale"])
-
     # Persist FIRST, then apply to the live `_vc`: a write that failed must not
     # leave the gateway running a setting the file does not hold, which the next
     # restart would silently revert. The write is a locked delta RMW of the keys
@@ -413,9 +388,7 @@ async def api_voice_synthesize(request: web.Request) -> web.Response:
     assert task is not None
     jobs.tasks[key] = task
     try:
-        return await _synthesize_request(
-            request.app["state"], body, text, slot_key, request_id, jobs.piper
-        )
+        return await _synthesize_request(request.app["state"], body, text, slot_key, request_id)
     finally:
         jobs.tasks.pop(key, None)
 
@@ -426,7 +399,6 @@ async def _synthesize_request(
     text: str,
     slot_key: str,
     request_id: str,
-    piper: PiperRuntime,
 ) -> web.Response:
     text, _ = redact_exfiltration_urls(text)
     text, _ = redact_credentials(text)
@@ -450,8 +422,6 @@ async def _synthesize_request(
     chunk_paths: list[str] = []
     final_path: str | None = None
     try:
-        if _vc.provider == PROVIDER_PIPER:
-            return await _synthesize_piper_stream(state, text, identity, piper)
         # Only explicitly selected Polly may reach the paid sentence stream.
         # The built-in engine retains its provider-aware single-WAV path.
         if _vc.provider != PROVIDER_POLLY:
@@ -544,59 +514,13 @@ async def _synthesize_request(
                 os.unlink(p)
 
 
-async def _synthesize_piper_stream(
-    state: DashboardState, text: str, identity: dict[str, str], piper: PiperRuntime
-) -> web.Response:
-    """Send playable PCM chunks immediately and retain one bounded replay clip."""
-    pcm = bytearray()
-    chunks = 0
-    sample_rate = 0
-    stream = streaming_piper_reply(
-        text,
-        piper_binary=_vc.piper_binary,
-        piper_model=_vc.piper_model,
-        piper_model_config=_vc.piper_model_config,
-        length_scale=_vc.piper_length_scale,
-        runtime=piper,
-        request_id=identity["request_id"],
-    )
-    # Explicit close is essential when the request is cancelled while the
-    # generator is suspended at yield: its child still belongs to this request.
-    async with contextlib.aclosing(stream):
-        async for index, sample_rate, audio in stream:
-            pcm.extend(audio)
-            chunks += 1
-            state.broadcast_ws(
-                "voice_chunk",
-                {
-                    **identity,
-                    "index": index,
-                    "sentence": text if index == 0 else "",
-                    "audio": base64.b64encode(pcm_to_wav(audio, sample_rate)).decode("ascii"),
-                    "audioMime": "audio/wav",
-                },
-            )
-    if not chunks:
-        raise VoiceSynthesisError("voice_unavailable", "Piper returned no speakable audio.")
-
-    def replay() -> str:
-        return base64.b64encode(pcm_to_wav(bytes(pcm), sample_rate)).decode("ascii")
-
-    audio_b64 = await asyncio.to_thread(replay)
-    state.broadcast_ws(
-        "voice_complete",
-        {**identity, "audio": audio_b64, "chunks": chunks, "audioMime": "audio/wav"},
-    )
-    return web.json_response({"ok": True, "chunks": chunks, "request_id": identity["request_id"]})
-
-
 async def _synthesize_nonstreaming(
     state: DashboardState, text: str, identity: dict[str, str], speakable: str
 ) -> web.Response:
     """Keep the built-in engine's single-file synthesis and failure remedies.
 
-    Its chunk, completion, and errors share the request identity used by Piper
-    and Polly, so interruption and late-frame rejection apply to every provider.
+    Its chunk, completion, and errors share the request identity used by
+    Polly, so interruption and late-frame rejection apply to every provider.
     """
     audio_path: str | None = None
     provider = _vc.provider
@@ -605,42 +529,29 @@ async def _synthesize_nonstreaming(
             text,
             provider=provider,
             rate=_vc.default_rate,
-            piper_binary=_vc.piper_binary,
-            piper_model=_vc.piper_model,
-            piper_model_config=_vc.piper_model_config,
-            length_scale=_vc.piper_length_scale,
             system_voice=_vc.system_voice,
         )
         if not audio_path:
-            # The two local providers fail for unrelated reasons, and a wrong
-            # remedy costs the user the whole debugging session. For the system
-            # provider that means PROBING rather than assuming: synthesis also
-            # returns None with an engine present — a stale persisted
-            # ``system_voice`` the engine rejects, a timeout, a sandbox refusal —
-            # and telling that user to install espeak-ng sends them to fix
-            # something that is not broken.
-            if provider == PROVIDER_SYSTEM:
-                resolved = await resolve_system_tts_async()
-                if resolved is None:
-                    msg = (
-                        "System TTS unavailable — this host has no built-in speech "
-                        "engine. Install espeak-ng, or pick another provider in "
-                        "Voice settings."
-                    )
-                else:
-                    msg = (
-                        f"System TTS failed — the host's {resolved[0]} engine is "
-                        "installed but produced no audio. Check the voice and "
-                        "speed in Voice settings, or see the gateway log."
-                    )
+            # A wrong remedy costs the user the whole debugging session, so
+            # this PROBES rather than assumes: synthesis also returns None with
+            # an engine present — a stale persisted ``system_voice`` the engine
+            # rejects, a timeout, a sandbox refusal — and telling that user to
+            # install espeak-ng sends them to fix something that is not broken.
+            resolved = await resolve_system_tts_async()
+            if resolved is None:
+                msg = (
+                    "System TTS unavailable — this host has no built-in speech "
+                    "engine. Install espeak-ng, or pick another provider in "
+                    "Voice settings."
+                )
+                code = "voice_unavailable"
             else:
                 msg = (
-                    "Piper TTS unavailable — check the piper binary and model "
-                    "path in Voice settings."
+                    f"System TTS failed — the host's {resolved[0]} engine is "
+                    "installed but produced no audio. Check the voice and "
+                    "speed in Voice settings, or see the gateway log."
                 )
-            code = "voice_synthesis_failed"
-            if provider == PROVIDER_SYSTEM and resolved is None:
-                code = "voice_unavailable"
+                code = "voice_synthesis_failed"
             # On voice_unavailable the client speaks locally, so hand it the
             # cleaned (strip_markdown) text rather than letting it read raw
             # markdown/code/widget markup.
@@ -677,9 +588,9 @@ async def _synthesize_nonstreaming(
         )
         return web.json_response({"ok": True, "chunks": 1, "request_id": identity["request_id"]})
     except SandboxUnavailableError as exc:
-        # The default `system` engine reaches the sandbox through here; piper has its
-        # own streaming path. Reporting lives in the shared helper so this branch and
-        # the streaming one cannot diverge.
+        # The default `system` engine reaches the sandbox through here. Reporting
+        # lives in the shared helper so this branch and the streaming one cannot
+        # diverge.
         logger.exception("Voice synthesis was refused by the sandbox")
         return _sandbox_refusal_response(state, identity, exc)
     except Exception as exc:
@@ -759,11 +670,11 @@ async def api_voice_voices(request: web.Request) -> web.Response:
     # The catalogue lives behind a paid provider, so two gates come before the
     # subprocess. Neither may be dropped: without them the only thing stopping
     # this endpoint from calling AWS is the frontend declining to fetch it while
-    # Piper is selected, so any other client — or a direct request — reaches
+    # another provider is selected, so any other client — or a direct request — reaches
     # `aws polly describe-voices` against whatever the ambient credential chain
     # resolves to.
     #
-    # 1. Not the active provider: a Piper user has no business shipping a
+    # 1. Not the active provider: a system-engine user has no business shipping a
     #    request to Polly at all.
     if _vc.provider != PROVIDER_POLLY:
         return web.json_response({"voices": []})
@@ -782,7 +693,7 @@ async def api_voice_voices(request: web.Request) -> web.Response:
     aws_bin = await asyncio.to_thread(resolve_polly_cli)
     if aws_bin is None:
         # Polly voice listing needs the AWS CLI, which is optional (the
-        # default Piper provider works without it). Resolution goes through
+        # default system provider works without it). Resolution goes through
         # the deploy engine's shared well-known-dirs resolver, so a gateway
         # running under launchd with a minimal PATH still finds a Homebrew /
         # official-pkg install. When the CLI genuinely is not

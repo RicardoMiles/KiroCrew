@@ -393,17 +393,11 @@ from kiro_crew.taskrunner import TaskRunner
 from kiro_crew.tool_gate_busy import hook_gate_busy
 from kiro_crew.voice_reply import (  # noqa: F401 - read by the owners
     DEFAULT_PROVIDER,
-    PROVIDER_PIPER,
     PROVIDER_SYSTEM,
 )
 from kiro_crew.voice_reply import is_available as _tts_available  # noqa: F401 - read by the owners
 from kiro_crew.voice_reply import (  # noqa: F401 - read by the owners
     resolve_configured_provider,
-)
-from kiro_crew.voice_reply import (  # noqa: F401 - read by the owners
-    validate_length_scale as _validate_length_scale,
-)
-from kiro_crew.voice_reply import (  # noqa: F401 - read by the owners
     validated_config_string,
 )
 from kiro_crew.voice_reply import voice_reply as _voice_reply_fn  # noqa: F401 - read by the owners
@@ -658,11 +652,6 @@ class _VoiceConfig:
     # paid AWS service under whatever the ambient credential chain resolves to.
     # Sourced from the single constant so the two cannot drift.
     provider: str = DEFAULT_PROVIDER
-    # Piper-specific (ignored by the other providers):
-    piper_binary: str = ""
-    piper_model: str = ""
-    piper_model_config: str = ""
-    piper_length_scale: float = 1.0
     # Built-in-engine voice. Empty means the OS default voice, which is the
     # right answer whenever the host language matches the reply language.
     system_voice: str = ""
