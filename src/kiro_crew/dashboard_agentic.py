@@ -1040,8 +1040,22 @@ SUGGESTIONS_STATE: str = (
     "sees."
 )
 SUGGESTIONS_LINE: str = (
-    SUGGESTIONS_STATE + " The dashboard skill covers building one when the user asks."
+    SUGGESTIONS_STATE + " Your progress belongs on a page of your own, not in chat: when "
+    "you have work to report, build your page with the dashboard skill "
+    "(dashboard_save, then dashboard_apply) instead of posting it here."
 )
+
+
+def _crew_panel_on() -> bool:
+    """Whether member sessions mount ``kirocrew-panel``; ``False`` on any read failure,
+    so a block that cannot tell asks for no page. TOTAL."""
+    try:
+        from kiro_crew.members import crew_panel_enabled
+
+        return bool(crew_panel_enabled())
+    except Exception:
+        logger.debug("dashboard: the crew panel switch is unreadable", exc_info=True)
+        return False
 
 
 def turn_block(slug: str) -> str:
@@ -1068,6 +1082,10 @@ def turn_block(slug: str) -> str:
                 # Locked: the store's own refusal is the whole instruction, so no line
                 # here can read as "write one".
                 return f"[DASHBOARD]\n{SUGGESTIONS_STATE}\n{locked_line}"
+            if not _crew_panel_on():
+                # ``agent.crew_panel`` off: no kirocrew-panel, so no dashboard_save to
+                # build a page with. Where the tab stands, and nothing to act on.
+                return "[DASHBOARD]\n" + SUGGESTIONS_STATE
             return "[DASHBOARD]\n" + SUGGESTIONS_LINE
         if package_slug:
             # An older record's bound page, which the tab draws: named from the Model

@@ -56,8 +56,27 @@ A template from `dashboard_templates` uses `dashboard_apply(template_id=...)`.
 gate for authored code. `dashboard_rollback` restores a version listed by
 `dashboard_fields`; restoring an old version itself creates a new version.
 
+**Progress goes on the page, not in chat.** People check a crewmate once or
+twice a day, and the page is what they read. Keep where your work stands on
+your Dashboard page; the chat gets few reports, and when it gets one it covers
+several things in one message, never a stream of small updates. No goal or
+milestone is needed for a page: the first time you have work to report is
+reason enough to build one.
+
+**The daily review.** Your daily goal wake asks you to review your page:
+read it against the latest data (`dashboard_fields` for each field and its
+source, `dashboard_types` for the folds behind it), check that the page as a
+whole still makes sense for the work you do now, and update what is stale --
+a field with `dashboard_write`, the page with `dashboard_save` and
+`dashboard_apply` when a section no longer fits. A page that is current stays
+as it is. Then find one way to make the page better -- clearer, better made,
+nicer to look at -- by sections 2 to 6 below, and make it: one small, steady
+improvement a day rather than a redesign, every number still read from a fold
+and none invented.
+
 **Writing your page, and asking first on a template.** With nothing on your
-Dashboard tab, the wake that tells you to build your page is the go-ahead:
+Dashboard tab, having work to report, or a wake that tells you to build your
+page, is the go-ahead:
 write it, `dashboard_save` it and `dashboard_apply` it, then post one short
 message that a Dashboard page is ready on the Dashboard tab -- no preview, no
 card, and no second message. On a template page (one the user adopted, or the

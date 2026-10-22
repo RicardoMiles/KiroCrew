@@ -2237,10 +2237,9 @@ draft guard, so a veto neither remounts the card nor loses its pushed form.
   (`dashboard_agentic.bound_package`) and the suggestions page
   (`dashboard_agentic.tab_shows_suggestions`, the answer `turn_block` and the
   read route give) -- so a template page the person picked, or the page named
-  for the mate, is never replaced on a wake; and only once the goal record
-  holds a goal and confirmed milestones (`goal_reminder.knows_its_page`:
-  `member_goals.has_goal` and a stored key result, which exists only after the
-  person confirms it), so the page has something to be about. Then the Daily
+  for the mate, is never replaced on a wake. No goal or milestone is needed: a
+  mate's progress goes on its Dashboard page, not in chat, so its first page is
+  built when it has something to report. Then the Daily
   Goal Reminder, the goal-setup nudge (`goal_setup.kickoff_prompt`) and the
   `[Milestones confirmed]` turn (`goal_setup.milestones_prompt`), each built off
   the loop, end with `goal_reminder.DASHBOARD_BUILD_LINE`: write your own HTML page
@@ -2263,17 +2262,45 @@ draft guard, so a veto neither remounts the card nor loses its pushed form.
   Dashboard tab (no preview, no card) -- the one message a gateway wake posts about
   the page. There is no default page: the line stops on the first wake after the
   mate's own `dashboard_apply` (the package is then on screen), so there is no
-  second message. The
-  `[DASHBOARD]` block for a tab still on the suggestions page
-  (`dashboard_agentic.SUGGESTIONS_LINE`) says the same: a `dashboard_write`
-  lands on a page nobody sees, so write the page and save and apply it; the
-  member protocol's page item names the three parts `dashboard_save` takes as
-  fields, `view.html` and theme.
+  second message. A mate with no goal gets none of those wakes, so the
+  `[DASHBOARD]` block that rides every turn carries the rule for a tab still on
+  the suggestions page (`dashboard_agentic.SUGGESTIONS_LINE`): its progress
+  belongs on a page of its own, not in chat, and when it has work to report it
+  builds that page with the dashboard skill (`dashboard_save`, then
+  `dashboard_apply`) instead of posting it -- conditioned on having work to
+  report, never an order on every turn. A locked tab gets the lock's refusal
+  instead, and with `agent.crew_panel` off (or unreadable) the block states only
+  where the tab stands (`dashboard_agentic.SUGGESTIONS_STATE`), since there is no
+  `dashboard_save` to build with. The member protocol's page item says the same
+  (progress on the page; the first report is when the page is built) and names
+  the three parts `dashboard_save` takes as fields, `view.html` and theme; its
+  front-desk item says the thread is read once or twice a day, so it gets few
+  reports, each one message covering several things, never a stream of small
+  updates. The Daily Goal Reminder puts where things stand on the page and
+  writes in the thread only when something changed the user should know, once;
+  it also carries `goal_reminder.DAILY_PAGE_REVIEW`, a review of the mate's own
+  page in three steps, each its own sentence so a later step (a look at a
+  screenshot of the page) slots in before the check: read the page
+  (`dashboard_fields` for each field's source and value, `dashboard_types` for
+  the folds and paths behind it) against the latest data; check the page as a
+  whole still makes sense (it answers what the person would ask today, its
+  sections and words match the current work, nothing contradicts the folds);
+  update what is stale (a field with `dashboard_write`, the page with
+  `dashboard_save` then `dashboard_apply` when a section no longer fits), and
+  leave a current page as it is; then make one improvement (clearer, better
+  made, nicer looking, by the dashboard skill's design guidance): one small,
+  steady improvement a day, not a redesign, every number still from a fold and
+  none invented. Weekly and monthly reports do not carry it. Both the page-first
+  wording and the review ride only while `agent.crew_panel` mounts the page tools
+  (`goal_reminder._page_tools_on`, off when unreadable); without them the daily
+  reminder keeps its readings-led chat message, since there is no page to put
+  them on.
 - the **`crewmate.dashboard_page` card** (`offer_dashboard_page`): the one way a
   crewmate on a TEMPLATE page -- one the person adopted, or the page named for it
   -- comes to replace it. `goal_reminder.dashboard_line` gives such a crewmate, in
-  place of the build line and under the same gate (a goal and confirmed
-  milestones), `page_offer.OFFER_LINE` naming the template, until it has been
+  place of the build line and only once the goal record holds a goal and
+  confirmed milestones (`goal_reminder.knows_its_page`), since the card offers a
+  page built around the goal, `page_offer.OFFER_LINE` naming the template, until it has been
   asked once. The crewmate calls `offer_dashboard_page` in that same wake, so the
   offer adds no turn of its own; the card (`change_card_dashboard_page.TITLE`,
   "Want me to build a Dashboard page around your goal?", with a row naming the

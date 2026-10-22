@@ -273,10 +273,12 @@ def _finished_lines(tasks: list[dict[str, str]]) -> str:
     )
 
 
-#: Added to a crewmate's daily reminder and goal-setup wake while it has no Dashboard
-#: page of its own (:func:`dashboard_line`).
+#: Added to a crewmate's daily reminder and goal-setup wakes while it has no Dashboard
+#: page of its own (:func:`dashboard_line`). The every-turn ``[DASHBOARD]`` block says
+#: the same for a crewmate with no goal (``dashboard_agentic.SUGGESTIONS_LINE``).
 DASHBOARD_BUILD_LINE: str = (
-    "Kiro Crew notes: your Dashboard tab has no page of your own yet. Build one with "
+    "Kiro Crew notes: your Dashboard tab has no page of your own yet, and your "
+    "progress belongs on it rather than in chat. Build one with "
     "the dashboard skill: dashboard_save stores your HTML page (view.html), and "
     "dashboard_apply puts it live. Read dashboard_types for paths and row keys: "
     "work and workstreams for progress, hourly history and "
@@ -308,16 +310,17 @@ def dashboard_line(slug: str, rec: dict[str, Any], *, has_mate_tools: bool = Tru
     answer), so a template page the person picked, or the page named for the
     crewmate, is never replaced on a wake: a crewmate on a template page gets the
     one-time offer instead (:func:`kiro_crew.dashboard.page_offer.offer_line`), a card
-    the person answers. Either only once *rec* holds a goal and
-    confirmed milestones (:func:`knows_its_page`), so the page has something to be
-    about. With ``agent.crew_panel`` off (:func:`kiro_crew.members.crew_panel_enabled`)
+    the person answers, and only once *rec* holds a goal and confirmed milestones
+    (:func:`knows_its_page`), since that card offers a page built around the goal.
+    The build line needs no goal: a crewmate's progress goes on its page, so the
+    first page is built when it has something to report. With ``agent.crew_panel`` off (:func:`kiro_crew.members.crew_panel_enabled`)
     no DM session mounts ``kirocrew-panel``, so there are no ``dashboard_save`` /
     ``dashboard_apply`` tools and neither line. The offer needs
     ``offer_dashboard_page`` (``kirocrew-mate``), so a crewmate without those tools
     (*has_mate_tools* False) gets no offer line. An empty *slug*, or a lookup that
     fails, gets no line. Blocking IO.
     """
-    if not slug or not knows_its_page(rec):
+    if not slug:
         return ""
     from kiro_crew import dashboard_agentic
 
@@ -403,17 +406,55 @@ REPORT_LOOK = (
 )
 
 
+#: The daily wake's review of the crewmate's own Dashboard page, in steps: what it
+#: reads, what it checks, what it updates, and one improvement. Each step is its own
+#: sentence so a later step (a look at a screenshot of the page) slots in before the
+#: check.
+DAILY_PAGE_REVIEW: str = (
+    "Then review your Dashboard page, when it shows a page of your own. Read it: "
+    "dashboard_fields gives each field's source and its current value or summary, and "
+    "dashboard_types the folds and paths behind it, so you compare what the page "
+    "shows with the latest data. Check that the page as a whole still makes sense: "
+    "it answers what the person would ask about your work today, its sections and "
+    "words match what you are working on now, and no figure or phrase contradicts "
+    "the folds. Update what is stale: a field of yours with dashboard_write, and "
+    "the page itself with dashboard_save then dashboard_apply when a section no "
+    "longer fits the work; leave a page that is current as it is. Then look for one "
+    "way to make the page better -- clearer to read, better made, nicer to look at -- "
+    "following the dashboard skill's design guidance, and make it: one small, steady "
+    "improvement a day, not a redesign, and every number still read from a fold, "
+    "none invented."
+)
+
+
+def _page_tools_on() -> bool:
+    """Whether the crewmate's sessions mount ``kirocrew-panel``; ``False`` when the
+    switch cannot be read, so a wake that cannot tell sends no status to a page."""
+    try:
+        from kiro_crew.members import crew_panel_enabled
+
+        return bool(crew_panel_enabled())
+    except Exception:
+        logger.debug("goal reminder: the crew panel switch is unreadable", exc_info=True)
+        return False
+
+
 def reminder_prompt(
     rec: dict[str, Any],
     cadence: str = member_goals.CADENCE_DAILY,
     *,
     finished: list[dict[str, str]] | None = None,
     dashboard: str = "",
+    page_tools: bool = True,
 ) -> str:
     """The hidden turn's text for *cadence*, built from the current goal record.
 
     *finished* is :func:`finished_tasks` for the weekly and monthly prompts.
     *dashboard* is :func:`dashboard_line`, added last to the daily prompt.
+    *page_tools* says the crewmate's sessions mount ``kirocrew-panel``
+    (``members.crew_panel_enabled``): only then does the daily prompt send its
+    status to the Dashboard page (:data:`DAILY_PAGE_REVIEW`); without the page tools
+    the readings lead its chat message, as there is no page to put them on.
     """
     block = member_goals.progress_block(rec)
     done = _finished_lines(finished or [])
@@ -422,9 +463,19 @@ def reminder_prompt(
             "[Daily goal reminder] " + _PREAMBLE + f"{block}\n\n"
             "Take a fresh reading of each key result and record it with "
             "key_result_progress (on the kirocrew-mate server); a reading can be a "
-            "number or a short note. Lead your message with those readings and say "
-            "briefly where things stand toward each goal, then continue "
-            "with your next task. Ask the user something only when you are blocked."
+            "number or a short note. "
+            + (
+                "Where things stand toward each goal belongs on your Dashboard page, "
+                "not in a chat message. "
+                + DAILY_PAGE_REVIEW
+                + " Write in this thread only when something changed that the "
+                "user should know, and then once, covering all of it; then continue "
+                "with your next task."
+                if page_tools
+                else "Lead your message with those readings and say briefly where "
+                "things stand toward each goal, then continue with your next task."
+            )
+            + " Ask the user something only when you are blocked."
         ) + (f"\n\n{dashboard}" if dashboard else "")
     if cadence == member_goals.CADENCE_WEEKLY:
         return (
@@ -633,12 +684,14 @@ async def fire(state: Any, job: Any) -> str:
         return skip
     finished: list[dict[str, str]] = []
     dashboard = ""
+    page_tools = True
     if cadence == member_goals.CADENCE_DAILY:
         from kiro_crew.member_mate_tools import member_has_mate_tools
 
         dashboard = await asyncio.to_thread(
             lambda: dashboard_line(slug, rec, has_mate_tools=member_has_mate_tools(member))
         )
+        page_tools = await asyncio.to_thread(_page_tools_on)
         # The binding read ran off the loop: a turn may have started meanwhile.
         again, skip = _idle_thread(state, slot_key, member)
         if skip:
@@ -670,7 +723,9 @@ async def fire(state: Any, job: Any) -> str:
             return LOOP_SKIP
         prompt = heartbeat_prompt(rec, has_session_tools=has_tools, milestones_waiting=waiting)
     else:
-        prompt = reminder_prompt(rec, cadence, finished=finished, dashboard=dashboard)
+        prompt = reminder_prompt(
+            rec, cadence, finished=finished, dashboard=dashboard, page_tools=page_tools
+        )
     dispatch_hidden_turn(state, slot, prompt, human_seen=False)
     return "started"
 
