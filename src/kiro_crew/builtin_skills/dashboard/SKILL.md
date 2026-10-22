@@ -24,8 +24,8 @@ longer history, a new kind of reading -- is a good reason to redesign the page
 once; it is never a reason to redraw it every turn.
 
 `dashboard_save` takes `model`, `view` and an optional `theme`. `view.html`
-holds the markup, CSS and script; a crewmate page uses HTML rather than
-`view.blocks`. Every field read by a binding or a script belongs in `model`.
+holds the markup, CSS and script; it is the only view, and a stored view of
+blocks is read back as `view.html`. Every field read by a binding or a script belongs in `model`.
 The gateway derives `kind` and `bound_to` from the caller. Saving stores a
 draft; `dashboard_apply` with no arguments makes it a new live version.
 
