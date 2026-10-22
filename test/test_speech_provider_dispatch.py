@@ -228,6 +228,8 @@ def _voice_app(state) -> web.Application:
 
 
 _ROW_KEYS = {"name", "label", "builtin", "available", "reason", "action", "error"}
+#: A built-in row names the provider and nothing else: no status is probed for it.
+_BUILTIN_ROW_KEYS = {"name", "builtin"}
 
 
 class TestCapabilityResponses:
@@ -248,7 +250,8 @@ class TestCapabilityResponses:
         async with TestClient(TestServer(app)) as client:
             body = await (await client.get("/api/config/stt")).json()
         rows = body["providers"]
-        assert all(set(row) == _ROW_KEYS for row in rows)
+        assert all(set(row) == _BUILTIN_ROW_KEYS for row in rows if row["builtin"])
+        assert all(set(row) == _ROW_KEYS for row in rows if not row["builtin"])
         names = [row["name"] for row in rows]
         assert names[-2:] == ["acme", "off"]
         assert [n for n in names if n not in ("acme", "off")] == [
@@ -264,7 +267,6 @@ class TestCapabilityResponses:
             "action": {"kind": "login", "label": "Sign in to Acme"},
             "error": False,
         }
-        assert not any(row["error"] for row in rows)
         assert "acme" in body["streaming_providers"]
 
     @pytest.mark.asyncio
@@ -272,27 +274,37 @@ class TestCapabilityResponses:
         acme = _AcmeTts(status=ProviderStatus(False, "Acme needs a sign-in", action=_SIGN_IN))
         _install(tts=(acme,))
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
-        monkeypatch.setattr("kiro_crew.dashboard.chat_voice.is_available", lambda *a, **k: True)
         async with TestClient(TestServer(_voice_app(_make_state(tmp_path)))) as client:
             rows = (await (await client.get("/api/voice/config")).json())["providers"]
-        assert all(set(row) == _ROW_KEYS for row in rows)
-        assert [row["name"] for row in rows] == ["system", "piper", "polly", "acme"]
-        assert [row["builtin"] for row in rows] == [True, True, True, False]
+        assert rows[:3] == [
+            {"name": "system", "builtin": True},
+            {"name": "piper", "builtin": True},
+            {"name": "polly", "builtin": True},
+        ]
+        assert set(rows[-1]) == _ROW_KEYS
+        assert rows[-1]["name"] == "acme"
         assert rows[-1]["available"] is False
         assert rows[-1]["reason"] == "Acme needs a sign-in"
         assert rows[-1]["action"] == {"kind": "login", "label": "Sign in to Acme"}
-        assert [row["error"] for row in rows] == [False, False, False, False]
+        assert rows[-1]["error"] is False
 
     @pytest.mark.asyncio
-    async def test_a_builtin_probe_that_raises_is_an_error(self, tmp_path, monkeypatch) -> None:
-        def raises(*a, **k):
-            raise RuntimeError("probe broke")
+    async def test_opening_settings_runs_no_builtin_probe(self, tmp_path, monkeypatch) -> None:
+        """Built-in rows carry no status, so no built-in check runs on a GET."""
+        from kiro_crew import voice_reply as vr
+        from kiro_crew.dashboard.handlers import core_stt_settings
 
+        def boom(*a, **k):
+            raise AssertionError("a built-in provider was probed for its row")
+
+        monkeypatch.setattr(vr, "is_available", boom)
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
-        monkeypatch.setattr("kiro_crew.dashboard.chat_voice.is_available", raises)
         async with TestClient(TestServer(_voice_app(_make_state(tmp_path)))) as client:
             rows = (await (await client.get("/api/voice/config")).json())["providers"]
-        assert [(r["available"], r["error"]) for r in rows] == [(False, True)] * 3
+        assert all(set(r) == _BUILTIN_ROW_KEYS for r in rows)
+        assert core_stt_settings._builtin_stt_rows(["local", "apple", "transcribe", "off"]) == {
+            n: {"name": n, "builtin": True} for n in ("local", "apple", "transcribe", "off")
+        }
 
     @pytest.mark.asyncio
     async def test_a_check_that_raises_or_hangs_is_unavailable(self, monkeypatch) -> None:
@@ -381,6 +393,38 @@ class TestSttDispatch:
         assert (
             asyncio.run(transcribe.transcribe_audio(str(clip), SttConfig(provider="acme"))) is None
         )
+
+    def test_a_registered_provider_gets_no_local_cap_or_split(self) -> None:
+        """The local decoder's ceiling and auto-split belong to the built-ins only.
+
+        Every caller skips the duration probe when the cap is None, so a webm
+        upload on a host without FFmpeg is not refused as unverifiable before
+        it reaches the registered provider.
+        """
+        _install(stt=(_AcmeStt(),))
+        cfg = SttConfig(provider="acme")
+        assert transcribe.batch_duration_cap_secs(cfg) is None
+        assert transcribe.provider_splits_oversized(cfg) is False
+
+    @pytest.mark.parametrize(
+        "provider, cap, splits",
+        [("local", True, True), ("apple", True, False), ("transcribe", False, False)],
+    )
+    def test_the_builtin_caps_are_unchanged(self, provider, cap, splits) -> None:
+        cfg = SttConfig(provider=provider)
+        expected_cap = transcribe._MAX_AUDIO_SECS if cap else None
+        assert transcribe.batch_duration_cap_secs(cfg) == expected_cap
+        assert transcribe.provider_splits_oversized(cfg) is splits
+
+    def test_an_unverifiable_webm_reaches_the_registered_provider(self, tmp_path) -> None:
+        """The upload path asks the cap first; with no cap it never probes."""
+        _install(stt=(_AcmeStt(),))
+        cfg = SttConfig(provider="acme")
+        with unittest.mock.patch.object(transcribe, "audio_exceeds_secs") as probe:
+            cap = transcribe.batch_duration_cap_secs(cfg)
+            if cap is not None:
+                transcribe.audio_exceeds_secs(str(tmp_path / "clip.webm"), cap)
+        probe.assert_not_called()
 
     @pytest.mark.parametrize("builtin", ["local", "apple", "transcribe"])
     def test_a_builtin_name_never_reaches_the_registry(self, builtin) -> None:

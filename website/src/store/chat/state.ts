@@ -168,6 +168,11 @@ export interface ChatState {
    *  `automatic` auto-select). Kept apart from `activeSlotMoves`, which then
    *  counts only moves the user asked for. */
   activeSlotAutoMoves?: number
+  /** Forks started in this window that will open their child when they
+   *  succeed and `forkMayOpen` allows it. Creates are tracked by
+   *  `foregroundCreateId`. While either is pending, the chat page does not
+   *  auto-open another session after it lost its own. */
+  pendingForkOpens?: number
   messages: ChatMessage[]
   slotRunning: boolean
   slotStopping: boolean
@@ -624,6 +629,7 @@ export const initialState: ChatState = {
   agentSwitchNotice: null,
   creatingSlot: false,
   foregroundCreateId: null,
+  pendingForkOpens: 0,
   lastCreatedActivation: null,
   slotContextPct: {},
   slotContextTokens: {},

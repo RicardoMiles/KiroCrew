@@ -385,7 +385,11 @@ def test_the_dashboard_has_no_sentence_for_the_unavailable_code() -> None:
     """So it renders the backend ``detail`` instead of a canned Off sentence."""
     from kiro_crew import transcribe
 
-    mapping = (Path(__file__).resolve().parents[1] / "website/src/lib/sttProviders.ts").read_text(
+    source = (Path(__file__).resolve().parents[1] / "website/src/lib/sttProviders.ts").read_text(
         encoding="utf-8"
     )
-    assert transcribe.CODE_PROVIDER_UNAVAILABLE not in mapping
+    # The code may be named elsewhere (the Status badge reads it), but it must
+    # not have a catalog sentence: ``unavailableMessage`` then shows ``detail``.
+    catalog = source.split("export const UNAVAILABLE_CODE_KEY", 1)[1].split("\n}\n", 1)[0]
+    assert "stt_provider_off" in catalog
+    assert transcribe.CODE_PROVIDER_UNAVAILABLE not in catalog

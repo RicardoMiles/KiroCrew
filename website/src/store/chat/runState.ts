@@ -255,6 +255,12 @@ export const runStateReducers = {
     if (state.activeSlot !== null) parkActiveTranscript(state)
     enterActiveSlot(state, null, true); state.slotState = 'idle'; state.pendingTurnSlot = null
   },
+  /** A fork that may open its child started (`pendingForkOpens`). Every
+   *  caller pairs it with exactly one `forkOpenSettled`, after its own
+   *  switch to the child, so the count stays raised from the click until
+   *  the child is active. */
+  forkOpenStarted(state: ChatState) { state.pendingForkOpens = (state.pendingForkOpens ?? 0) + 1 },
+  forkOpenSettled(state: ChatState) { state.pendingForkOpens = Math.max(0, (state.pendingForkOpens ?? 0) - 1) },
   clearSlotState(state: ChatState) {
     state.messages = []; state.toolLog = []; state.subagents = {}; state.activityTab = 'changes'; state.slotRunning = false; state.slotStopping = false; state.slotState = 'idle'; setPagingCursor(state, false, 0); state.loadingOlder = false; state.lastChunkSeq = undefined; state.lastChunkGen = undefined; state._wsChunkedDuringFetch = false; state.slotStatusDetail = {}; state.voicePlaying = false; state.voiceAudio = null; if (state.activeSlot) delete state.pendingQuestions?.[state.activeSlot]
     // This clears only the active mirror, not the slot's cached identity. Keep

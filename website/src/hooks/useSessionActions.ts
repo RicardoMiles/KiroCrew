@@ -4,7 +4,7 @@ import { api, ApiError } from '../api/client'
 import { apiErrorCode, isSlotCapError } from '../api/apiError'
 import { store, useAppDispatch } from '../store'
 import type { MuteFlag } from '../store/dashboardSlice'
-import { captureForkOrigin, deleteSlot, forkMayOpen, listForkedSlot, switchSlot } from '../store/chatSlice'
+import { captureForkOrigin, deleteSlot, forkMayOpen, forkOpenSettled, forkOpenStarted, listForkedSlot, switchSlot } from '../store/chatSlice'
 import { updateSlotPin, updateSlotMuteFlag, setSlotMuteFlagError, markSlotRead, markSlotUnread, slotWriteStampOf } from '../store/dashboardSlice'
 import { emitSlotRead } from '../lib/slotReadRelay'
 import { copySessionLink } from '../utils/shareUrl'
@@ -241,7 +241,10 @@ export function useSessionActions(mode?: string, opts?: {
   const forkingSlotsRef = useRef(new Set<string>())
   const forkMutation = useMutation({
     mutationFn: (slot: string) => api.forkChatSlot(slot),
-    onMutate: () => ({ origin: captureForkOrigin(store.getState()) }),
+    // The fork is pending until onSettled, which runs after onSuccess has
+    // switched to the child, so the chat page does not open another session
+    // if its own leaves the list meanwhile.
+    onMutate: () => { dispatch(forkOpenStarted()); return { origin: captureForkOrigin(store.getState()) } },
     onSuccess: (data, _slot, started) => {
       if (data?.ok && data.key) {
         // A refusal describes a condition that no longer holds: leaving it under the row
@@ -310,8 +313,13 @@ export function useSessionActions(mode?: string, opts?: {
     },
     // Mutation-level, not a per-call `mutate` option: TanStack fires per-call
     // callbacks only for the latest call, so a fork of A followed by a fork of B
-    // would leave A marked in flight for good.
-    onSettled: (_data, _err, slotKey) => { forkingSlotsRef.current.delete(slotKey) },
+    // would leave A marked in flight for good. It also ends the fork's pending
+    // open (see onMutate). One callback: a second onSettled key would replace
+    // this one.
+    onSettled: (_data, _err, slotKey) => {
+      forkingSlotsRef.current.delete(slotKey)
+      dispatch(forkOpenSettled())
+    },
   })
 
   // One optimistic toggle for both user-owned mute flags, serialized per flag

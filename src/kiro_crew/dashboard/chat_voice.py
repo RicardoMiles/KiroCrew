@@ -45,7 +45,6 @@ from kiro_crew.voice_reply import (
     VoiceSynthesisError,
     _validate_pitch,
     _validate_rate,
-    is_available,
     iter_registered_chunks,
     join_audio,
     list_system_voices,
@@ -233,40 +232,20 @@ def _sandbox_refusal_response(
     )
 
 
-#: The built-in TTS providers in the order the Voice settings picker lists them,
-#: with an English label (the dashboard localises a built-in by its ``name``).
-_TTS_BUILTIN_ROWS: tuple[tuple[str, str], ...] = (
-    (PROVIDER_SYSTEM, "System (built-in)"),
-    (PROVIDER_PIPER, "Piper (local, offline)"),
-    (PROVIDER_POLLY, "Polly (cloud)"),
-)
+#: The built-in TTS providers, in the order the picker lists them.
+_TTS_BUILTINS: tuple[str, ...] = (PROVIDER_SYSTEM, PROVIDER_PIPER, PROVIDER_POLLY)
 
 
 async def _voice_provider_rows() -> list[dict]:
     """The voice ``providers`` capability list.
 
-    Built-ins answer through ``voice_reply.is_available`` with the settings in
-    force (it stats binaries, so it runs off the loop). The edition's providers
-    answer through their own ``check()``, each bounded and fail-closed. ``error``
-    is true only for a check that timed out or raised.
+    Built-ins are served as ``{name, builtin}`` with no probe: the dashboard reads
+    a row's status only for a registered provider and labels a built-in from its
+    own catalog. The edition's providers answer through their own ``check()``,
+    each bounded and fail-closed; ``error`` is true only for a check that timed
+    out or raised.
     """
-    from kiro_crew.platform.interfaces_runtime import ProviderStatus
-
-    def _builtins() -> list[dict]:
-        rows = []
-        for name, label in _TTS_BUILTIN_ROWS:
-            try:
-                ok = is_available(name, piper_binary=_vc.piper_binary, piper_model=_vc.piper_model)
-            except Exception:
-                # A probe that raised is an error, not a missing prerequisite.
-                logger.warning("TTS provider %r probe failed", name, exc_info=True)
-                status = ProviderStatus(False, "the provider check failed", error=True)
-            else:
-                status = ProviderStatus(ok, None if ok else f"{label} is not set up on this host")
-            rows.append(speech_providers.provider_entry(name, label, True, status))
-        return rows
-
-    rows = await asyncio.to_thread(_builtins)
+    rows: list[dict] = [{"name": name, "builtin": True} for name in _TTS_BUILTINS]
     rows += await speech_providers.registered_entries(
         speech_providers.registered_tts_providers(),
         lambda provider: registered_voice_config(

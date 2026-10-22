@@ -206,6 +206,8 @@ CODE_DISABLED = "stt_disabled"
 #: (every config read here is inside a function, off the event loop).
 #: ``test_stt_provider_off`` pins it equal to ``config.sections.STT_PROVIDER_OFF``.
 STT_PROVIDER_OFF = "off"
+#: ``config.sections.STT_PROVIDER_LOCAL``, spelled here for the same reason.
+_STT_PROVIDER_LOCAL = "local"
 
 
 def _registered_provider(provider: object) -> Any:
@@ -480,9 +482,12 @@ def batch_duration_cap_secs(stt_config=None) -> int | None:  # type: ignore[no-u
     """
     if stt_config is None:
         stt_config = _load_stt_config()
-    if stt_config.provider == "transcribe":
-        return None
-    return _MAX_AUDIO_SECS
+    # Named positively: only the two built-in decoders carry this ceiling. A
+    # provider an edition registered handles its own length, so it gets no cap
+    # (and no duration probe) that belongs to the local decoder.
+    if stt_config.provider in (_STT_PROVIDER_LOCAL, "apple"):
+        return _MAX_AUDIO_SECS
+    return None
 
 
 def provider_splits_oversized(stt_config) -> bool:  # type: ignore[no-untyped-def]
@@ -506,7 +511,7 @@ def provider_splits_oversized(stt_config) -> bool:  # type: ignore[no-untyped-de
     itself, so there is no window for the three answers to describe different
     providers.
     """
-    return stt_config.provider not in ("transcribe", "apple")
+    return stt_config.provider == _STT_PROVIDER_LOCAL
 
 
 def _wav_duration_secs(audio_path: str) -> float | None:
