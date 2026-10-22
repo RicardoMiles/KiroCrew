@@ -1,6 +1,6 @@
 import { createContext, forwardRef, useCallback, useEffect, useMemo, useRef, useState, type HTMLAttributes, type ReactNode, type Ref, type ForwardedRef } from 'react'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
-import { AlarmClock, Brain, ChevronLeft, ChevronRight, FolderOpen, Goal, IdCard, NotebookPen, Pencil, RotateCcw, Route, X } from 'lucide-react'
+import { AlarmClock, Brain, ChevronLeft, ChevronRight, Download, FolderOpen, Goal, IdCard, NotebookPen, Pencil, RotateCcw, Route, X } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import type { MemberRosterRow } from '../../api/client'
 import { crewDisplayName } from '../../components/AgentSelector'
@@ -10,9 +10,11 @@ import type { AutomationRecord } from '../../monitoring/automation'
 import type { CronJob } from '../../types'
 import CrewMonitorDetails, { type MonitorReadState } from './CrewMonitorDetails'
 import CrewScheduleList from './CrewScheduleList'
+import CrewExportView from './CrewExportView'
 import { cn } from '../../lib/utils'
 import { Btn } from '../../components/ui'
 import ErrorNotice from '../../components/ErrorNotice'
+import { useConfirm } from '../../components/ConfirmDialog'
 import { forwardUiLocation } from '../../uiLocations/uiLocation'
 import type { UiLocationId } from '../../uiLocations/descriptors'
 
@@ -26,8 +28,8 @@ export const PROFILE_FACE_PX = 84
 
 /** A page the card pushes OVER its tabs (iOS push: one back control pointing at
  *  the card), for the things a tab opens in place: the full description, the
- *  crewmate's notes, and the schedule create form. */
-type Pushed = 'about' | 'notes' | 'new-schedule' | 'tab-page'
+ *  crewmate's notes, the Export confirm view, and the schedule create form. */
+type Pushed = 'about' | 'notes' | 'export' | 'new-schedule' | 'tab-page'
 
 /** A tab's own page pushed over the card (the Goals tab's milestone, goal and
  *  check-in pages). The tab keeps the page's state and renders it into `host`
@@ -199,6 +201,22 @@ export default function CrewProfilePanel(p: CrewProfilePanelProps) {
   // no path here to take a folder name from.
   const ws = p.member.workspace ?? ''
 
+  // The Export view's lessons text lives only in that view, which the host's draft
+  // guard cannot see, so the card asks before a back or close drops it.
+  const exportDirty = useRef(false)
+  const setExportDirty = useCallback((dirty: boolean) => { exportDirty.current = dirty }, [])
+  const { confirm, confirmDialog } = useConfirm()
+  const guardExport = useCallback((proceed: () => void) => {
+    if (pushed !== 'export' || !exportDirty.current) {
+      proceed()
+      return
+    }
+    void confirm({
+      title: t('pages.membersPage.export_discard_lessons'),
+      confirmLabel: t('pages.membersPage.export_discard_lessons_confirm'),
+    }).then(ok => { if (ok) proceed() })
+  }, [pushed, confirm, t])
+
   // Escape belongs to this card only. A key event in the roster switcher,
   // the chat composer, or another overlay never reaches it.
   useEffect(() => {
@@ -207,12 +225,12 @@ export default function CrewProfilePanel(p: CrewProfilePanelProps) {
       const target = e.target as HTMLElement
       if (!pushed && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return
       e.stopPropagation()
-      if (pushed) p.onRequestBack(popPage)
+      if (pushed) guardExport(() => p.onRequestBack(popPage))
       else p.onClose()
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [pushed, p])
+  }, [pushed, p, guardExport])
 
   // Going back from any pushed page. A tab page first hands its own state back
   // (its `onPop`), so the tab is already on its first page when the slide ends.
@@ -234,7 +252,7 @@ export default function CrewProfilePanel(p: CrewProfilePanelProps) {
   // Land it on the back control instead (the New schedule page focuses its own
   // form), and hand it back to the opener when the page pops.
   useEffect(() => {
-    if (pushed === 'about' || pushed === 'notes' || pushed === 'tab-page') {
+    if (pushed === 'about' || pushed === 'notes' || pushed === 'export' || pushed === 'tab-page') {
       backRef.current?.focus({ preventScroll: true })
     } else if (!pushed) {
       const opener = openerRef.current
@@ -279,7 +297,9 @@ export default function CrewProfilePanel(p: CrewProfilePanelProps) {
     ? t('pages.membersPage.profile_about')
     : pushed === 'notes'
       ? t('pages.membersPage.notes_tab')
-      : t('pages.membersPage.schedule_new')
+      : pushed === 'export'
+        ? t('pages.membersPage.export_title')
+        : t('pages.membersPage.schedule_new')
 
   const slide = reduce
     ? { initial: { opacity: 1 }, animate: { opacity: 1 }, exit: { opacity: 1 } }
@@ -307,7 +327,7 @@ export default function CrewProfilePanel(p: CrewProfilePanelProps) {
           <button
             type="button"
             ref={backRef}
-            onClick={() => p.onRequestBack(popPage)}
+            onClick={() => guardExport(() => p.onRequestBack(popPage))}
             className="inline-flex items-center gap-0.5 pl-1 pr-2 py-1 rounded-lg text-accent font-medium text-[13px] hover:bg-accent-subtle cursor-pointer"
             data-testid="crew-profile-back"
           >
@@ -319,7 +339,7 @@ export default function CrewProfilePanel(p: CrewProfilePanelProps) {
         {!pushed && <div className="flex-1" />}
         <button
           type="button"
-          onClick={p.onClose}
+          onClick={() => guardExport(p.onClose)}
           className="w-8 h-8 rounded-lg grid place-items-center text-muted hover:text-text hover:bg-bg-hover cursor-pointer shrink-0"
           aria-label={t('pages.membersPage.close')}
           title={t('pages.membersPage.close')}
@@ -464,6 +484,7 @@ export default function CrewProfilePanel(p: CrewProfilePanelProps) {
 
                 <div className="rounded-2xl border border-border bg-bg overflow-hidden">
                   <Row icon={<NotebookPen size={16} />} tone="warn" label={t('pages.membersPage.notes_tab')} sub={t('pages.membersPage.profile_notes_sub')} onClick={() => push('notes')} testId="crew-profile-notes" />
+                  <Row icon={<Download size={16} />} tone="info" label={t('pages.membersPage.export_row')} sub={t('pages.membersPage.export_row_sub')} onClick={() => push('export')} testId="crew-profile-export" />
                 </div>
 
                 {p.settingsBody}
@@ -498,6 +519,8 @@ export default function CrewProfilePanel(p: CrewProfilePanelProps) {
                 </div>
               ) : pushed === 'notes' ? (
                 p.notesBody
+              ) : pushed === 'export' ? (
+                <CrewExportView slug={p.member.slug} member={p.member.name} onDirtyChange={setExportDirty} />
               ) : pushed === 'tab-page' ? (
                 <div ref={setTabPageHost} className="px-4 py-4" />
               ) : (
@@ -506,6 +529,7 @@ export default function CrewProfilePanel(p: CrewProfilePanelProps) {
             </motion.div>
           )}
         </AnimatePresence>
+        {confirmDialog}
       </div>
     </div>
   )
