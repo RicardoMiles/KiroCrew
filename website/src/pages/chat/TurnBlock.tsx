@@ -185,8 +185,9 @@ type FoldMode = 'interim' | 'collapseAll' | 'default'
  *   The window is counted over all tool rows FIRST, so a live row among the
  *   newest five never shifts an older one into view.
  * - Settled, on top: the mode's own collapse. Default folds every tool row;
- *   collapseAll folds what precedes the conclusion; an interim fan-out folds
- *   every row. `isVisibleInline` rows never fold.
+ *   collapseAll folds what precedes the conclusion, or every row but the
+ *   system notices when the turn has none (collapseAllFoldRange); an interim
+ *   fan-out folds every row. `isVisibleInline` rows never fold.
  *
  * The settled set contains the running set, so completion only ever folds
  * more rows. It never opens a row the window had folded.
@@ -196,10 +197,14 @@ function foldCandidates(items: TurnItem[], appToolCallIds: ReadonlySet<string>, 
   const out = new Set(tools.slice(0, Math.max(0, tools.length - LIVE_ACTIVITY_WINDOW)))
   if (complete && mode === 'default') tools.forEach(i => out.add(i))
   if (complete && mode !== 'default') {
-    const end = mode === 'interim' ? items.length : Math.max(0, findConclusionIdx(items))
+    const { end, keepNotices } = mode === 'interim'
+      ? { end: items.length, keepNotices: false }
+      : collapseAllFoldRange(items)
     const pinned = mode === 'interim' ? NO_PINNED_ROWS : answeredRefusalRows
     for (let i = 0; i < end; i++) {
-      if (isCountedRow(items[i]) && !isVisibleInline(items[i], appToolCallIds, pinned)) out.add(i)
+      const it = items[i]
+      if (keepNotices && it.kind === 'single' && isSystemNoticeRow(it.msg)) continue
+      if (isCountedRow(it) && !isVisibleInline(it, appToolCallIds, pinned)) out.add(i)
     }
   }
   return Array.from(out).sort((a, b) => a - b)
@@ -240,6 +245,31 @@ function findConclusionIdx(items: TurnItem[]): number {
     }
   }
   return conclusionIdx === -1 ? fallbackIdx : conclusionIdx
+}
+
+/**
+ * Where the collapseAll fold stops: the conclusion's index, so everything the
+ * agent did BEFORE handing the user its conclusion may fold. A turn with no
+ * conclusion handed the user nothing, so there is nothing to keep out of the
+ * fold and every row is a working step: the end is the whole turn. That is a
+ * quiet `nothing_to_do` end, a turn that stopped on an error, and the rows
+ * above a mid-turn steer: the steer is its own display row (the pinned-prompt
+ * band pins it, so it cannot live inside a turn), which leaves the work before
+ * it as a turn of its own with no answer. A conclusion at `0` is the other
+ * boundary, nothing precedes it. Mapping "no conclusion" to `0` instead left
+ * every such turn flat, each tool row expanded.
+ *
+ * `keepNotices` is set only for that whole-turn fold. A system notice (a
+ * compaction result, a stuck-turn or recycle notice) is never a conclusion
+ * (findConclusionIdx skips it), so in a turn with no answer it is the one row
+ * that says why the turn stopped, and the fold must leave it in view. A turn
+ * that has a conclusion folds its notices exactly as before.
+ */
+const collapseAllFoldRange = (items: TurnItem[]): { end: number; keepNotices: boolean } => {
+  const conclusionIdx = findConclusionIdx(items)
+  return conclusionIdx < 0
+    ? { end: items.length, keepNotices: true }
+    : { end: conclusionIdx, keepNotices: false }
 }
 
 /**
