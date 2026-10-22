@@ -442,7 +442,6 @@ def handshake_matches(d: str, meta: dict) -> bool:
 # the base ref fails, and an entry whose member now passes fails until removed.
 X_CAPTURE_ALLOWLIST: dict[tuple[str, str], str] = {
     ("ACP_BACKENDS_STEERING_REQUEST", "claude"): "claude _session/steering turn",
-    ("ACP_BACKENDS_STEERING_REQUEST", "codex"): "codex _session/steering turn",
     ("ACP_BACKENDS_STEERING_REQUEST", "goose"): "goose _goose/unstable/session/steer turn",
     ("ACP_BACKENDS_STEER_CONCURRENT_PROMPT", "opencode"): "opencode second session/prompt",
     ("ACP_BACKENDS_SIDE_READONLY", "kiro"): "live capture pending",

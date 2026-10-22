@@ -104,9 +104,10 @@ ACP_BACKENDS_STEER = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 # ``{outcome: "startedNewTurn"}`` and the adapter runs a turn of its own that no
 # ``session/prompt`` owns; ``session/cancel`` stops that turn and the next
 # ``session/prompt`` runs normally. There is no ``steering_consumed`` echo, so the
-# request's own answer is the delivery evidence. This membership is not
-# re-measured on the Real Adapter Contract lane's pin
-# (``test/real_adapters/package.json``).
+# request's own answer is the delivery evidence. That lane run's frames, on the
+# pin in ``test/real_adapters/package.json``, are
+# ``test/fixtures/acp_frames/codex/steering-live.jsonl``: its ``initialize``
+# answers ``_meta.steering.supported: true`` and the mid-turn steer ``injected``.
 #
 # The session handle therefore AWAITS the answer (the kiro verb is
 # fire-and-forget), until it arrives or the aimed-at turn ends: ``injected``

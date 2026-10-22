@@ -85,11 +85,6 @@ BASELINE: dict = {
         "a scratch run id",
         "a run or request uuid",
     ),
-    "test/fixtures/acp_frames/codex/session-live.expected.json": ("a run or request uuid",),
-    "test/fixtures/acp_frames/codex/session-live.jsonl": (
-        "a run or request uuid",
-        "the harness's own command inventory",
-    ),
     "test/fixtures/acp_frames/kas/session.expected.json": ("a run or request uuid",),
     "test/fixtures/acp_frames/kas/session.jsonl": (
         "a scratch run id",

@@ -46,9 +46,7 @@ _RECAPTURE = "stale, re-capture pending"
 
 #: ``<dir>/<file>`` -> (fixture's agent_version, pin it was stale against, why).
 #: Shrink-only. Do not add to it to land a bump: re-capture instead.
-_STALE: dict[str, tuple[str, str, str]] = {
-    "codex/session-live.jsonl": ("1.11.0", "2.2.2", _RECAPTURE),
-}
+_STALE: dict[str, tuple[str, str, str]] = {}
 
 #: ``_STALE`` as it started, written out so that editing an entry above (its pin
 #: above all) does not widen this too. ``_STALE`` may lose entries; every one it
