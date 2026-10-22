@@ -38,6 +38,9 @@ FIRING_LINK_TEMPLATES = [
     "https://github.com/microsoft/TypeScript/blame/{}/src/compiler/checker.ts#L10",
     "https://github.com/microsoft/TypeScript/raw/{}/README.md",
     "https://bitbucket.org/atlassian/Docker-Builds/src/{}/README.md",
+    # Some code hosts spell their routes in the plural, under a deeper path.
+    "https://git.example/packages/WidgetHubChatBridge/blobs/{}/--/src/app/gateway.py#L10",
+    "https://git.example/packages/WidgetHubChatBridge/trees/{}/--/src/app",
 ]
 FIRING_COMMITS = [
     COMMIT,
@@ -45,7 +48,16 @@ FIRING_COMMITS = [
     COMMIT,
     COMMIT,
     "2c73b114eeb1c7078f04d5a68f19a283f4d8c2fd",
+    COMMIT,
+    COMMIT,
 ]
+PLURAL_ROUTE_LINK_TEMPLATES = FIRING_LINK_TEMPLATES[-2:]
+SHA256 = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+#: The singular-only route alternation the ceiling shipped with before the plural routes.
+_SINGULAR_ROUTES_RE = re.compile(
+    r"(?:(?<=/)|\A)(?:blob|tree|blame|raw|commits?|src)/"
+    r"(?P<commit>[0-9a-f]{64}|[0-9a-f]{40})(?=/|\Z)"
+)
 FIRING_LINKS = [
     template.format(commit) for template, commit in zip(FIRING_LINK_TEMPLATES, FIRING_COMMITS)
 ]
@@ -219,10 +231,94 @@ def test_a_window_reads_only_the_commit_it_can_cross() -> None:
     ],
 )
 def test_the_accepted_residual_is_a_key_that_ends_in_a_routed_commit(glued: str) -> None:
-    """A key ending in `/blob/` and twelve or more hex digits, glued to the rest of 40.
+    """A key ending in `/blob/` and hex digits, glued to the rest of 40.
 
-    The key then carries the route itself, so its window holds twelve or more digits
+    The key then carries the route itself, so its window holds digits
     of a routed commit, which at this layer is byte-identical to a window straddling
     a repository name and a commit. Pinned as a decision, not an accident.
     """
     assert redact_credentials(glued) == (glued, [])
+
+
+@pytest.mark.parametrize("template", PLURAL_ROUTE_LINK_TEMPLATES)
+def test_a_plural_route_link_fires_on_singular_routes(
+    template: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`blobs/` and `trees/` are what lets the ceiling see a plural-route commit."""
+    monkeypatch.setattr(_redaction, "_ROUTED_COMMIT_RE", _SINGULAR_ROUTES_RE)
+    assert _redaction._text_contains_bare_secret(template.format(COMMIT))
+
+
+@pytest.mark.parametrize("template", PLURAL_ROUTE_LINK_TEMPLATES)
+def test_a_plural_route_link_fires_when_twelve_digits_are_required(
+    template: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deeper `packages/<name>/` path leaves a firing window fewer than twelve commit digits."""
+    monkeypatch.setattr(_redaction, "_ROUTED_COMMIT_PIECE_MIN", 12)
+    rng = random.Random(template)
+    fired = 0
+    for _ in range(200):
+        commit = "".join(rng.choice("0123456789abcdef") for _ in range(40))
+        fired += _redaction._text_contains_bare_secret(template.format(commit))
+    assert fired, template
+
+
+@pytest.mark.parametrize("template", PLURAL_ROUTE_LINK_TEMPLATES)
+def test_a_sha256_segment_after_a_plural_route_survives(template: str) -> None:
+    url = template.format(SHA256)
+    assert redact_credentials(url) == (url, [])
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"https://git.example/packages/WidgetHubChatBridge/blobs/{KEY}",
+        f"https://git.example/packages/WidgetHubChatBridge/blobs/{COMMIT}/{KEY}",
+        f"https://git.example/packages/WidgetHubChatBridge/trees/{COMMIT}/src/{KEY}/x.py",
+        f"https://git.example/packages/WidgetHubChatBridge/blobs/{KEY}/--/src/x.py",
+        f"{KEY}/blobs/{COMMIT}/--/x.py",
+    ],
+)
+def test_a_key_in_a_plural_route_link_is_still_redacted(text: str) -> None:
+    result, warnings = redact_credentials(text)
+    assert KEY not in result
+    assert TAG in result
+    assert warnings
+
+
+@pytest.mark.parametrize(
+    ("key", "text"),
+    [
+        (HEAD_HEX_KEY, f"https://git.example/packages/P/blobs/{HEAD_HEX_KEY}"),
+        (
+            LEAD_SLASH_KEY,
+            f"https://git.example/packages/P/blobs/{COMMIT[:28]}{LEAD_SLASH_KEY}",
+        ),
+        (HEX_HEAD_KEY, f"https://git.example/packages/P/trees/{COMMIT[:12]}{HEX_HEAD_KEY}"),
+    ],
+)
+def test_a_glued_key_after_a_plural_route_is_still_redacted(key: str, text: str) -> None:
+    result, warnings = redact_credentials(text)
+    assert key not in result
+    assert TAG in result
+    assert warnings
+
+
+def test_seeded_keys_glued_to_a_plural_route_commit_are_redacted() -> None:
+    rng = random.Random(22831)
+    alphabet = string.ascii_letters + string.digits + "+/"
+    checked = 0
+    while checked < 300:
+        key = "".join(rng.choice(alphabet) for _ in range(40))
+        if not _redaction._looks_like_secret_key(key):
+            continue
+        if key.count("/") > _redaction._SECRET_MAX_SLASHES:
+            continue
+        for text in (
+            f"https://git.example/packages/WidgetHubChatBridge/blobs/{COMMIT}/{key}",
+            f"https://git.example/packages/WidgetHubChatBridge/blobs/{key}",
+            f"x{key}/trees/{COMMIT}",
+            f"{key}blobs/{COMMIT}",
+        ):
+            assert key not in redact_credentials(text)[0], text
+        checked += 1
