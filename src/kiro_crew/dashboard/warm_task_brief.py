@@ -32,6 +32,7 @@ from kiro_crew import members as members_mod
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard.chat_utils import effective_session_key, slot_history_key
 from kiro_crew.dashboard.slot_preparing import preparing_message
+from kiro_crew.dashboard.slot_retention import _MAX_FOREGROUND_KEY
 from kiro_crew.history import TranscriptBusy, TranscriptWithheld, is_incognito_transcript
 from kiro_crew.history_schema import transcript_sort_key
 from kiro_crew.llm_helpers import _extract_json_of_type, run_bg_oneliner
@@ -263,7 +264,8 @@ def handle_focus_frame(
         # still showing the thread keeps the shared brief alive.
         if not _shown_by_other(foreground, conn, previous):
             cancel_warm_task_brief(state, previous)
-    if not isinstance(slot_key, str) or not slot_key:
+    # The foreground registry's key bound, before any key is retained.
+    if not isinstance(slot_key, str) or not slot_key or len(slot_key) > _MAX_FOREGROUND_KEY:
         return
     seen = getattr(state, "_warm_task_brief_last_seen", None)
     seen_at = seen.get(slot_key) if isinstance(seen, dict) else None

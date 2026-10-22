@@ -396,6 +396,13 @@ async def test_one_window_leaving_keeps_the_other_windows_brief(monkeypatch):
     assert _brief_kinds(slot) == _FULL_BRIEF
 
 
+def test_an_overlong_focus_key_is_never_retained():
+    state = _State()
+    warm_task_brief.handle_focus_frame(state, 1, "x" * (slot_retention._MAX_FOREGROUND_KEY + 1))
+    assert state._warm_task_brief_last_seen == {}
+    assert state._warm_task_brief_tasks == {}
+
+
 def test_last_seen_record_is_bounded(monkeypatch):
     monkeypatch.setattr(warm_task_brief, "_MAX_LAST_SEEN", 2)
     state = _State()
