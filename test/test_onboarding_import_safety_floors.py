@@ -506,7 +506,15 @@ class TestSessionImportRemoved:
             onboarding_sources,
             *(
                 importlib.import_module(f"kiro_crew.onboarding_sources.{name}")
-                for name in ("claude_code", "codex", "gemini", "hermes", "lineage", "openclaw")
+                for name in (
+                    "amazon_quick",
+                    "claude_code",
+                    "codex",
+                    "gemini",
+                    "hermes",
+                    "lineage",
+                    "openclaw",
+                )
             ),
         ]
 
@@ -542,11 +550,14 @@ class TestSessionImportRemoved:
             [{"role": "user", "content": "predecessor secret talk"}],
         )
         _write_openclaw_session(home / ".openclaw")
+        quick_session = home / ".quickwork" / "profiles" / "work" / "sessions" / "s1" / "workspace"
+        quick_session.mkdir(parents=True)
+        (quick_session / "notes.md").write_text("quick secret talk", encoding="utf-8")
 
         plan = api.preview_import(home=home, env={})
         serialized = json.dumps(plan)
 
-        for source_id in ("codex", "claude_code", "predecessor", "openclaw"):
+        for source_id in ("codex", "claude_code", "predecessor", "openclaw", "amazon_quick"):
             assert "sessions" not in _categories(plan, source_id)
         assert "secret talk" not in serialized
 
