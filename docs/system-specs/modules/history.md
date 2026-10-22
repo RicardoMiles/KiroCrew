@@ -562,6 +562,16 @@ slot key (`pages/system/sessionRows.ts`), in place of the backend's
 `New Session…` placeholder. A single-session message names it "Untitled session"
 with no key: the could-not-open notice (`pages/chat/page/ChatPaneNotices.tsx`) and
 the Memory tab's failed-consolidation line (`pages/overview/MemoryTab.tsx`).
+Other on-screen names read "Untitled session" too: a pane's fork-of tag
+(`components/ChatPane.tsx`) and an embedded tab (`components/EmbedTabStrip.tsx`),
+whose hover titles keep the key; the scene agent list (`hooks/useAgentSync.ts`);
+the Prompts tab's "Send to…" rows after the agent name, with the key on a muted second
+line (`pages/overview/PromptsTab.tsx`);
+the computer-use view's session name (`hooks/useComputerUseFrame.ts`); and a
+closed-session chip's name (`components/markdown/linkTargets.ts`), localized at
+render from the raw row it caches. A session missing from the slot list has an
+unknown title, so the fork-of tag and the embedded tab keep its key. Resuming a
+closed session still sends its raw title, or its key when untitled, never the label.
 
 `ChatSidebar.tsx` is a facade over owners that each hold one responsibility. It
 calls each owner hook where that block used to sit, so React runs the effects in
