@@ -12,6 +12,8 @@ frames a widget:
   script from an origin the frame does not allow fails here as it would there;
 * the same sandbox: scripts run, but without ``allow-same-origin`` the frame
   has an opaque origin, with no storage, no cookies and no reach into the page;
+* the same link handling: the frame opens no window, so a web link opens in a
+  new tab through the page, right after a click in the frame;
 * the theme variables of the default palette, in its dark set and its light set.
 
 With ``--fields`` the file is a Dashboard page's ``view.html`` instead, and
@@ -213,6 +215,58 @@ REPORT_SHIM = r"""(function () {
   });
 })();"""
 
+#: Runs first in a widget preview's frame, as the chat frame's link bridge
+#: (``LINK_BRIDGE_SHIM_BODY`` in ``website/src/lib/widgetSrcdoc.ts``) does there:
+#: the sandbox opens no window, so a web link's click is handed to the page,
+#: which opens it right after a click in the frame. Decided a task after the
+#: click, so a page that cancels it keeps that. A plain click is left to the
+#: sandbox, which refuses its window (a bare link is made window-opening, so the
+#: frame does not navigate away); a middle or modified click, which opens a tab
+#: even in the sandbox, is cancelled by a window listener added during its
+#: capture, so after the page's own window listeners, and only if the page has not
+#: cancelled it in any form (preventDefault, return false, returnValue).
+LINK_SHIM = r"""(function () {
+  // A protocol-relative link takes the page's scheme (a local preview file has none
+  // of its own, so https); an SVG link may carry xlink:href instead of href.
+  var XLINK = 'http://www.w3.org/1999/xlink';
+  function web(raw) {
+    var s = String(raw).trim();
+    if (s.slice(0, 2) === '//') s = (/^http:/.test(document.baseURI) ? 'http:' : 'https:') + s;
+    try { var u = new URL(s); } catch (_) { return null; }
+    return u.protocol === 'http:' || u.protocol === 'https:' ? u.href : null;
+  }
+  function hrefOf(n) {
+    return n.getAttribute('href') || (n.getAttributeNS ? n.getAttributeNS(XLINK, 'href') : '') || '';
+  }
+  function decide(e, middle) {
+    var path = typeof e.composedPath === 'function' ? e.composedPath() : [e.target], a = null;
+    for (var i = 0; i < path.length && !a; i++) {
+      var n = path[i];
+      if (n && n.nodeType === 1 && (n.localName === 'a' || n.localName === 'area')
+        && (n.hasAttribute('href') || (n.hasAttributeNS && n.hasAttributeNS(XLINK, 'href')))) a = n;
+    }
+    if (!a || a.closest('[data-action]')) return;
+    var target = (a.getAttribute('target') || '').trim().toLowerCase();
+    var url = web(hrefOf(a));
+    if (!url || (!middle && target === '_self')) return;
+    if (!middle && !target) a.setAttribute('target', '_blank');
+    var post = function () { parent.postMessage({ type: 'lui-preview-open', url: url }, '*'); };
+    if (!(middle || e.ctrlKey || e.metaKey || e.shiftKey)) {
+      setTimeout(function () { if (!e.defaultPrevented) post(); }, 0);
+      return;
+    }
+    // Added now, during capture, so it runs after every window listener the page
+    // registered, and reads a cancel in any form before the tab would open.
+    window.addEventListener(e.type, function (ev) {
+      if (ev !== e || e.defaultPrevented) return;
+      e.preventDefault();
+      post();
+    }, { once: true });
+  }
+  window.addEventListener('click', function (e) { decide(e, false); }, true);
+  window.addEventListener('auxclick', function (e) { if (e.button === 1) decide(e, true); }, true);
+})();"""
+
 #: The page script. It reads the flags, builds the frame's document the way the
 #: chat frame's builder does, and shows what the frame reports.
 _PAGE_SCRIPT = r"""(() => {
@@ -231,6 +285,7 @@ _PAGE_SCRIPT = r"""(() => {
   const shims = [];
   if (reduced) shims.push(CONFIG.shims.reduced);
   if (slow < 1) shims.push(CONFIG.shims.slow.replace('__SPEED__', String(slow)));
+  if (CONFIG.shims.link) shims.push(CONFIG.shims.link);
   shims.push(CONFIG.shims.report);
   const rootBody = Object.entries(vars).map(([name, value]) => `${name}:${value}`).join(';');
   const theme = `:root{${rootBody};color-scheme:${mode}}` +
@@ -254,6 +309,14 @@ _PAGE_SCRIPT = r"""(() => {
   addEventListener('message', (event) => {
     const data = event.data;
     if (event.source !== frame.contentWindow || !data) return;
+    // A widget's web link, opened only right after a click in the frame, as the
+    // dashboard's link bridge opens it.
+    if (data.type === 'lui-preview-open' && CONFIG.shims.link && typeof data.url === 'string'
+      && /^https?:\/\//i.test(data.url) && navigator.userActivation && navigator.userActivation.isActive
+      && document.activeElement === frame) {
+      frame.blur();
+      window.open(data.url, '_blank', 'noopener,noreferrer');
+    }
     if (data.type === 'lui-preview-height' && Number.isFinite(data.height)) {
       frame.style.height = `${Math.min(Math.max(data.height, 0), 20000)}px`;
     }
@@ -404,7 +467,12 @@ def page(text: str, name: str = "widget") -> str:
         "sandbox": FRAME_SANDBOX,
         "baseCss": BASE_BODY_CSS,
         "themes": THEMES,
-        "shims": {"reduced": REDUCED_SHIM, "slow": SLOW_SHIM, "report": REPORT_SHIM},
+        "shims": {
+            "reduced": REDUCED_SHIM,
+            "slow": SLOW_SHIM,
+            "link": LINK_SHIM,
+            "report": REPORT_SHIM,
+        },
     }
     return _PAGE.format(
         title=html.escape(name), config=_script_literal(config), script=_PAGE_SCRIPT
