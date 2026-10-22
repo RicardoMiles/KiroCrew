@@ -18597,6 +18597,8 @@
       "add_member_settling": "दूसरा साथी जोड़ने से पहले {{name}} का पहला संदेश पूरा हो रहा है।",
       "create_options_failed": "“{{list}}” के विकल्प लोड नहीं हो सके; डिफ़ॉल्ट दिखाया जा रहा है।",
       "welcome_title": "मैं इन पर काम कर रहा था",
+      "entrance_first_mate": "हाय! मैं तुम्हारा पहला साथी हूँ।",
+      "entrance_hello": "हाय! मैं {{name}} हूँ।",
       "welcome_paused": "रुका हुआ: {{goal}}",
       "welcome_paused_next": "रुका हुआ: {{goal}} (अगला कदम: {{next}})",
       "welcome_recent": "हाल का सत्र, शायद पूरा हो चुका: {{title}}",

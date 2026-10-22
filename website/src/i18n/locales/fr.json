@@ -18884,6 +18884,8 @@
       "add_member_settling": "Le premier message de {{name}} se termine avant d’ajouter un autre coéquipier.",
       "create_options_failed": "Impossible de charger les choix « {{list}} » ; la valeur par défaut est affichée.",
       "welcome_title": "Voici ce sur quoi je travaillais",
+      "entrance_first_mate": "Salut ! Je suis ton premier coéquipier.",
+      "entrance_hello": "Salut ! Je suis {{name}}.",
       "welcome_paused": "En pause : {{goal}}",
       "welcome_paused_next": "En pause : {{goal}} (prochaine étape : {{next}})",
       "welcome_recent": "Session récente, peut-être terminée : {{title}}",

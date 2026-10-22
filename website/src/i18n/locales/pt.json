@@ -18884,6 +18884,8 @@
       "add_member_settling": "Concluindo a primeira mensagem de {{name}} antes de adicionar outro companheiro.",
       "create_options_failed": "Não foi possível carregar as opções de “{{list}}”; o padrão é exibido.",
       "welcome_title": "Isto é o que eu estava fazendo",
+      "entrance_first_mate": "Oi! Sou seu primeiro companheiro.",
+      "entrance_hello": "Oi! Sou {{name}}.",
       "welcome_paused": "Em pausa: {{goal}}",
       "welcome_paused_next": "Em pausa: {{goal}} (próximo passo: {{next}})",
       "welcome_recent": "Sessão recente, pode estar concluída: {{title}}",

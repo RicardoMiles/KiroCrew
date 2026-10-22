@@ -316,6 +316,14 @@ Superseded 2026-10-10 by the amendment in screen 02: a crewmate is created on
 the New crewmate card, and this flow is no longer shown. The decisions below
 stay as the record of the earlier design.
 
+Amended 2026-10-22 (issue #23207): meeting the first Mate is its own moment,
+separate from the feature intro. The first time Mate's chat opens and its
+greeting is dispatched, Mate's face enters centre stage with "Hi! I'm your first
+Mate.", flies into the header name-pill's face slot, and only then greets in the
+thread. It runs for every new install, not only in launch week, and is
+specified in
+[crew-mode § The first Mate's entrance](../system-specs/modules/crew-mode.md).
+
 Decided: a four-step flow in the product's existing split-screen first-run
 shell, not a single card.
 

@@ -18310,6 +18310,8 @@
       "add_member_settling": "正在完成 {{name}} 的第一条消息，然后才能添加另一位队友。",
       "create_options_failed": "无法加载“{{list}}”的选项，已显示默认值。",
       "welcome_title": "这是我之前在做的工作",
+      "entrance_first_mate": "嗨！我是你的第一位队友。",
+      "entrance_hello": "嗨！我是 {{name}}。",
       "welcome_paused": "已暂停：{{goal}}",
       "welcome_paused_next": "已暂停：{{goal}}（下一步：{{next}}）",
       "welcome_recent": "最近的会话，可能已完成：{{title}}",

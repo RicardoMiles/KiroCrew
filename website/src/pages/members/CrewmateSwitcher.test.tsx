@@ -81,6 +81,25 @@ describe('CrewmateSwitcher closed chip', () => {
     const faces = within(chip()).getAllByTestId('avatar-stub').map((f) => f.textContent)
     expect(faces).toEqual(['scribe'])
   })
+
+  // The first Mate's entrance (#23207): while Mate's face is centre stage the
+  // folded roster is the only roster on screen, so its stack holds Mate's
+  // face unpainted, box kept, exactly as the pill's slot and a roster row do.
+  it('holds the face of the mate on stage unpainted, keeping its place in the stack', () => {
+    setup({ members: [MEMBERS[1]], faceOnStageFor: 'scribe' })
+    const face = within(chip()).getByTestId('crewmate-switcher-face')
+    expect(face).toHaveAttribute('data-entrance-empty', '')
+    expect(face).toHaveStyle({ visibility: 'hidden' })
+    expect(within(face).getByTestId('avatar-stub')).toHaveTextContent('scribe')
+  })
+
+  it('leaves every face painted when no mate is on stage', () => {
+    setup()
+    for (const face of within(chip()).getAllByTestId('crewmate-switcher-face')) {
+      expect(face).not.toHaveAttribute('data-entrance-empty')
+      expect(face).not.toHaveStyle({ visibility: 'hidden' })
+    }
+  })
 })
 
 describe('CrewmateSwitcher roster action', () => {

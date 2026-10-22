@@ -18597,6 +18597,8 @@
       "add_member_settling": "Die erste Nachricht von {{name}} wird abgeschlossen, bevor ein weiterer Crewmate hinzukommt.",
       "create_options_failed": "Die Auswahl für „{{list}}“ konnte nicht geladen werden; der Standardwert wird angezeigt.",
       "welcome_title": "Daran habe ich gearbeitet",
+      "entrance_first_mate": "Hi! Ich bin dein erster Crewmate.",
+      "entrance_hello": "Hi! Ich bin {{name}}.",
       "welcome_paused": "Pausiert: {{goal}}",
       "welcome_paused_next": "Pausiert: {{goal}} (nächster Schritt: {{next}})",
       "welcome_recent": "Letzte Sitzung, evtl. abgeschlossen: {{title}}",

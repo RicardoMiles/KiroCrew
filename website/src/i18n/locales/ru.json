@@ -19171,6 +19171,8 @@
       "add_member_settling": "Завершаем первое сообщение {{name}}, прежде чем добавить другого напарника.",
       "create_options_failed": "Не удалось загрузить варианты для «{{list}}»; показано значение по умолчанию.",
       "welcome_title": "Вот над чем я работал",
+      "entrance_first_mate": "Привет! Я твой первый напарник.",
+      "entrance_hello": "Привет! Я {{name}}.",
       "welcome_paused": "На паузе: {{goal}}",
       "welcome_paused_next": "На паузе: {{goal}} (следующий шаг: {{next}})",
       "welcome_recent": "Недавняя сессия, возможно, завершена: {{title}}",

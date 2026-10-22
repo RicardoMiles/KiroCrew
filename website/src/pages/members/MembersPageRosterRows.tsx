@@ -51,6 +51,7 @@ export function MemberRow({
   scrollActiveRowIntoView,
   slugCollides,
   indented,
+  faceOnStage,
 }: {
   m: MemberRosterRow
   t: TFn
@@ -71,6 +72,9 @@ export function MemberRow({
   slugCollides: boolean
   /** The row sits under a team header: stepped in so the header reads as its group. */
   indented: boolean
+  /** This crewmate's face is centre stage in the first Mate's entrance (#23207):
+   *  the row keeps its box and holds the face unpainted until it lands. */
+  faceOnStage: boolean
 }) {
   // Withheld for a colliding slug, exactly as the page's merged list and drawer
   // do: this row shares its slug with another member, so a slug-keyed frame
@@ -156,7 +160,12 @@ export function MemberRow({
           )}
           aria-current={view.name === activeName ? 'true' : undefined}
         >
-          <span className="relative shrink-0">
+          <span
+            className="relative shrink-0"
+            style={faceOnStage ? { visibility: 'hidden' } : undefined}
+            data-testid="member-row-face"
+            data-entrance-empty={faceOnStage ? '' : undefined}
+          >
             {/* The face reacts: it animates while the member works and
                 flashes its finished / failed expression on the turn's
                 trailing edge. The dot below stays presence-only — a

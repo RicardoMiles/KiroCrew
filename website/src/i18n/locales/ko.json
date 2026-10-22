@@ -18310,6 +18310,8 @@
       "add_member_settling": "다른 크루메이트를 추가하기 전에 {{name}}의 첫 메시지를 마무리하고 있습니다.",
       "create_options_failed": "‘{{list}}’ 선택 항목을 불러오지 못했습니다. 기본값을 표시합니다.",
       "welcome_title": "제가 하던 작업입니다",
+      "entrance_first_mate": "안녕하세요! 저는 첫 크루메이트입니다.",
+      "entrance_hello": "안녕하세요! 저는 {{name}}입니다.",
       "welcome_paused": "일시 중지됨: {{goal}}",
       "welcome_paused_next": "일시 중지됨: {{goal}} (다음 단계: {{next}})",
       "welcome_recent": "최근 세션, 완료되었을 수 있음: {{title}}",

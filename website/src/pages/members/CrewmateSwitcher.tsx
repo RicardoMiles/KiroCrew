@@ -84,6 +84,7 @@ export default function CrewmateSwitcher({
   onShowRoster,
   signals = rowOnlySignals,
   openRequest = 0,
+  faceOnStageFor = '',
   className,
 }: {
   /** The FULL roster, in the page's display order. The hide rule below decides
@@ -107,6 +108,10 @@ export default function CrewmateSwitcher({
   /** Bumped by the page to open the list from outside (the unread column's
    *  "+N" pill). A counter, not a boolean, so two requests in a row both open. */
   openRequest?: number
+  /** The crewmate whose face is centre stage in the first Mate's entrance
+   *  (#23207): its face in the stack holds its place unpainted until the face
+   *  lands, as the header pill's slot and the roster row do. `''` for none. */
+  faceOnStageFor?: string
   className?: string
 }) {
   const { t } = useTranslation()
@@ -201,7 +206,9 @@ export default function CrewmateSwitcher({
               <span
                 key={m.name}
                 className={cn('rounded-full ring-2 ring-bg group-hover:ring-bg-hover group-data-[state=open]:ring-bg-hover transition-colors', i > 0 && '-ml-2')}
-                style={{ zIndex: STACK_FACES - i }}
+                style={{ zIndex: STACK_FACES - i, ...(faceOnStageFor === m.name ? { visibility: 'hidden' as const } : {}) }}
+                data-testid="crewmate-switcher-face"
+                data-entrance-empty={faceOnStageFor === m.name ? '' : undefined}
               >
                 <CrewStateAvatar seed={m.name} avatar={m.avatar} slotKey={m.slot_key} running={signals(m).running} size={22} working="subtle" />
               </span>

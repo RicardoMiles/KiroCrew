@@ -440,13 +440,16 @@ interface MembersPageRosterColumnProps {
   postCreateError: PostCreateFailure | null
   createHeld: string | null
   slotKeyOf: (m: MemberRosterRow) => string
+  /** The crewmate whose face is centre stage in the first Mate's entrance
+   *  (#23207), so its row holds the face unpainted until it lands; `''` for none. */
+  faceOnStageFor: string
 }
 
 /** The roster card. On a phone the facade portals it into the roster drawer (`placeRoster`). */
 export function MembersPageRosterColumn({
   rosterRead, teamsRead, layout, drawers, rosterView, rosterSignals, profileFlight, navigation, teamView,
   activeName, scrollActiveRowIntoView, gone, createOpen, openAdvanced, openQuick, postCreateError, createHeld,
-  slotKeyOf,
+  slotKeyOf, faceOnStageFor,
 }: MembersPageRosterColumnProps) {
   const { t } = useTranslation()
   const { rosterQuery, loaded, loadError, collidingSlugs, members } = rosterRead
@@ -928,6 +931,7 @@ export function MembersPageRosterColumn({
                           scrollActiveRowIntoView={scrollActiveRowIntoView}
                           slugCollides={collidingSlugs.has(m.slug)}
                           indented={grouped}
+                          faceOnStage={faceOnStageFor === m.name}
                         />
                       ))}
                   </Fragment>

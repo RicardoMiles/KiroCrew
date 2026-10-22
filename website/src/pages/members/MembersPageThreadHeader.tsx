@@ -57,7 +57,7 @@ export function MembersPageThreadHeader({
   const { pillFaceRef, openProfile, schedGuardRef, schedAtStakeRef, requestCloseProfile, togglePanel } = profileCard
   const { rosterDrawerOpen, openRosterDrawer, rosterDrawerAvailable } = drawers
   const { isRunning, orderedMembers } = rosterView
-  const { activeSlot } = thread
+  const { activeSlot, entranceFaceHidden } = thread
   const {
     threadHeaderRef, setSwitcherOpenRequest, switcherOpenRequest, topbarSlot, headerInBar, pillActivity,
   } = threadView
@@ -113,6 +113,7 @@ export function MembersPageThreadHeader({
           onCreate={createHeld ? undefined : openQuick}
           onShowRoster={() => setRosterPin(true)}
           openRequest={switcherOpenRequest}
+          faceOnStageFor={entranceFaceHidden ? active.name : ''}
         />
         </div>
         <Glass
@@ -190,11 +191,14 @@ export function MembersPageThreadHeader({
         {/* When the card docks and the pill steps out, the face flies to
             the card's head as `CrewFaceFlight`'s copy, above everything;
             this one holds its place unpainted while a flight is up. */}
+        {/* And while the first Mate is centre stage (#23207), the slot waits
+            empty, reserved width and all, for the face to fly into it. */}
         <span
           ref={pillFaceRef}
           className="relative flex shrink-0 rounded-full"
-          style={faceFlight || (profile && profile.placement === 'floating') ? { visibility: 'hidden' } : undefined}
+          style={faceFlight || (profile && profile.placement === 'floating') || entranceFaceHidden ? { visibility: 'hidden' } : undefined}
           data-testid="member-pill-face"
+          data-entrance-empty={entranceFaceHidden ? '' : undefined}
         >
           <CrewMonitoredAvatar
             seed={active.name}

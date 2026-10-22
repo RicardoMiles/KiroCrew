@@ -1322,6 +1322,28 @@ or host name. The route answers `{"outcome": ...}` (`started`, `already_greeted`
 fails surfaces through the ordinary turn error path once; the marker is already
 claimed, so it never loops, and the composer stays usable.
 
+**The first Mate's entrance.** The one tab whose greet request is answered
+`started` -- and only that answer: `already_greeted`, `not_empty`, an error and
+every other outcome show nothing -- introduces Mate itself before the greeting
+(`pages/members/MateEntrance.tsx`, driven from `useMembersPageThread` through
+`useFirstGreeting`'s `onStarted`). The header pill's face slot, Mate's roster
+row and its face in the folded roster's switcher chip hold their face unpainted
+(box kept, so nothing shifts); Mate's face appears
+large (150px) at the centre of the thread column with a one-line speech bubble --
+"Hi! I'm your first Mate." while Mate is the only mate on the roster, "Hi! I'm
+{{name}}." once others exist, the same split the kickoff makes -- and the chat
+pane under it is veiled. After about 1.5 s the face flies into the pill's face
+slot (0.9 s, a portaled copy above every surface, as the Profile face flight is),
+the slot's own face and the roster row's fill with a small pop and a ring, the
+pane fades back, and the greeting turn's row streams in as above. Mate only: a
+mate created on the New mate card already showed the person the face and name
+they chose, so its goal welcome opens with no entrance. Once per thread by
+construction -- the server's `O_EXCL` claim decides which single request ever
+hears `started`, so a reload, a second tab or a failed turn never replays it, and
+no second marker exists. Leaving the thread mid-entrance ends it for good. Under
+`prefers-reduced-motion` the faces stay painted from the start, only the bubble
+is shown, static, for the same 1.5 s, and nothing flies.
+
 **Fresh start.** A quiet "Fresh start" pill under the mate's name, in the Profile
 card's head (on every screen width; the DM header carries no button; no danger colour;
 the label is the action alone, with no ellipsis and no sub line -- the confirm carries

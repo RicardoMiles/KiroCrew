@@ -18597,6 +18597,8 @@
       "add_member_settling": "আরেকজন সঙ্গী যোগ করার আগে {{name}}-এর প্রথম বার্তা শেষ করা হচ্ছে।",
       "create_options_failed": "“{{list}}” এর বিকল্প লোড করা যায়নি; ডিফল্ট দেখানো হচ্ছে।",
       "welcome_title": "আমি এগুলো নিয়ে কাজ করছিলাম",
+      "entrance_first_mate": "হাই! আমি তোমার প্রথম সঙ্গী।",
+      "entrance_hello": "হাই! আমি {{name}}।",
       "welcome_paused": "বিরতিতে: {{goal}}",
       "welcome_paused_next": "বিরতিতে: {{goal}} (পরবর্তী ধাপ: {{next}})",
       "welcome_recent": "সাম্প্রতিক সেশন, হয়তো শেষ হয়েছে: {{title}}",

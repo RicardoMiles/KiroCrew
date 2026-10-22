@@ -21,6 +21,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject, type Dispatch, type SetStateAction, type RefObject } from 'react'
 import { type NavigateFunction, type Location, type SetURLSearchParams } from 'react-router-dom'
 import { RotateCw } from 'lucide-react'
+import { useReducedMotion } from 'framer-motion'
 import { usePreviewFlag } from '../../hooks/usePreviewFlag'
 import { PREVIEW_CREW } from '../../utils/previewFlags'
 import { Btn } from '../../components/ui'
@@ -47,6 +48,7 @@ import { useSlotActivity } from './useSlotActivity'
 import { AWAITING_REPLY_ACTIVITY } from '../../components/chat/useCrewmateAwaitingReply'
 import ChatPane from '../../components/ChatPane'
 import MateWelcomeCard from './MateWelcomeCard'
+import MateEntrance from './MateEntrance'
 import { useMateGreeting } from './mateGreeting'
 import CrewComposer from './CrewComposer'
 import ErrorBoundary from '../../components/ErrorBoundary'
@@ -179,11 +181,39 @@ export function useMembersPageThread({
   // or the goal question of a crewmate created with `first_greeting`), so this
   // is a no-op on every later open. Asked only for Mate (with the preview on)
   // and dashboard-created crewmates: no other row can be owed one.
+  // The first Mate's entrance (#23207): in the one tab whose greeting request
+  // the server answers `started`, Mate's face enters centre stage with a line,
+  // flies into the header pill's face slot, and only then does the greeting
+  // turn stream in. Keyed on that answer alone, so a reload, a second tab or a
+  // failed turn (`already_greeted`, `not_empty`, an error) never replays it:
+  // the server's own once-only claim is the entrance's once-only too. Mate
+  // only: a mate created on the New mate card already showed the person the
+  // face and name they picked, so there is no one new to meet there.
+  const reduceMotion = useReducedMotion()
+  const [entranceState, setEntrance] = useState<MateEntranceState | null>(null)
+  const startEntrance = useCallback((slot: string) => setEntrance({ slot, phase: 'stage' }), [])
+  const landEntrance = useCallback(
+    () => setEntrance((e) => (e && e.phase === 'stage' ? { ...e, phase: 'landed' } : e)),
+    [],
+  )
+  const endEntrance = useCallback(() => setEntrance(null), [])
   useFirstGreeting(
     active?.slug,
     activeSlot,
     !!active && ((crewPreview && isAssistantMember(active)) || active.dashboard_created === true),
+    isAssistantMember(active) ? startEntrance : undefined,
   )
+  // An entrance belongs to the thread it was answered for. Leaving that thread
+  // mid-entrance ends it (the stage unmounts with the column) and nothing
+  // brings it back: `started` is answered once per thread.
+  const entrance = entranceState && entranceState.slot === activeSlot ? entranceState : null
+  useEffect(() => {
+    if (entranceState && entranceState.slot !== activeSlot) setEntrance(null)
+  }, [entranceState, activeSlot])
+  // While the face is on stage the header pill's slot and the roster row hold
+  // their face unpainted, so there is one face on screen. Reduced motion has
+  // no face on stage, so both keep theirs from the start.
+  const entranceFaceHidden = !!entrance && entrance.phase === 'stage' && !reduceMotion
   // Two distinct verdicts with two different sentences: a collision is a
   // fact about the roster (the slug's thread belongs to another crew), a
   // failed POST is a transport error. Both render through ErrorNotice so
@@ -314,8 +344,15 @@ export function useMembersPageThread({
   return {
     activeSlot, freshStarts, freshStartError, setFreshStartError, freshStart, freshStartConfirmDialog,
     askFreshStart, crewPreview, mateLandedRef, activeCollision, activeThreadFailed, postThread, connected,
-    confirmedSlot,
+    confirmedSlot, entrance, entranceFaceHidden, landEntrance, endEntrance,
   }
+}
+
+/** The first Mate's entrance in progress (#23207): `stage` while the face is
+ *  centre stage or in flight, `landed` while the slot's own face pops. */
+export interface MateEntranceState {
+  slot: string
+  phase: 'stage' | 'landed'
 }
 
 export type MembersPageThreadState = ReturnType<typeof useMembersPageThread>
@@ -567,8 +604,21 @@ export function MembersPageThreadColumn({
   const { activeRoster, crewmateIdentity, setStarError, starError } = rosterView
   const {
     activeSlot, freshStarts, freshStartError, setFreshStartError, activeCollision, activeThreadFailed,
-    connected,
+    connected, entrance, landEntrance, endEntrance,
   } = thread
+  const { pillFaceRef } = profileCard
+  const { reduceMotion } = profileFlight
+  // What Mate says on stage: "your first Mate" only while it IS the only mate
+  // on the roster, the same split the server's welcome kickoff makes
+  // (`FIRST_WELCOME` vs `FIRST_WELCOME_WITH_CREW`).
+  const entranceText = active && entrance
+    ? members.some((m) => !isAssistantMember(m))
+      ? t('pages.membersPage.entrance_hello', { name: crewDisplayName(active) })
+      : t('pages.membersPage.entrance_first_mate')
+    : ''
+  // The pane is veiled while the face is on stage, so the greeting's first row
+  // cannot stream in under the entrance; it fades back as the face lands.
+  const entranceOnStage = !!entrance && entrance.phase === 'stage'
   const {
     openMemberSideChat, openCrewWorkLog, openSubagentsView, sessionRoster, retryThreadsFlag, threadsFlagFailed,
     threadsFlagRetrying, threadsOn, threadsQuery, threadHooks, actionError, setActionError, actionInfo,
@@ -1012,8 +1062,28 @@ export function MembersPageThreadColumn({
                 )}
                 </div>
                 </div>
+                {entrance && crewmateIdentity && (
+                  <MateEntrance
+                    key={entrance.slot}
+                    crewmate={crewmateIdentity}
+                    slotKey={activeSlot}
+                    text={entranceText}
+                    stageRef={threadColumnRef}
+                    targetRef={pillFaceRef}
+                    reduceMotion={!!reduceMotion}
+                    onLanded={landEntrance}
+                    onDone={endEntrance}
+                  />
+                )}
                 {activeSlot ? (
-                  <div className="flex-1 min-h-0">
+                  <div
+                    // Veiled at once (a cut, so no "Working" row shows under the
+                    // face for a frame); unveiled with a fade as the face lands.
+                    className={entranceOnStage ? 'flex-1 min-h-0' : 'flex-1 min-h-0 transition-opacity duration-300 motion-reduce:transition-none'}
+                    style={entranceOnStage ? { opacity: 0 } : undefined}
+                    data-testid="member-thread-pane"
+                    data-entrance-veiled={entranceOnStage ? '' : undefined}
+                  >
                     <ErrorBoundary>
                       {/* Same reading measure as the main chat transcript — the
                           pane resolves the user's Content width setting itself
@@ -1033,7 +1103,7 @@ export function MembersPageThreadColumn({
                         // while a repair has failed; the pane's own "Session
                         // ready" would contradict it one line down.
                         // The crewmate's greeting already speaks for the empty chat.
-                        hideEmptyHint={activeThreadFailed || !!mateGreeting}
+                        hideEmptyHint={activeThreadFailed || !!mateGreeting || !!entrance}
                         foldBefore={freshStarts[activeSlot] ?? activeRoster?.reset_at}
                         // Under the floating header only when nothing sits between
                         // them (see the block above); a card between already paid.

@@ -802,6 +802,7 @@ export default function MembersPage() {
         scrollActiveRowIntoView={scrollActiveRowIntoView} gone={gone} createOpen={createOpen}
         openAdvanced={openAdvanced} openQuick={openQuick} postCreateError={postCreateError}
         createHeld={createHeld} slotKeyOf={slotKeyOf}
+        faceOnStageFor={thread.entranceFaceHidden && active ? active.name : ''}
       />)}
 
       {/* DM thread */}

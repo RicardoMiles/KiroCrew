@@ -18310,6 +18310,8 @@
       "add_member_settling": "別のクルーメイトを追加する前に、{{name}} の最初のメッセージを完了しています。",
       "create_options_failed": "「{{list}}」の選択肢を読み込めませんでした。デフォルトを表示しています。",
       "welcome_title": "これまで取り組んでいた作業です",
+      "entrance_first_mate": "こんにちは！私はあなたの最初のクルーメイトです。",
+      "entrance_hello": "こんにちは！私は {{name}} です。",
       "welcome_paused": "一時停止中: {{goal}}",
       "welcome_paused_next": "一時停止中: {{goal}}（次の手順: {{next}}）",
       "welcome_recent": "最近のセッション(完了済みの可能性あり): {{title}}",
