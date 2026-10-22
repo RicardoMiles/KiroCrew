@@ -1,13 +1,16 @@
 """``POST /api/members/{slug}/dashboard/page-offer`` -- the yes on a page-offer card.
 
-The ``crewmate.dashboard_page`` card's one apply step. It writes no page and no
-record (asked-once was written before the card was shown): it wakes the crewmate once to write,
+The ``crewmate.dashboard_page`` card's one apply step. It writes no page (asked-once
+was written before the card was shown; the yes only marks that record pending until
+its wake starts): it wakes the crewmate once to write,
 ``dashboard_save`` and ``dashboard_apply`` its page (:mod:`kiro_crew.dashboard.page_offer`).
 Owner-only, and only from the card's own apply step (:data:`REQ_CARD_PAGE_OFFER_APPLY`,
 which only the card hook sets), so no other caller can start that wake.
 """
 
 from __future__ import annotations
+
+import asyncio
 
 from aiohttp import web
 
@@ -35,8 +38,10 @@ async def api_member_page_offer(request: web.Request) -> web.Response:
     if request.get(REQ_CARD_PAGE_OFFER_APPLY) is not True:
         return _deny(403, "card_only", "this runs only from the crewmate's page-offer card")
     slug, member, _cfg = who
-    # The asked-once record was written before the card was shown; the yes adds nothing
-    # to it, so this step has no write that can fail.
+    # The asked-once record was written before the card was shown; the yes only marks
+    # it pending until the wake starts, best effort, so this step has no write that
+    # can fail. Off the loop: the mark is an fsynced write.
+    await asyncio.to_thread(page_offer.record_yes, slug)
     page_offer.schedule_write(
         request.app.get("state"), slug, member, page=request.get(REQ_CARD_PAGE_OFFER_PAGE)
     )

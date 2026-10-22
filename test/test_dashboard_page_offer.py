@@ -19,7 +19,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from kiro_crew import change_card_catalog as catalog
 from kiro_crew import change_card_dashboard_page as card
-from kiro_crew.dashboard import page_offer
+from kiro_crew.dashboard import boot_id, page_offer
 
 SLUG = "scout"
 MEMBER = "Scout"
@@ -257,10 +257,20 @@ async def _client(monkeypatch: Any, *, armed: bool, page: Any = None) -> TestCli
 async def test_the_yes_starts_one_write_wake_and_writes_nothing(
     home: Path, monkeypatch: Any
 ) -> None:
+    import threading
+
     woken: list[tuple[str, str]] = []
     monkeypatch.setattr(
         page_offer, "schedule_write", lambda _st, slug, m, **_k: woken.append((slug, m))
     )
+    marked_on: list[threading.Thread] = []
+    real_mark = page_offer.record_yes
+
+    def mark(slug: str) -> None:
+        marked_on.append(threading.current_thread())
+        real_mark(slug)
+
+    monkeypatch.setattr(page_offer, "record_yes", mark)
     page_offer.record_asked(SLUG, "Goal board")
     client = await _client(monkeypatch, armed=True)
     try:
@@ -271,7 +281,12 @@ async def test_the_yes_starts_one_write_wake_and_writes_nothing(
     finally:
         await client.close()
     assert woken == [(SLUG, MEMBER)]
-    assert page_offer.read_record(SLUG) == {"replaces": "Goal board"}
+    # The yes only marks the record pending, and off the event loop: it is an fsync.
+    assert page_offer.read_record(SLUG) == {
+        "replaces": "Goal board",
+        "pending": boot_id.current_boot_id(),
+    }
+    assert len(marked_on) == 1 and marked_on[0] is not threading.current_thread()
 
 
 @pytest.mark.asyncio
@@ -594,3 +609,89 @@ def test_the_yes_wake_puts_the_template_back_by_id() -> None:
     text = page_offer.write_prompt("Goal board", "goal-board")
     assert 'dashboard_apply(template_id="goal-board")' in text
     assert "dashboard_rollback" not in text
+
+
+def test_the_yes_marks_the_record_pending_until_its_wake_starts(
+    monkeypatch: Any, home: Path
+) -> None:
+    """The yes waits in memory for an idle thread; the record says so until it starts."""
+    from kiro_crew.dashboard import goal_setup
+
+    calls: list[tuple] = []
+    monkeypatch.setattr(goal_setup, "_schedule", lambda *a, **k: calls.append((a, k)))
+    page_offer.record_asked(SLUG, "Goal board", "goal-board")
+    page_offer.record_yes(SLUG)
+    page_offer.schedule_write("state", SLUG, MEMBER)
+    assert page_offer.read_record(SLUG) == {
+        "replaces": "Goal board",
+        "template_id": "goal-board",
+        "pending": boot_id.current_boot_id(),
+    }
+    # Still asked in this process: the wake is waiting, not lost.
+    assert page_offer.was_asked(SLUG) is True
+    ((_args, kwargs),) = calls
+    kwargs["on_started"]()
+    assert page_offer.read_record(SLUG) == {"replaces": "Goal board", "template_id": "goal-board"}
+
+
+def test_a_yes_a_restart_lost_is_offered_again(monkeypatch: Any, home: Path) -> None:
+    """A gateway that exits while the yes waits leaves a mark naming an older process:
+    the crewmate is not counted as asked, and raising the card again clears the mark."""
+    import asyncio
+
+    from kiro_crew.dashboard import goal_setup
+    from kiro_crew.dashboard.handlers import member_self
+
+    monkeypatch.setattr(goal_setup, "_schedule", lambda *a, **k: None)
+    page_offer.record_asked(SLUG, "Goal board", "goal-board")
+    page_offer.record_yes(SLUG)
+    page_offer.schedule_write("state", SLUG, MEMBER)
+    monkeypatch.setattr(boot_id, "_boot_id", "a-later-gateway")
+    assert page_offer.was_asked(SLUG) is False
+    _claim_env(monkeypatch)
+    asyncio.run(member_self._page_offer_claim(MEMBER)())
+    assert page_offer.read_record(SLUG) == {"replaces": "Goal board"}
+    assert page_offer.was_asked(SLUG) is True
+
+
+def test_a_started_wake_stays_asked_after_a_restart(monkeypatch: Any, home: Path) -> None:
+    from kiro_crew.dashboard import goal_setup
+
+    calls: list[tuple] = []
+    monkeypatch.setattr(goal_setup, "_schedule", lambda *a, **k: calls.append((a, k)))
+    page_offer.record_asked(SLUG, "Goal board")
+    page_offer.record_yes(SLUG)
+    page_offer.schedule_write("state", SLUG, MEMBER)
+    ((_args, kwargs),) = calls
+    kwargs["on_started"]()
+    monkeypatch.setattr(boot_id, "_boot_id", "a-later-gateway")
+    assert page_offer.was_asked(SLUG) is True
+
+
+@pytest.mark.asyncio
+async def test_a_wake_that_starts_runs_its_started_hook_only(monkeypatch: Any) -> None:
+    from kiro_crew.dashboard import goal_setup
+
+    async def started(*_a: Any) -> str:
+        return "started"
+
+    monkeypatch.setattr(goal_setup, "_wait_and_send", started)
+    seen: list[str] = []
+
+    class _State:
+        pass
+
+    state = _State()
+    goal_setup._schedule(
+        state,
+        "k",
+        SLUG,
+        MEMBER,
+        lambda *_a: "x",
+        "test",
+        on_dropped=lambda outcome: seen.append(f"dropped:{outcome}"),
+        on_started=lambda: seen.append("started"),
+    )
+    for task in list(goal_setup._tasks(state).values()):
+        await task
+    assert seen == ["started"]

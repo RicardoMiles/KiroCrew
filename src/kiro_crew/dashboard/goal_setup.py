@@ -264,12 +264,15 @@ def _schedule(
     build: Build,
     what: str,
     on_dropped: "Callable[[str], None] | None" = None,
+    on_started: "Callable[[], None] | None" = None,
 ) -> None:
     """Send *build*'s turn to *member* once its thread is idle, one waiting per *key*.
 
     *on_dropped*, when given, runs off the loop with the outcome when the turn was
     never started (the wait timed out, the thread closed, the read failed), so a
-    caller that promised a wake can take that promise back.
+    caller that promised a wake can take that promise back. *on_started*, when
+    given, runs off the loop once the turn was started, so a caller that kept a
+    durable mark of the promise can clear it.
     """
     if state is None:
         return
@@ -282,7 +285,10 @@ def _schedule(
         try:
             outcome = await _wait_and_send(state, slug, member, build)
             logger.info("%s nudge for %s: %s", what, slug, outcome)
-            if on_dropped is not None and outcome != "started":
+            if outcome == "started":
+                if on_started is not None:
+                    await asyncio.to_thread(on_started)
+            elif on_dropped is not None:
                 await asyncio.to_thread(on_dropped, outcome)
         except asyncio.CancelledError:
             raise

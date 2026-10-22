@@ -2288,7 +2288,13 @@ draft guard, so a veto neither remounts the card nor loses its pushed form.
   back. A no, or the card expiring, writes nothing. Asked-once is
   `crew-panels/<slug>.page-offer.json` (`page_offer.record_path`, beyond the
   crewmate's own shell), written when the card is raised, so a yes, a no and an
-  expiry all count: the line stops and the card's preview refuses a second offer
+  expiry all count. The one exception is a yes whose wake never started: the yes
+  marks the record `pending` with the gateway process's boot id (`boot_id.current_boot_id`)
+  (`record_yes`, called off the event loop by the route) and the wake clears it when it starts (`record_started`, through
+  `goal_setup._schedule`'s `on_started`), so a mark naming an earlier process -- a
+  gateway that exited while the wake waited for an idle thread -- is read as not
+  asked (`was_asked`) and the next wake offers the page again. Otherwise the line
+  stops and the card's preview refuses a second offer
   (`already_asked`), and also refuses a crewmate with nothing on its tab or a
   page of its own (`not_on_a_template`) or with no goal and milestones yet
   (`not_ready`). The kind is `catalog.SELF_ONLY_KINDS`: `list_change_kinds` leaves it

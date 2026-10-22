@@ -16,6 +16,13 @@ Asked-once is a record per crewmate in ``crew-panels`` (:func:`record_path`), wh
 the crewmate's own shell cannot reach: written just before the card is shown, so a yes, a
 no and an expiry all count, and no later wake asks again. The offer line and the
 card's own preview both read it.
+
+A yes waits in memory for the crewmate's thread to go idle, so a gateway that exits
+in that wait would lose it with the record still saying "asked". The yes therefore
+marks the record ``pending`` with this process's boot id
+(``boot_id.current_boot_id``, :func:`record_yes`), and the wake clears the mark once it starts
+(:func:`record_started`). A mark left by an earlier process is a yes whose wake never
+started: :func:`was_asked` reads it as not asked, so the next wake offers the page again.
 """
 
 from __future__ import annotations
@@ -62,8 +69,20 @@ def read_record(slug: str) -> dict[str, Any] | None:
 
 
 def was_asked(slug: str) -> bool:
-    """Whether crewmate *slug* has already been asked (yes, no or expiry all count)."""
-    return read_record(slug) is not None
+    """Whether crewmate *slug* has already been asked (yes, no or expiry all count).
+
+    A yes an earlier gateway process accepted but never started its wake for
+    (``pending`` naming another process) does not count, so the page is offered again.
+    """
+    rec = read_record(slug)
+    if rec is None:
+        return False
+    pending = rec.get("pending")
+    if not (isinstance(pending, str) and pending):
+        return True
+    from kiro_crew.dashboard.boot_id import current_boot_id
+
+    return pending == current_boot_id()
 
 
 def _write(slug: str, data: dict[str, Any]) -> None:
@@ -86,6 +105,34 @@ def record_asked(slug: str, replaces: str, template_id: str = "") -> None:
     if template_id:
         data["template_id"] = template_id
     _write(slug, data)
+
+
+def _mark(slug: str, pending: bool) -> None:
+    """Set or clear the record's ``pending`` mark. Best effort: a mark that cannot be
+    written leaves the record as it was, which still counts as asked."""
+    try:
+        rec = read_record(slug)
+        if not rec:
+            return
+        data = {k: v for k, v in rec.items() if k != "pending"}
+        if pending:
+            from kiro_crew.dashboard.boot_id import current_boot_id
+
+            data["pending"] = current_boot_id()
+        if data != rec:
+            _write(slug, data)
+    except Exception:
+        logger.warning("page offer record for %s could not be marked", slug, exc_info=True)
+
+
+def record_yes(slug: str) -> None:
+    """Mark *slug*'s record: the person said yes, and the write wake has not started."""
+    _mark(slug, True)
+
+
+def record_started(slug: str) -> None:
+    """Clear the yes mark: the write wake started, so the offer is spent."""
+    _mark(slug, False)
 
 
 def forget_asked(slug: str) -> None:
@@ -190,6 +237,9 @@ def schedule_write(
     picked while the thread was busy is a newer choice than the yes, so no wake is sent
     and the record goes back the same way. *page* is the page the card's yes was given
     over (its last previewed snapshot); without it, the page the card was raised over.
+    The caller marks the yes first, off the loop (:func:`record_yes`); the wake clears
+    the mark when it starts, so a gateway that exits while the wake waits leaves the
+    page to be offered again.
     """
     from kiro_crew.dashboard import goal_setup
 
@@ -214,4 +264,5 @@ def schedule_write(
         build,
         "dashboard page",
         on_dropped=lambda _outcome: forget_asked(slug),
+        on_started=lambda: record_started(slug),
     )
