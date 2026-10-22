@@ -72,6 +72,11 @@ from kiro_crew.acp.types import (
     JsonRpcMessage,
     steering_outcome,
 )
+from kiro_crew.agent_sdk.backends import (
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_LAUNCH,
+    ACP_BACKEND_NODE_ADAPTER_PACKAGES,
+)
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -112,6 +117,48 @@ def steering_advertised(init_resp: object) -> bool:
     meta = init_resp.get("_meta") if isinstance(init_resp, dict) else None
     steering = meta.get("steering") if isinstance(meta, dict) else None
     return isinstance(steering, dict) and steering.get("supported") is True
+
+
+#: The oldest goose that serves ``_goose/unstable/session/steer`` as Crew sends it:
+#: 1.38.0 ("Steering messages with ACP", block/goose#9560) added the request with
+#: ``expectedRunId``, the ``{runId, messageId}`` answer, ``activeRunId`` on
+#: ``session_info_update`` and the ``_meta.goose.steer`` echo. 1.37.0 has none of
+#: them, so its answer is ``-32601`` and every steer queues.
+GOOSE_STEER_MIN_VERSION = (1, 38, 0)
+
+#: The release each adapter needs before the card's ``mid_turn_steer`` line is true,
+#: with the command that updates it. Below it the session still runs and a steer
+#: queues, so a new chat gets one notice naming the upgrade instead of a refusal.
+_STEER_MIN_VERSIONS: dict[str, tuple[tuple[int, int, int], str]] = {
+    ACP_BACKEND_CLAUDE: (
+        CLAUDE_ACP_STEERING_MIN_VERSION,
+        f"npm i -g {ACP_BACKEND_NODE_ADAPTER_PACKAGES[ACP_BACKEND_CLAUDE]}",
+    ),
+    ACP_BACKEND_GOOSE: (
+        GOOSE_STEER_MIN_VERSION,
+        ACP_BACKEND_LAUNCH[ACP_BACKEND_GOOSE].install_command,
+    ),
+}
+
+
+def steer_version_issue(backend: str, agent_version: str) -> str:
+    """The upgrade notice for *agent_version* of *backend*, or ``""`` when it is not
+    known to be too old to steer. An absent or unreadable version gets none, as for
+    pi. Compared by :func:`_adapter_version_at_least`, the parser the steer gate
+    itself reads, so the notice cannot disagree with whether the session steers."""
+    floor_and_fix = _STEER_MIN_VERSIONS.get(backend)
+    # Readable means it parses at all: every readable version is at least 0.0.0.
+    if floor_and_fix is None or not _adapter_version_at_least(agent_version, (0, 0, 0)):
+        return ""
+    floor, fix = floor_and_fix
+    if _adapter_version_at_least(agent_version, floor):
+        return ""
+    minimum = ".".join(str(part) for part in floor)
+    return (
+        f"{backend} {agent_version} is older than {minimum}, so a message you send "
+        f"while it works waits until it finishes. "
+        f"Update it: run '{fix}', then start a new chat."
+    )
 
 
 def format_command_result(result: dict) -> str:

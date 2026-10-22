@@ -199,6 +199,15 @@ async def _notice_spec_hooks_run_nowhere(
         )
 
 
+def _notice_steer_upgrade(state: "DashboardState", slot: "_ChatSlot", client: Any) -> None:
+    """One notice row on a new session whose adapter is too old to take a mid-turn
+    message: the chat runs, the message waits for the turn, and the row names the
+    installed version, the minimum and the upgrade command."""
+    notice = getattr(client, "steer_upgrade_notice", "")
+    if isinstance(notice, str) and notice:
+        append_and_surface(state, slot, "notice", _redact_display_text(notice), "msg msg-info")
+
+
 async def _surface_withheld_project_hooks(
     state: "DashboardState",
     slot: "_ChatSlot",

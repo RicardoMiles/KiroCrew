@@ -101,6 +101,7 @@ if TYPE_CHECKING:
     )
     from kiro_crew.dashboard.chat_turn.turn_reply_seams import _steer_segment_cut
     from kiro_crew.dashboard.chat_turn.turn_spec_hooks import (
+        _notice_steer_upgrade,
         _prepare_spec_hooks,
         _surface_agent_welcome,
     )
@@ -1105,6 +1106,8 @@ async def _turn_admit(turn: _ChatTurn) -> _Flow | None:
     turn._spec_hooks = _spec_hooks
     turn._spec_hooks_unreadable = _spec_hooks_unreadable
     turn._spec_hooks_cwd = _spec_hooks_cwd
+    if is_new:
+        _notice_steer_upgrade(state, slot, client)
     # A member DM's first turn carries the four-layer member section as
     # session-start context. Record that it is at stake HERE — the moment
     # the session client exists — not at the context build: every early

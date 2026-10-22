@@ -414,6 +414,19 @@ class AcpProvider(LLMProvider):
         return str(getattr(self._client, "agent_version", "") or "")
 
     @property
+    def steer_upgrade_notice(self) -> str:
+        """The upgrade notice when this session's adapter is too old to steer, else ``""``.
+
+        Read off :attr:`agent_version`, so ``""`` before the handshake and for an
+        adapter that reported no readable version.
+        """
+        from kiro_crew.acp.client_turn_control import steer_version_issue
+
+        return steer_version_issue(
+            str(getattr(self._client, "backend", "") or ""), self.agent_version
+        )
+
+    @property
     def cwd(self) -> str:
         """Working directory this provider operates in.
 
