@@ -830,10 +830,23 @@ run as `main(plan, libc=None, argv=None)`, whose child enters the namespaces
 `seal_readonly`, `mask_sensitive`, `apply_carveouts`, `mask_sensitive_files`,
 `mask_ssh_keys`, `scrub_env`, `drop_privileges`, `install_seccomp`,
 `refuse_hardlinked_credentials` and `exec_agent`, in the order `run_child` and
-`place_masks` fix -- with exactly one substitution, the plan's data. The program's
-source is read once, when `sandbox_launcher` is imported, so a package replaced on disk
-under a running gateway cannot pair the new program with the old code's plan; a package
-without a readable program still imports, and every Linux spawn then refuses.
+`place_masks` fix -- with exactly one substitution, the plan's data. The program's text
+spans `sandbox_launcher_program.py` and the three modules of
+`src/kiro_crew/sandbox_launcher_parts/`: the facade keeps the program's head (imports,
+constants, `_load_libc`, `Launch`), `enter_namespaces`, the stand-in root and the run order
+(`place_masks`, `run_child`, `main`, the plan placeholder), with a marker line where each
+part's text goes; `pinned_mounts` holds the checked mounts, the no-follow pin and the
+post-mount read-back, `mask_stages` the stages `place_masks` runs and the crew-home alias
+checks, and `exec_lockdown` what runs after the masks up to the exec. The renderer splices
+each part's text in at its marker and drops the facade's module glue, so the program a
+child runs is byte for byte the one-file program; imported as a module, the facade binds
+every part's names and `kiro_crew._facade_compose.compose` runs them on its globals, so a
+test's patch of `sandbox_launcher_program.<name>` reaches every stage that reads it. The
+facade and every part are read once, together, when `sandbox_launcher` is imported, so a
+package replaced on disk under a running gateway cannot pair a new program or a new part
+with the old code's plan; a package whose program cannot be read or assembled (a part
+missing or unreadable, a marker missing, repeated or unknown) still imports, and every
+Linux spawn then refuses.
 `sandbox_seatbelt.render_seatbelt_profile` spells the plan as Seatbelt rules.
 `sandbox_mount_sweep` reclaims the launcher's stale bind-mount sources for
 `cleanup_stale_sandbox_profiles`. Its pin scan reads one task's mountinfo per mount
@@ -867,8 +880,9 @@ and `wrap_argv`; `sandbox_cgroup` the per-spawn scope probe and its sizing;
 `sandbox_rlimit` the rlimit-applying spawn wrappers; and `sandbox_spawn` the entry
 points callers spawn through (`sandboxed_spawn_argv`). `sandbox.py` itself keeps only
 its BASE imports, the `sandbox_plan` aliases and the facade. A new mask
-rule goes in `sandbox_plan`, a new launcher step in `sandbox_launcher_program` as a
-stage, a new host fact in `_live_plan_host`, a new crew-home leaf in `sandbox_leaves` with
+rule goes in `sandbox_plan`, a new launcher step in
+`sandbox_launcher_parts/mask_stages.py` (or `exec_lockdown.py` when it runs after the
+masks) as a stage that `place_masks` or `run_child` names, a new host fact in `_live_plan_host`, a new crew-home leaf in `sandbox_leaves` with
 its disposition, a new mask target's materialiser in `sandbox_staging`, and a new
 read-only seal target in `sandbox_precreate` (which leaves the launcher may create or pin)
 with its seal in `sandbox_seals`. A new per-scope systemd property gets its `-p` flag in
