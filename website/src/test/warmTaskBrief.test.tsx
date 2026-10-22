@@ -1,9 +1,16 @@
-import { describe, expect, it } from 'vitest'
-import { render, screen } from '@testing-library/react'
-import { defaultMessageRenderers, mergeRenderers, resolveRenderer } from '../app-sdk/messageRenderers'
+import { describe, expect, it, vi } from 'vitest'
+import { act, fireEvent, render, screen } from '@testing-library/react'
+import { defaultMessageRenderers, mergeRenderers, resolveRenderer, type MessageRenderContext } from '../app-sdk/messageRenderers'
 import { isCrewmateChatRow } from '../components/chat/crewmateBubbles'
 import WarmBriefCard, { warmBriefOf } from '../components/chat/WarmBriefCard'
 import type { ChatMessage } from '../types'
+import { fmtMessageTime } from '../pages/chat/messageTime'
+
+vi.mock('../utils/clipboard', async (orig) => ({
+  ...(await orig<typeof import('../utils/clipboard')>()),
+  copyToClipboard: vi.fn(() => Promise.resolve(true)),
+}))
+import { copyToClipboard } from '../utils/clipboard'
 
 const row = (role: ChatMessage['role'], meta: Record<string, unknown>, content = ''): ChatMessage => ({
   role, content, cls: role === 'assistant' ? 'msg msg-a' : '', meta,
@@ -31,13 +38,18 @@ describe('warm task brief transcript rows', () => {
     expect(resolveRenderer(preparing, defaultMessageRenderers)?.id).toBe('assistant')
   })
 
-  it('draws a structured brief as the card, ahead of any host assistant bubble', () => {
+  it.each(['user', 'notice', 'system', 'inject', 'error'] as const)(
+    'a %s row carrying the kind is never a brief',
+    (role) => {
+      const m = row(role, { kind: 'warm_task_brief_result', brief: { asked: 'x', now: 'Ready.', needs_you: ['Approve'], next: [] } }, 'hi')
+      expect(warmBriefOf(m)).toBeNull()
+    },
+  )
+
+  it('a structured brief rides the ordinary assistant entry', () => {
     const m = brief({ asked: 'Fix the test', now: 'Ready.', needs_you: [], next: ['Review'] })
     expect(isCrewmateChatRow(m)).toBe(true)
-    // No host renderers (ChatEmbed): the defaults alone must pick the card.
-    expect(resolveRenderer(m, mergeRenderers(undefined))?.id).toBe('warm_task_brief_result')
-    const host = [{ id: 'assistant', roles: ['assistant'], render: () => null }] as const
-    expect(resolveRenderer(m, mergeRenderers(host as never))?.id).toBe('warm_task_brief_result')
+    expect(resolveRenderer(m, mergeRenderers(undefined))?.id).toBe('assistant')
   })
 
   it.each([
@@ -100,22 +112,116 @@ describe('WarmBriefCard', () => {
   })
 })
 
+const TS = '2026-10-01T09:30:00Z'
+const PLAIN = 'You asked: Fix\nNow: Ready.\nNeeds you: Approve'
+const stamped = (role: ChatMessage['role']): ChatMessage => ({
+  ...row(role, {
+    kind: 'warm_task_brief_result', mid: 'm-1',
+    brief: { asked: 'Fix', now: 'Ready.', needs_you: ['Approve'], next: ['Merge'] },
+  }, PLAIN),
+  ts: TS,
+})
+
+function ctxFor(m: ChatMessage, onOpen = vi.fn()): MessageRenderContext {
+  return {
+    index: 0, messages: [m], running: false, key: 'k0', hideCardOwnedOAuth: false,
+    autoDeniedIds: new Set<string>(), wrapper: c => <>{c}</>, row: c => <>{c}</>,
+    threads: { summaryOf: () => undefined, onOpen, crewmateName: 'Radar' },
+  }
+}
+
+async function crewmateRenderers(m: ChatMessage) {
+  const { createTranscriptRenderers } = await import('../pages/chat/transcriptRenderers')
+  return mergeRenderers(createTranscriptRenderers({
+    slot: 'member-radar', crewmate: { name: 'Radar' }, crewmateTranscript: () => [m],
+  }))
+}
+
+describe('who may draw the card', () => {
+  it.each(['user', 'notice', 'system'] as const)("a %s row with the kind draws as its own role, not the crewmate's card", async (role) => {
+    const m = stamped(role)
+    const renderers = await crewmateRenderers(m)
+    const entry = resolveRenderer(m, renderers)
+    render(<>{entry?.render(m, ctxFor(m))}</>)
+    expect(screen.queryByTestId('warm-brief-card')).toBeNull()
+    expect(screen.queryByText('Radar')).toBeNull()
+    expect(document.querySelector('[data-role="assistant"]')).toBeNull()
+    if (role === 'user') {
+      expect(entry?.id).toBe('user')
+      expect(screen.getByText(/You asked: Fix/)).toBeInTheDocument()
+    }
+  })
+
+  it('the same rows draw no card from the SDK defaults alone (ChatEmbed)', () => {
+    for (const role of ['user', 'notice'] as const) {
+      const m = stamped(role)
+      const entry = resolveRenderer(m, mergeRenderers(undefined))
+      const { unmount } = render(<>{entry?.render(m, ctxFor(m))}</>)
+      expect(screen.queryByTestId('warm-brief-card')).toBeNull()
+      unmount()
+    }
+  })
+})
+
 describe("the card in a crewmate's chat", () => {
-  it('sits in the run as a filled crewmate bubble', async () => {
-    const { createTranscriptRenderers } = await import('../pages/chat/transcriptRenderers')
-    const m = brief({ asked: 'Fix', now: 'Ready.', needs_you: [], next: ['Merge'] })
-    const renderers = mergeRenderers(createTranscriptRenderers({
-      slot: 'member-radar', crewmate: { name: 'Radar' }, crewmateTranscript: () => [m],
+  it('sits in the crewmate bubble with its timestamp, Copy and Reply in thread', async () => {
+    const m = stamped('assistant')
+    const renderers = await crewmateRenderers(m)
+    const entry = resolveRenderer(m, renderers)
+    expect(entry?.id).toBe('assistant')
+    const onOpen = vi.fn()
+    render(<>{entry!.render(m, ctxFor(m, onOpen))}</>)
+    const card = screen.getByTestId('warm-brief-card')
+    const bubble = card.closest('.message-bubble')!
+    expect(bubble.className).toContain('crewmate-bubble')
+    // The plain-text content is not drawn again under the card.
+    expect(bubble.textContent).not.toContain('Needs you: Approve')
+    expect(screen.getByText(fmtMessageTime(TS))).toBeInTheDocument()
+    expect(screen.queryByTestId('toggle-raw-view')).toBeNull()
+    fireEvent.click(screen.getByTestId('reply-in-thread'))
+    expect(onOpen).toHaveBeenCalledWith('m-1')
+    // Reply in thread holds the row seat, so Copy sits in More, as on any crewmate reply.
+    fireEvent.pointerDown(screen.getByTestId('assistant-more-actions'), { button: 0, ctrlKey: false, pointerType: 'mouse' })
+    await act(async () => { fireEvent.click(await screen.findByTestId('copy-message-menu-item')) })
+    expect(copyToClipboard).toHaveBeenCalledWith(PLAIN)
+  })
+
+  it('a reloaded row draws the same bubble', async () => {
+    const m = stamped('assistant')
+    const reloaded = JSON.parse(JSON.stringify(m)) as ChatMessage
+    const renderers = await crewmateRenderers(m)
+    const draw = (r: ChatMessage) => {
+      const { container, unmount } = render(<>{resolveRenderer(r, renderers)!.render(r, ctxFor(r))}</>)
+      const html = container.querySelector('[data-testid="warm-brief-card"]')!.outerHTML
+      const stamp = screen.getByText(fmtMessageTime(TS)).textContent
+      unmount()
+      return [html, stamp]
+    }
+    expect(draw(reloaded)).toEqual(draw(m))
+  })
+
+  it('the SDK default bubble (ChatEmbed) also keeps the timestamp and Copy', async () => {
+    const m = stamped('assistant')
+    // No thread hooks on an embed, so Copy keeps its row button.
+    render(<>{resolveRenderer(m, mergeRenderers(undefined))!.render(m, { ...ctxFor(m), threads: undefined })}</>)
+    expect(screen.getByTestId('warm-brief-card').closest('[data-role="assistant"]')).not.toBeNull()
+    expect(screen.getByText(fmtMessageTime(TS))).toBeInTheDocument()
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Copy' })) })
+    expect(copyToClipboard).toHaveBeenCalledWith(PLAIN)
+  })
+
+  it('the crew window bubble draws the card too', async () => {
+    const { createCrewWindowRenderers } = await import('../pages/chat/crew-window/crewWindowRenderers')
+    const m = stamped('assistant')
+    const renderers = mergeRenderers(createCrewWindowRenderers({
+      instanceId: 'i', name: 'Peer', key: 'k', canRewind: () => false, onRewind: () => false,
+      regenerateRow: null, onRegenerate: () => {},
     }))
     const entry = resolveRenderer(m, renderers)
-    expect(entry?.id).toBe('warm_task_brief_result')
-    const ctx = {
-      index: 0, messages: [m], running: false, key: 'k0', hideCardOwnedOAuth: false,
-      autoDeniedIds: new Set<string>(), wrapper: (c: unknown) => c, row: (c: unknown) => c,
-    }
-    render(<>{entry!.render(m, ctx as never)}</>)
-    const card = screen.getByTestId('warm-brief-card')
-    expect(card.className).toContain('crewmate-bubble')
-    expect(card.className).toContain('message-bubble')
+    render(<>{entry!.render(m, ctxFor(m))}</>)
+    expect(screen.getByTestId('crew-window-assistant')).toContainElement(screen.getByTestId('warm-brief-card'))
+    const u = stamped('user')
+    const { container } = render(<>{resolveRenderer(u, renderers)!.render(u, ctxFor(u))}</>)
+    expect(container.querySelector('[data-testid="warm-brief-card"]')).toBeNull()
   })
 })

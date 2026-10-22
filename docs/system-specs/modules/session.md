@@ -170,7 +170,11 @@ collapsed and `**` dropped, then capped. The result is a second mate
 message: `meta.brief` holds the fields and `content` holds the same brief as
 labelled plain text. The transcript draws `meta.brief` as a fixed card
 (`WarmBriefCard`) that renders every field as a plain text node; a row without a
-valid `meta.brief` keeps the ordinary bubble. These generated rows
+valid `meta.brief` keeps the ordinary bubble. The card is the body of the
+ordinary assistant bubble, so the row keeps its timestamp and row actions, and
+Copy takes the plain-text `content`. Only an assistant row draws it: any other
+role carrying the same `meta.kind` (the send route keeps client `meta` keys on
+the user row) draws as its own role. These generated rows
 are excluded from the task fingerprint. A new user turn, a new away episode,
 slot replacement, reset, close, and a finished task drop a stale result
 unposted. Patrol turns, `[work-ledger wake]` rows, and worker reports change

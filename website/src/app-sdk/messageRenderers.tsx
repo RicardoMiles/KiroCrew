@@ -39,7 +39,7 @@ import { ErrorCard } from '../pages/chat/ErrorCard'
 import { decisionStripFieldOf } from '../pages/chat/decisionRecord'
 import { resolveTransientNotice } from '../pages/chat/transientNotice'
 import StopEventCard from '../pages/chat/StopEventCard'
-import WarmBriefCard, { warmBriefOf } from '../components/chat/WarmBriefCard'
+import { warmBriefBodyOf } from '../components/chat/WarmBriefCard'
 import { ToolDetails } from '../pages/chat/ToolDetails'
 import { isSubagentCompletionMessage } from '../pages/chat/subagentCompletion'
 import { REASONING_ROLES, stripAppEnvelope } from '../pages/chat/groupDisplayItems'
@@ -585,6 +585,9 @@ export function renderAssistantBubble(
       bubbleClassName={bubbleClassName}
       onReplyInThread={isStreaming ? undefined : replyInThreadFor(m, ctx)}
       onQuoteMessage={quoteMessageFor(m, ctx, 'assistant')}
+      // A structured warm brief draws as a fixed card in place of the markdown,
+      // inside this same bubble, so it keeps the timestamp and row actions.
+      body={warmBriefBodyOf(m)}
     />
   )
   // The column's child is the bubble itself unless this message has a thread
@@ -620,19 +623,6 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     // transcript verbatim. The label is the only human-readable rendering there
     // has ever been.
     render: (m, ctx) => ctx.row(<StopEventCard message={m} />),
-  },
-  {
-    // A structured brief is always the fixed plain-text card, never markdown.
-    // It sits ahead of this list's own `assistant` entry, and the `*` role keeps
-    // it ahead of every host's role-keyed `assistant` bubble in mergeRenderers.
-    // A brief row without valid `meta.brief` falls through to the ordinary
-    // bubble, which reads its plain-text `content`.
-    id: 'warm_task_brief_result',
-    roles: ['*'],
-    match: m => warmBriefOf(m) !== null,
-    // `ctx.row`, the card layout: a `*` entry also resolves on ChatPage,
-    // whose `ctx.wrapper` is only sound for rows its own bubble claims.
-    render: (m, ctx) => ctx.row(<WarmBriefCard brief={warmBriefOf(m)!} />),
   },
   {
     id: 'subagent_completion',
@@ -763,7 +753,6 @@ export const defaultMessageRenderers: readonly MessageRenderer[] = [
     match: m => m.meta?.kind === 'warm_task_brief_claim',
     render: () => null,
   },
-
   {
     id: 'notice',
     roles: ['notice'],
