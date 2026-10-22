@@ -16,6 +16,7 @@ from apps_registry_coverage_helpers import _explicit_registry_execution_admissio
 from apps_registry_coverage_helpers import cache_dir_fixture  # noqa: F401
 
 from kiro_crew.apps import registry
+from kiro_crew.testing.wait import finished
 
 # ---------------------------------------------------------------------------
 # Characterization: behaviour a structural move of this module must not change
@@ -232,7 +233,7 @@ class TestTimeoutsAreReadWhereTheyAreUsed:
         monkeypatch.setattr(registry, "_KILL_GRACE_PERIOD", 0)
         proc = _NeverExits()
         # Bounded well below the real 5 s grace, so an inert patch fails here.
-        await asyncio.wait_for(registry._kill_process_group(proc), timeout=2)
+        await finished(registry._kill_process_group(proc), "the zero-grace group kill", timeout=2)
         assert reaped == [proc]
 
     @pytest.mark.asyncio
@@ -273,7 +274,9 @@ class TestTimeoutsAreReadWhereTheyAreUsed:
         monkeypatch.setattr(registry, "_kill_process_group", _kill)
         monkeypatch.setattr(registry, "_CLONE_TIMEOUT", 0.01)
         log: list[str] = []
-        result = await asyncio.wait_for(
+        # Bounded well below the real 60 s clone timeout, so an inert patch
+        # fails here instead of passing on the real timeout's own exit 124.
+        result = await finished(
             registry._git_fetch_branch(
                 "https://github.com/acme/demo-app.git",
                 "main",
@@ -282,6 +285,7 @@ class TestTimeoutsAreReadWhereTheyAreUsed:
                 clone_env={},
                 sandbox_mode="strict",
             ),
+            "the fetch ending at the patched clone timeout",
             timeout=5,
         )
         assert result == {"ok": False, "name": "demo-app", "error": "git fetch failed (exit 124)"}

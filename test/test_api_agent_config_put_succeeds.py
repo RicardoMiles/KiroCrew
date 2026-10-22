@@ -16,6 +16,7 @@ from aiohttp import web
 
 import kiro_crew.config.loader as loader_module
 from kiro_crew.dashboard.handlers import api_agent_config
+from kiro_crew.testing.wait import await_until
 
 
 @pytest.fixture(autouse=True)
@@ -593,7 +594,7 @@ async def test_agent_config_put_persists_nothing_before_the_transaction_lock(tmp
     ):
         task = asyncio.ensure_future(api_agent_config(request))
         try:
-            await asyncio.wait_for(reached_lock.wait(), timeout=5)
+            await await_until(reached_lock, what="the handler reaching the contended lock")
             # Cancel while the handler is suspended on the lock wait.
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -718,12 +719,13 @@ async def test_agent_config_put_lock_releases_only_after_every_write_landed(tmp_
             assert worker_entered.is_set(), "test bug: the first durable write never started"
 
             # Cancel with the write parked. Give the loop room to deliver it and
-            # to run any unwind the handler's shape allows.
+            # to run any unwind the handler's shape allows; the task cannot end
+            # before ``release`` is set, so there is no state to wait on here.
             task.cancel()
             for _ in range(10):
                 if task.done():
                     break
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(0.01)  # flake-ok: a stimulus gap for the cancel to unwind, not a wait on a signal
 
             release.set()
             with pytest.raises(asyncio.CancelledError):
