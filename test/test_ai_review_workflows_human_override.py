@@ -17,12 +17,14 @@ from ai_review_workflows_helpers import (
     _fork_child_env,
     _line_containing,
     _proc_log,
+    _script_file,
     _step_script,
     _stub_path,
     _workflow,
     _write_stub,
 )
 from skill_script_helpers import load_skill_script
+from workflow_token_scopes import WORKFLOWS, load_workflow
 
 RELEASE_RECORD_PATH = (
     Path(__file__).resolve().parents[1] / ".github" / "scripts" / "release_record.py"
@@ -534,8 +536,8 @@ class TestHumanOverrideHandler:
         notices.touch()
         # Stub only the two calls this step makes, so a third call is a loud
         # failure rather than a silent pass.
-        (bin_dir / "gh").write_text(
-            "#!/usr/bin/env bash\n"
+        _write_stub(
+            bin_dir / "gh",
             'if [ "${1:-}" = "api" ] && [ "${2:-}" = "--method" ]; then\n'
             f'  cat >> "{notices}"\n'
             "  exit 0\n"
@@ -551,34 +553,34 @@ class TestHumanOverrideHandler:
             "esac\n"
             'echo "unexpected gh call: $*" >&2\n'
             "exit 9\n",
-            encoding="utf-8",
         )
         # Keep the bounded backoff from costing this test its own wall clock.
-        (bin_dir / "sleep").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-        for stub in ("gh", "sleep"):
-            (bin_dir / stub).chmod(0o755)
+        _write_stub(bin_dir / "sleep", "exit 0\n")
 
         out_file = tmp_path / "gh-output"
         out_file.touch()
         proc = subprocess.run(
-            [bash, "-e", "-c", self._override_step()],
+            [bash, "-e", _script_file(tmp_path, self._override_step())],
             check=False,
             capture_output=True,
             text=True,
             encoding="utf-8",
-            env={
-                **os.environ,
-                "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
-                "PERM_MODE": perm_mode,
-                "GH_TOKEN": "stub",
-                "REPO": "o/r",
-                "PR": "1",
-                "ACTOR": "someone",
-                "COMMENT_ID": "42",
-                "RELEASE_RECORD": str(RELEASE_RECORD_PATH),
-                "COMMENT_BODY": f"/ai-review override gpt {head} false-positive: a stated reason that is long enough",
-                "GITHUB_OUTPUT": str(out_file),
-            },
+            env=_child_env(
+                {
+                    **os.environ,
+                    "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                    "PERM_MODE": perm_mode,
+                    "GH_TOKEN": "stub",
+                    "REPO": "o/r",
+                    "PR": "1",
+                    "ACTOR": "someone",
+                    "COMMENT_AUTHOR": "someone",
+                    "COMMENT_ID": "42",
+                    "RELEASE_RECORD": str(RELEASE_RECORD_PATH),
+                    "COMMENT_BODY": f"/ai-review override gpt {head} false-positive: a stated reason that is long enough",
+                    "GITHUB_OUTPUT": str(out_file),
+                }
+            ),
             cwd=tmp_path,
         )
 
@@ -1066,6 +1068,7 @@ class TestOverrideHandlerRecordsAClass:
         *,
         actor: str = "writer",
         pr_author: str = "author",
+        comment_author: str | None = None,
         permission: str = "write",
         issue: dict | str | None = None,
         today: str = "2026-11-01",
@@ -1081,9 +1084,9 @@ class TestOverrideHandlerRecordsAClass:
         reads.touch()
         issue_file = tmp_path / "issue.json"
         if isinstance(issue, dict):
-            issue_file.write_text(json.dumps(issue), encoding="utf-8")
-        (bin_dir / "gh").write_text(
-            "#!/usr/bin/env bash\n"
+            issue_file.write_text(json.dumps(issue), encoding="utf-8", newline="\n")
+        _write_stub(
+            bin_dir / "gh",
             'case "$*" in\n'
             f'  *"--method POST"*"/comments"*) cat >> "{notices}"; printf "\\n--\\n" >> "{notices}"; exit 0 ;;\n'
             f'  */pulls/*) printf \'{{"head":{{"sha":"{self.HEAD}","repo":{{"full_name":"o/r"}}}},'
@@ -1099,37 +1102,37 @@ class TestOverrideHandlerRecordsAClass:
             "esac\n"
             'echo "unexpected gh call: $*" >&2\n'
             "exit 9\n",
-            encoding="utf-8",
         )
-        (bin_dir / "sleep").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
-        for stub in ("gh", "sleep"):
-            (bin_dir / stub).chmod(0o755)
+        _write_stub(bin_dir / "sleep", "exit 0\n")
         out_file = tmp_path / "gh-output"
         out_file.touch()
         step = _step_script(
             _workflow("ai-review-human-override.yml"), "Validate and record the decision"
         )
         proc = subprocess.run(
-            [bash, "-e", "-c", step],
+            [bash, "-e", _script_file(tmp_path, step)],
             check=False,
             capture_output=True,
             text=True,
             encoding="utf-8",
             cwd=tmp_path,
-            env={
-                **os.environ,
-                "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
-                "ISSUE_MODE": "json" if isinstance(issue, dict) else (issue or "none"),
-                "RELEASE_RECORD": str(RELEASE_RECORD_PATH),
-                "RELEASE_RECORD_TODAY": today,
-                "GH_TOKEN": "stub",
-                "REPO": "o/r",
-                "PR": "1",
-                "ACTOR": actor,
-                "COMMENT_ID": "42",
-                "COMMENT_BODY": body,
-                "GITHUB_OUTPUT": str(out_file),
-            },
+            env=_child_env(
+                {
+                    **os.environ,
+                    "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                    "ISSUE_MODE": "json" if isinstance(issue, dict) else (issue or "none"),
+                    "RELEASE_RECORD": str(RELEASE_RECORD_PATH),
+                    "RELEASE_RECORD_TODAY": today,
+                    "GH_TOKEN": "stub",
+                    "REPO": "o/r",
+                    "PR": "1",
+                    "ACTOR": actor,
+                    "COMMENT_AUTHOR": actor if comment_author is None else comment_author,
+                    "COMMENT_ID": "42",
+                    "COMMENT_BODY": body,
+                    "GITHUB_OUTPUT": str(out_file),
+                }
+            ),
         )
         return (
             proc,
@@ -1244,6 +1247,42 @@ class TestOverrideHandlerRecordsAClass:
         assert proc.returncode == 1
         assert "only a repository writer" in notices
         assert reads == 0
+
+    def test_an_edit_by_someone_else_is_never_recorded_as_the_authors(self, tmp_path: Path) -> None:
+        # The sender made the edit; the comment's author did not. Judging the
+        # edit as the author's would hand the sender's words the author's
+        # authority (and the author's `author_is_actor` for later policy).
+        proc, notices, out, reads = self._run(
+            tmp_path,
+            self._cmd("deferred", issue="9"),
+            actor="editor",
+            comment_author="writer",
+            issue=_GOOD_ISSUE,
+        )
+
+        assert proc.returncode == 1, _proc_log(proc)
+        assert "changed by @editor, not by its author @writer" in notices
+        assert "ai-review-human-override target" not in notices
+        assert out == ""
+        assert reads == 0
+
+    def test_an_author_who_edits_their_own_comment_is_still_recorded(self, tmp_path: Path) -> None:
+        # Logins compare without case, as the PR-author comparison does.
+        proc, notices, _out, _ = self._run(
+            tmp_path, self._cmd("false-positive"), actor="Writer", comment_author="writer"
+        )
+
+        assert proc.returncode == 0, _proc_log(proc)
+        assert "actor=Writer" in notices
+
+    def test_the_actor_is_the_event_sender_not_the_comment_author(self) -> None:
+        steps = load_workflow(WORKFLOWS / "ai-review-human-override.yml")["jobs"]["record"]["steps"]
+        env = next(
+            step["env"] for step in steps if step.get("name") == "Validate and record the decision"
+        )
+
+        assert env["ACTOR"] == "${{ github.event.sender.login }}"
+        assert env["COMMENT_AUTHOR"] == "${{ github.event.comment.user.login }}"
 
     @pytest.mark.parametrize(
         "body",
@@ -1419,3 +1458,65 @@ class TestLedgerCarriesTheReleaseClass:
 
         assert "ai-review-override-record class=C issue=N" in script
         assert "class=deferred issue=N means a" in script
+
+
+_REVIEW_CONTROL_WORKFLOWS = (
+    "ai-review-human-override.yml",
+    "disposition-deferral-check.yml",
+    "sensitive-change-review-comment.yml",
+)
+
+
+def _run_steps(name: str) -> "list[tuple[str, str]]":
+    jobs = load_workflow(WORKFLOWS / name)["jobs"]
+    return [
+        (step["name"], step["run"])
+        for job in jobs.values()
+        for step in job["steps"]
+        if isinstance(step.get("run"), str) and step.get("name")
+    ]
+
+
+class TestTheHandlerScriptsReadTheSameOnEveryCheckout:
+    """The step scripts reach bash from workflow text a Windows checkout may hand over as CRLF.
+
+    The Windows runner stopped the handler with "unexpected EOF while looking for
+    matching quote" after the script had grown, a failure only the success path
+    reached because bash parses a script one top-level command at a time. A
+    syntax-only parse of the WHOLE script (``bash -n``) reaches every path.
+    """
+
+    @pytest.mark.parametrize("name", _REVIEW_CONTROL_WORKFLOWS)
+    def test_the_extractor_gives_the_same_script_from_a_crlf_copy(self, name: str) -> None:
+        lf = _workflow(name)
+        crlf = lf.replace("\n", "\r\n")
+
+        assert "\r\n" in crlf
+        for step_name, _run in _run_steps(name):
+            got = _step_script(crlf, step_name)
+            assert "\r" not in got, step_name
+            assert got == _step_script(lf, step_name), step_name
+
+    @pytest.mark.parametrize("name", _REVIEW_CONTROL_WORKFLOWS)
+    def test_every_step_script_parses_whole_under_bash(self, name: str, tmp_path: Path) -> None:
+        bash = _bash()
+        if bash is None:
+            pytest.skip("the step scripts are Bash; skip where Bash is absent")
+        crlf = _workflow(name).replace("\n", "\r\n")
+
+        for step_name, _run in _run_steps(name):
+            script = _script_file(tmp_path, _step_script(crlf, step_name))
+            proc = subprocess.run(
+                [bash, "-n", script],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                env=_child_env({**os.environ}),
+            )
+            assert proc.returncode == 0, f"{name}: {step_name}\n{_proc_log(proc)}"
+
+    def test_a_handler_script_file_is_lf_only(self, tmp_path: Path) -> None:
+        path = _script_file(tmp_path, "echo a\r\necho b\r\n")
+
+        assert b"\r" not in Path(path).read_bytes()

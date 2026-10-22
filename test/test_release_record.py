@@ -12,6 +12,7 @@ from datetime import date
 from pathlib import Path
 
 import pytest
+from ai_review_workflows_helpers import _bash, _child_env
 from skill_script_helpers import load_skill_script
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -400,9 +401,7 @@ class TestCommandLine:
         assert self._run("frobnicate").returncode == 2
 
 
-@pytest.mark.skipif(
-    shutil.which("bash") is None or shutil.which("jq") is None, reason="needs bash and jq"
-)
+@pytest.mark.skipif(_bash() is None or shutil.which("jq") is None, reason="needs bash and jq")
 class TestDeferralCheckAgreesWithIssueProblems:
     """The deferral check calls ``issue_problems``; it must keep telling the author what it always did.
 
@@ -446,10 +445,11 @@ true
 
     @pytest.mark.parametrize("issue", FIXTURES, ids=range(len(FIXTURES)))
     def test_bash_and_python_name_the_same_problems(self, issue: dict) -> None:
-        bash = shutil.which("bash")
+        # `_bash()`, not `shutil.which`: on Windows the latter finds the WSL launcher.
+        bash = _bash()
         proc = subprocess.run(
             [bash, "-c", self.REFERENCE],
-            env={**os.environ, "ISSUE": json.dumps(issue)},
+            env=_child_env({**os.environ, "ISSUE": json.dumps(issue)}),
             capture_output=True,
             text=True,
             encoding="utf-8",

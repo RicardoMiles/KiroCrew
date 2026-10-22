@@ -21,11 +21,16 @@ on:
 
 # Re-run the affected reviewer workflows, dispatch PR Readiness, and record the
 # trusted decision. PR-write is required because the trusted
-# record is a pull-request comment. Deliberately no id-token or contents:write.
+# record is a pull-request comment. issues: read is for class `deferred`, which
+# reads the follow-up issue it names: a scope not listed here is `none`, so
+# without it every deferred override would fail the read three times and be
+# refused as a retry. Deliberately no id-token or contents:write.
+# test_workflow_token_scopes.py derives the scopes from the calls below.
 permissions:
   actions: write
   checks: write
   contents: read
+  issues: read
   pull-requests: write
 
 concurrency:
@@ -83,7 +88,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.issue.number }}
-          ACTOR: ${{ github.event.comment.user.login }}
+          # The actor is the event's SENDER: whoever made this create or edit.
+          # An edit made by someone other than the comment's author must not be
+          # judged as the author's, so the two are compared below.
+          ACTOR: ${{ github.event.sender.login }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
           COMMENT_ID: ${{ github.event.comment.id }}
           COMMENT_BODY: ${{ github.event.comment.body }}
           RELEASE_RECORD: ${{ runner.temp }}/release_record.py
@@ -96,8 +105,18 @@ jobs:
                   --input - >/dev/null
           }
 
+          # A create is always the own act of the comment author. An EDIT can be made by
+          # anyone with edit rights on the comment, and the permission check
+          # and the record below would then bind the edit to the wrong person.
+          # Refuse it; the author, or the person who means it, posts the
+          # command themselves.
+          if [ -z "$ACTOR" ] || [ "${ACTOR,,}" != "${COMMENT_AUTHOR,,}" ]; then
+            post_notice "AI-review override not recorded: this comment was changed by @$ACTOR, not by its author @$COMMENT_AUTHOR. Post the command as a new comment from the person who is releasing."
+            exit 1
+          fi
+
           # The grammar, the class table and every per-class requirement are
-          # release_record.py's. COMMENT_BODY reaches it on env, never in argv.
+          # the job of release_record.py. COMMENT_BODY reaches it on env, never in argv.
           if ! parsed="$(python3 "$RELEASE_RECORD" parse)"; then
             post_notice "AI-review override not recorded: the command reader failed. Re-issue the command; if it fails again a maintainer has to look at this run."
             exit 1
@@ -223,8 +242,13 @@ jobs:
               exit 1
             fi
             if [ -n "$issue_problems" ]; then
-              post_notice "$(printf 'AI-review override not recorded: issue #%s is not a tracked deferral. What is missing:\n\n%s\n\nFix the issue, then re-issue the command.' \
-                "$release_issue" "$(printf '%s\n' "$issue_problems" | sed 's/^/- /')")"
+              # Built in plain steps, one command per line, not as a command
+              # substitution nested in a quoted string and continued across
+              # lines: the Windows Git Bash run of this script stopped with an
+              # unclosed quote at end of file.
+              missing_list="$(printf '%s\n' "$issue_problems" | sed 's/^/- /')"
+              printf -v not_tracked 'AI-review override not recorded: issue #%s is not a tracked deferral. What is missing:\n\n%s\n\nFix the issue, then re-issue the command.' "$release_issue" "$missing_list"
+              post_notice "$not_tracked"
               exit 1
             fi
           fi
@@ -234,8 +258,7 @@ jobs:
           if [ -n "$pr_author" ] && [ "${pr_author,,}" = "${ACTOR,,}" ]; then
             author_is_actor=true
           fi
-          if ! record_line="$(CLASS="$release_class" ISSUE="$release_issue" \
-            AUTHOR_IS_ACTOR="$author_is_actor" python3 "$RELEASE_RECORD" render)"; then
+          if ! record_line="$(env CLASS="$release_class" ISSUE="$release_issue" AUTHOR_IS_ACTOR="$author_is_actor" python3 "$RELEASE_RECORD" render)"; then
             post_notice "AI-review override not recorded: the record line could not be rendered. Re-issue the command."
             exit 1
           fi

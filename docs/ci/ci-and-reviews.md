@@ -4204,14 +4204,23 @@ or executes PR-controlled code. Before changing a result it requires:
 2. A current-head SHA match.
 3. The commenter to have `write`, `maintain`, or `admin` collaborator
    permission. PR authors receive no exemption.
+4. The actor is the event's sender (`github.event.sender.login`). When a
+   comment is edited by someone other than its author, the handler refuses it
+   and asks for a new comment, so an edit is never judged as the author's words
+   and `author_is_actor` is never derived from the wrong person.
 
 After validation it posts a `github-actions[bot]` comment whose hidden marker
 binds `{target, full head SHA, actor, source comment id}`, and a second hidden line
 records the class. Reviewer workflows
 trust only this bot-authored marker; a raw author or third-party comment cannot
 turn a gate green. The handler has only review-control permissions
-(`actions:write`, `checks:write`, `pull-requests:write`, and
-`contents:read`), and receives no `id-token` or `contents:write`.
+(`actions:write`, `checks:write`, `pull-requests:write`,
+`contents:read`, and `issues:read`), and receives no `id-token` or
+`contents:write`. `issues:read` is for class `deferred`, which reads its
+follow-up issue; a scope the block does not list is `none`, so without it every
+deferred override would fail the read three times. `test_workflow_token_scopes.py`
+derives the scopes each workflow's calls need from its scripts and compares them
+with the written block.
 `pull-requests:write` is required for the handler to create the trusted record
 on a pull request; `issues:write` alone does not make that write reliable for a
 GitHub Actions installation token.
