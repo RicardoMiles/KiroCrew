@@ -37,7 +37,6 @@ const API_COMMANDS = [
   { name: '/goal', description: 'Set a standing goal the agent works toward across turns' },
   { name: '/help', description: 'Show available commands' },
   { name: '/hooks', description: 'View configured context hooks' },
-  { name: '/issue', description: 'Report an issue or bug' },
   { name: '/logdump', description: 'Dump session logs to a file' },
   { name: '/mcp', description: 'Show configured MCP servers' },
   { name: '/model', description: 'Show or switch the current model' },
@@ -48,7 +47,7 @@ const API_COMMANDS = [
   { name: '/usage', description: 'Show billing and usage information' },
 ]
 
-const BLOCKED = ['/tangent', '/quit', '/exit', '/q', '/chat', '/paste', '/reply', '/editor']
+const BLOCKED = ['/tangent', '/quit', '/exit', '/q', '/chat', '/paste', '/reply', '/editor', '/issue']
 
 async function main() {
   const { srv, base } = await serveDist()
@@ -97,9 +96,11 @@ async function main() {
   // ── Frame 2: the issue's repro "/tan" — nothing matches, menu closed ──
   await composer.fill('/tan')
   await page.waitForTimeout(600)
+  // The menu may remain visible to announce that Enter now sends the message;
+  // it must not retain any option for the unsupported prefix.
   if (await menu.count() > 0 && await menu.first().isVisible()) {
     const leftover = (await menu.first().locator('[role="option"]').allInnerTexts()).join(',')
-    throw new Error(`menu still open for /tan with rows: ${leftover}`)
+    if (leftover) throw new Error(`menu still offers /tan rows: ${leftover}`)
   }
   console.log('/tan matches nothing — no inert /tangent suggestion')
 
