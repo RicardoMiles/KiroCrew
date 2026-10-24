@@ -612,6 +612,7 @@ async def _eager_spawn(
                     cfg,
                     session_key,
                     _bound[0] or None,
+                    _bound[2] or None,
                 )
                 kiro_agent = bindings.kiro_agent
                 crew_alias = bindings.resolved_alias
@@ -645,6 +646,7 @@ async def _eager_spawn(
                         cfg,
                         session_key,
                         _bound[0] or None,
+                        _bound[2] or None,
                     )
                     kiro_agent = bindings.kiro_agent
                     crew_alias = bindings.resolved_alias
